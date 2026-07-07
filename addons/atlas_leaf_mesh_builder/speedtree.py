@@ -531,31 +531,11 @@ def upsert_speedtree_assets_in_spm(spm_path, manifest, material_name):
 
 
 def cleanup_stale_mesh_exports(export_dir, exported_meshes):
-    manifest_path = Path(export_dir) / "speedtree_import_manifest.json"
-    previous = read_json_file(manifest_path, {})
-    if not previous:
-        return []
-
-    mesh_dir = (Path(export_dir) / "meshes").resolve()
-    current_paths = {Path(item["fbx"]).resolve() for item in exported_meshes}
-    removed = []
-    for item in previous.get("meshes", []):
-        fbx = item.get("fbx")
-        if not fbx:
-            continue
-        path = Path(fbx)
-        try:
-            resolved = path.resolve()
-        except OSError:
-            continue
-        if resolved in current_paths:
-            continue
-        if resolved.parent != mesh_dir or resolved.suffix.lower() != ".fbx":
-            continue
-        if resolved.exists():
-            resolved.unlink()
-            removed.append(str(resolved))
-    return removed
+    # Keep stale FBX files on disk. SpeedTree .spm files can keep external Mesh
+    # references across several atlas/material update passes, and deleting an old
+    # FBX from a shared meshes/ folder can break another material even when the
+    # current manifest no longer lists it.
+    return []
 
 
 def material_suffix_from_collection_name(collection_name):
@@ -611,13 +591,16 @@ def speedtree_mesh_sort_key(obj):
     return (10_000_000, 10_000_000, obj.name.lower())
 
 
-def speedtree_mesh_export_name(source, used_names):
+def speedtree_mesh_export_name(source, used_names, group_material=None):
     match = re.search(r"leaf_(\d+)", source.name, re.IGNORECASE)
     prefix = f"{int(match.group(1)):02d}" if match else f"{len(used_names) + 1:02d}"
-    candidate = f"{prefix}_{source.name}.fbx"
+    group_prefix = ""
+    if group_material:
+        group_prefix = material_suffix_from_collection_name(group_material) + "__"
+    candidate = f"{group_prefix}{prefix}_{source.name}.fbx"
     suffix = 2
     while candidate.lower() in used_names:
-        candidate = f"{prefix}_{source.name}_{suffix}.fbx"
+        candidate = f"{group_prefix}{prefix}_{source.name}_{suffix}.fbx"
         suffix += 1
     used_names.add(candidate.lower())
     return candidate
@@ -686,7 +669,14 @@ def export_speedtree_assets(props, export_dir):
                     for vertex in mesh.vertices:
                         vertex.co *= mesh_geometry_scale
                     mesh.update()
-                temp_obj = bpy.data.objects.new(source.name + "_speedtree", mesh)
+                export_name = speedtree_mesh_export_name(
+                    source,
+                    used_mesh_filenames,
+                    group["material"],
+                )
+                export_stem = Path(export_name).stem
+                mesh.name = export_stem
+                temp_obj = bpy.data.objects.new(export_stem, mesh)
                 temp_obj.matrix_world = source.matrix_world.copy()
                 temp_collection.objects.link(temp_obj)
 
@@ -695,7 +685,7 @@ def export_speedtree_assets(props, export_dir):
                 temp_obj.select_set(True)
                 bpy.context.view_layer.objects.active = temp_obj
 
-                fbx_path = mesh_dir / speedtree_mesh_export_name(source, used_mesh_filenames)
+                fbx_path = mesh_dir / export_name
                 bpy.ops.export_scene.fbx(
                     filepath=str(fbx_path),
                     use_selection=True,
@@ -707,7 +697,7 @@ def export_speedtree_assets(props, export_dir):
                     embed_textures=False,
                 )
                 item = {
-                    "name": source.name,
+                    "name": export_stem,
                     "fbx": str(fbx_path),
                     "source_object": source.name,
                     "source_collection": group["collection"],
