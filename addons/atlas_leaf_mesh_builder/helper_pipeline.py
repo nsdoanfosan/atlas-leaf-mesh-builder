@@ -14,12 +14,13 @@ import triangle as tr
 DEFAULT_FRONTS = [1, 2, 3, 4, 10, 6, 7, 8, 9, 11, 12, 13]
 
 QUALITY_PRESETS = {
-    "FAST": {"q": 12, "area_factor": 0.24},
-    "BALANCED": {"q": 18, "area_factor": 0.42},
-    "HIGH": {"q": 22, "area_factor": 0.95},
+    "FAST": {"q": 12, "area_factor": 0.24, "contour_sigma": 0.5, "epsilon_min": 0.5, "epsilon_max": 1.25},
+    "BALANCED": {"q": 18, "area_factor": 0.42, "contour_sigma": 0.5, "epsilon_min": 0.45, "epsilon_max": 1.1},
+    "HIGH": {"q": 22, "area_factor": 0.95, "contour_sigma": 0.5, "epsilon_min": 0.4, "epsilon_max": 0.9},
     "SPEEDTREE_LOW": {
         "q": 6,
         "area_factor": 0.04,
+        "contour_sigma": 0.5,
         "epsilon_min": 2.4,
         "epsilon_max": 6.0,
         "epsilon_scale": 0.0024,
@@ -65,6 +66,10 @@ def signed_area(points):
         x1, y1 = points[(i + 1) % len(points)]
         total += x0 * y1 - x1 * y0
     return total * 0.5
+
+
+def point_in_polygon(point, polygon):
+    return cv2.pointPolygonTest(np.array(polygon, dtype=np.float32), point, False) >= 0
 
 
 def remove_near_duplicates(points, min_dist=0.35):
@@ -254,44 +259,166 @@ class Pipeline:
         sheet.save(pair_path, quality=94)
         return {"island_labels": str(label_path), "pair_preview": str(pair_path), "pairs": pairs}
 
-    def extract_subpixel_polygon(self, index):
-        x, y, w, h = self.components[index]["bbox"]
-        comp = self.component_mask(index)
-        pad = 3
-        x0 = max(0, x - pad)
-        y0 = max(0, y - pad)
-        x1 = min(self.width, x + w + pad)
-        y1 = min(self.height, y + h + pad)
-        crop = (comp[y0:y1, x0:x1] > 127).astype(np.float32)
-        contours = measure.find_contours(crop, 0.5, fully_connected="high")
-        contour = max(contours, key=len)
-        image_points = [(float(x0 + col), float(y0 + row)) for row, col in contour]
-        image_points = remove_near_duplicates(image_points, float(self.quality.get("near_duplicate", 0.35)))
-        contour_np = np.array(image_points, dtype=np.float32).reshape((-1, 1, 2))
-        perimeter = cv2.arcLength(contour_np, True)
-        epsilon = max(
-            float(self.quality.get("epsilon_min", 0.55)),
-            min(float(self.quality.get("epsilon_max", 1.35)), perimeter * float(self.quality.get("epsilon_scale", 0.00055))),
-        )
+    def component_hole_min_area(self, index):
+        area = float(self.components[index]["area"])
+        return float(np.clip(area * 0.00012, 48.0, 480.0))
+
+    def component_contour_settings(self, index):
+        _x, _y, w, h = self.components[index]["bbox"]
+        long_side = max(float(w), float(h))
+        short_side = max(1.0, min(float(w), float(h)))
+        aspect = long_side / short_side
+        settings = {
+            "sigma": float(self.quality.get("contour_sigma", 0.5)),
+            "epsilon_min": float(self.quality.get("epsilon_min", 0.45)),
+            "epsilon_max": float(self.quality.get("epsilon_max", 1.1)),
+            "epsilon_scale": float(self.quality.get("epsilon_scale", 0.00055)),
+        }
+        if 6.0 <= aspect < 7.0:
+            settings["sigma"] = min(settings["sigma"], 0.0)
+            settings["epsilon_min"] = min(settings["epsilon_min"], 0.35)
+            settings["epsilon_max"] = min(settings["epsilon_max"], 0.8)
+        elif aspect >= 7.0:
+            settings["sigma"] = min(settings["sigma"], 0.25)
+            settings["epsilon_min"] = min(settings["epsilon_min"], 0.4)
+            settings["epsilon_max"] = min(settings["epsilon_max"], 0.9)
+        return settings
+
+    def component_mesh_orientation(self, index):
+        _x, _y, w, h = self.components[index]["bbox"]
+        if w > h and (float(w) / max(1.0, float(h))) >= 2.0:
+            return "rotate_horizontal_to_vertical"
+        return "atlas"
+
+    def simplify_contour_points(self, points, epsilon):
+        points = remove_near_duplicates(points, float(self.quality.get("near_duplicate", 0.35)))
+        if len(points) < 4:
+            return []
+        contour_np = np.array(points, dtype=np.float32).reshape((-1, 1, 2))
         approx = cv2.approxPolyDP(contour_np, epsilon, True).reshape((-1, 2))
         simplified = remove_near_duplicates(
             [(float(px), float(py)) for px, py in approx],
             float(self.quality.get("near_duplicate", 0.6)),
         )
-        simplified = remove_almost_collinear(simplified, float(self.quality.get("collinear", 0.05)))
-        return simplified, len(image_points), epsilon
+        return remove_almost_collinear(simplified, float(self.quality.get("collinear", 0.05)))
 
-    def triangulate_quality(self, object_poly):
+    def hole_seed_from_ring(self, index, ring):
+        comp = self.component_mask(index)
+        points = np.round(np.array(ring, dtype=np.float32)).astype(np.int32)
+        min_x = max(0, int(points[:, 0].min()) - 2)
+        max_x = min(self.width, int(points[:, 0].max()) + 3)
+        min_y = max(0, int(points[:, 1].min()) - 2)
+        max_y = min(self.height, int(points[:, 1].max()) + 3)
+        if max_x <= min_x or max_y <= min_y:
+            return tuple(map(float, ring[0]))
+
+        local_points = points.copy()
+        local_points[:, 0] -= min_x
+        local_points[:, 1] -= min_y
+        temp = np.zeros((max_y - min_y, max_x - min_x), dtype=np.uint8)
+        cv2.fillPoly(temp, [local_points], 255)
+        hole_region = ((temp > 0) & (comp[min_y:max_y, min_x:max_x] == 0)).astype(np.uint8)
+        if int(hole_region.sum()) > 0:
+            distance = cv2.distanceTransform(hole_region, cv2.DIST_L2, 5)
+            py, px = np.unravel_index(int(np.argmax(distance)), distance.shape)
+            return float(min_x + px), float(min_y + py)
+
+        moments = cv2.moments(points.reshape((-1, 1, 2)))
+        if abs(moments["m00"]) > 1e-6:
+            return float(moments["m10"] / moments["m00"]), float(moments["m01"] / moments["m00"])
+        return tuple(map(float, ring[0]))
+
+    def extract_subpixel_paths(self, index):
+        x, y, w, h = self.components[index]["bbox"]
+        comp = self.component_mask(index)
+        pad = 5
+        x0 = max(0, x - pad)
+        y0 = max(0, y - pad)
+        x1 = min(self.width, x + w + pad)
+        y1 = min(self.height, y + h + pad)
+        crop = (comp[y0:y1, x0:x1] > 127).astype(np.float32)
+        contour_settings = self.component_contour_settings(index)
+        sigma = contour_settings["sigma"]
+        if sigma > 0.0:
+            crop = cv2.GaussianBlur(crop, (0, 0), sigmaX=sigma, sigmaY=sigma)
+        contours = measure.find_contours(crop, 0.5, fully_connected="high")
+        candidates = []
+        total_dense_count = 0
+        for contour in contours:
+            image_points = [(float(x0 + col), float(y0 + row)) for row, col in contour]
+            if len(image_points) < 12:
+                continue
+            total_dense_count += len(image_points)
+            raw_area = abs(signed_area(image_points))
+            if raw_area < 16.0:
+                continue
+            contour_np = np.array(image_points, dtype=np.float32).reshape((-1, 1, 2))
+            perimeter = cv2.arcLength(contour_np, True)
+            epsilon = max(
+                contour_settings["epsilon_min"],
+                min(
+                    contour_settings["epsilon_max"],
+                    perimeter * contour_settings["epsilon_scale"],
+                ),
+            )
+            simplified = self.simplify_contour_points(image_points, epsilon)
+            if len(simplified) < 4:
+                continue
+            candidates.append(
+                {
+                    "points": simplified,
+                    "area": abs(signed_area(simplified)),
+                    "epsilon": epsilon,
+                }
+            )
+
+        if not candidates:
+            raise ValueError(f"No contour found for component {index}")
+
+        outer = max(candidates, key=lambda item: item["area"])
+        hole_min_area = self.component_hole_min_area(index)
+        holes = []
+        for item in candidates:
+            if item is outer or item["area"] < hole_min_area:
+                continue
+            if point_in_polygon(item["points"][0], outer["points"]):
+                holes.append(item)
+        holes.sort(key=lambda item: item["area"], reverse=True)
+        hole_points = [item["points"] for item in holes]
+        hole_seeds = [self.hole_seed_from_ring(index, points) for points in hole_points]
+        return outer["points"], hole_points, hole_seeds, total_dense_count, outer["epsilon"]
+
+    def extract_subpixel_polygon(self, index):
+        outer, _holes, _hole_seeds, dense_count, epsilon = self.extract_subpixel_paths(index)
+        return outer, dense_count, epsilon
+
+    def triangulate_quality(self, object_poly, object_holes=None, object_hole_seeds=None):
         if signed_area(object_poly) < 0:
             object_poly = list(reversed(object_poly))
-        vertices = np.array(object_poly, dtype=np.float64)
-        segments = np.array([(i, (i + 1) % len(object_poly)) for i in range(len(object_poly))], dtype=np.int32)
-        polygon_area = abs(signed_area(object_poly))
-        max_area = max(polygon_area / max(64, len(object_poly) * self.quality["area_factor"]), 0.00012)
-        result = tr.triangulate({"vertices": vertices, "segments": segments}, f"pq{self.quality['q']}a{max_area:.8f}")
+        object_holes = object_holes or []
+        object_hole_seeds = object_hole_seeds or []
+
+        rings = [object_poly] + object_holes
+        vertices = []
+        segments = []
+        for ring in rings:
+            start = len(vertices)
+            vertices.extend(ring)
+            segments.extend((start + i, start + ((i + 1) % len(ring))) for i in range(len(ring)))
+
+        polygon_area = abs(signed_area(object_poly)) - sum(abs(signed_area(hole)) for hole in object_holes)
+        polygon_area = max(polygon_area, 1.0e-12)
+        max_area = max(polygon_area / max(64, len(vertices) * self.quality["area_factor"]), 0.00012)
+        payload = {
+            "vertices": np.array(vertices, dtype=np.float64),
+            "segments": np.array(segments, dtype=np.int32),
+        }
+        if object_hole_seeds:
+            payload["holes"] = np.array(object_hole_seeds, dtype=np.float64)
+        result = tr.triangulate(payload, f"pq{self.quality['q']}a{max_area:.8f}")
         out_vertices = result["vertices"]
         triangles = result["triangles"]
-        out_segments = result.get("segments", segments)
+        out_segments = result.get("segments", payload["segments"])
         min_angles = [triangle_min_angle(out_vertices[a], out_vertices[b], out_vertices[c]) for a, b, c in triangles]
         return out_vertices, triangles, out_segments, max_area, float(min(min_angles))
 
@@ -355,6 +482,21 @@ class Pipeline:
         oy = ((y + h * 0.5) - py) * leaf_scale
         return float(ox), float(oy), "skeleton_endpoint"
 
+    def horizontal_stem_pivot(self, object_poly):
+        points = np.array(object_poly, dtype=np.float64)
+        min_x = float(points[:, 0].min())
+        max_x = float(points[:, 0].max())
+        width = max(max_x - min_x, 1e-8)
+        candidates = points[points[:, 0] <= min_x + width * 0.035]
+        if len(candidates) == 0:
+            candidates = points[points[:, 0] == min_x]
+        return float(min_x), float(np.median(candidates[:, 1])), "horizontal_left_endpoint"
+
+    def orient_local_point(self, x, y, orientation):
+        if orientation == "rotate_horizontal_to_vertical":
+            return -y, x
+        return x, y
+
     def build(self):
         objects = []
         summaries = []
@@ -364,16 +506,35 @@ class Pipeline:
             front_index = int(pair["front"])
             front_bbox = self.components[front_index]["bbox"]
             fx, fy, fw, fh = front_bbox
-            image_poly, dense_count, epsilon = self.extract_subpixel_polygon(front_index)
+            image_poly, image_holes, image_hole_seeds, dense_count, epsilon = self.extract_subpixel_paths(front_index)
             object_poly = [
                 ((px - (fx + fw * 0.5)) * leaf_scale, ((fy + fh * 0.5) - py) * leaf_scale)
                 for px, py in image_poly
             ]
+            object_holes = [
+                [
+                    ((px - (fx + fw * 0.5)) * leaf_scale, ((fy + fh * 0.5) - py) * leaf_scale)
+                    for px, py in image_hole
+                ]
+                for image_hole in image_holes
+            ]
+            object_hole_seeds = [
+                ((px - (fx + fw * 0.5)) * leaf_scale, ((fy + fh * 0.5) - py) * leaf_scale)
+                for px, py in image_hole_seeds
+            ]
             if signed_area(object_poly) < 0:
                 image_poly = list(reversed(image_poly))
                 object_poly = list(reversed(object_poly))
-            q_vertices, q_triangles, q_segments, max_area, min_angle = self.triangulate_quality(object_poly)
-            pivot_x, pivot_y, pivot_source = self.stem_pivot_from_skeleton(front_index, object_poly, leaf_scale)
+            q_vertices, q_triangles, q_segments, max_area, min_angle = self.triangulate_quality(
+                object_poly,
+                object_holes,
+                object_hole_seeds,
+            )
+            mesh_orientation = self.component_mesh_orientation(front_index)
+            if mesh_orientation == "rotate_horizontal_to_vertical":
+                pivot_x, pivot_y, pivot_source = self.horizontal_stem_pivot(object_poly)
+            else:
+                pivot_x, pivot_y, pivot_source = self.stem_pivot_from_skeleton(front_index, object_poly, leaf_scale)
 
             col = (pair_number - 1) % 4
             row = (pair_number - 1) // 4
@@ -394,13 +555,14 @@ class Pipeline:
             for ox, oy in q_vertices:
                 px = ox / leaf_scale + (fx + fw * 0.5)
                 py = (fy + fh * 0.5) - oy / leaf_scale
-                front_world = [float(ox - pivot_x + leaf_center_x), float(oy - pivot_y + leaf_center_y), float(front_z)]
+                local_x, local_y = self.orient_local_point(ox - pivot_x, oy - pivot_y, mesh_orientation)
+                front_world = [float(local_x + leaf_center_x), float(local_y + leaf_center_y), float(front_z)]
                 fu, fv = self.uv_from_pixel(px, py)
                 vertices.append(front_world)
                 uvs.append([float(fu), float(fv)])
                 front_uvs.append([float(fu), float(fv)])
                 if not single_plate:
-                    back_world = [float(ox - pivot_x + leaf_center_x), float(oy - pivot_y + leaf_center_y), float(back_z)]
+                    back_world = [float(local_x + leaf_center_x), float(local_y + leaf_center_y), float(back_z)]
                     vertices.append(back_world)
                     uvs.append([float(fu), float(fv)])
                     back_uvs.append([float(fu), float(fv)])
@@ -456,6 +618,8 @@ class Pipeline:
                     "pair": pair_number,
                     "front": front_index,
                     "boundary_points": len(image_poly),
+                    "hole_count": len(image_holes),
+                    "hole_boundary_points": int(sum(len(hole) for hole in image_holes)),
                     "quality_vertices": len(q_vertices),
                     "triangles_per_side": len(q_triangles),
                     "side_quads": 0 if single_plate or self.no_shell else int(len(q_segments)),
@@ -465,6 +629,7 @@ class Pipeline:
                     "surface_mode": self.surface_mode,
                     "pivot": [pivot_x, pivot_y],
                     "pivot_source": pivot_source,
+                    "mesh_orientation": mesh_orientation,
                     "epsilon": epsilon,
                     "max_area": max_area,
                     "min_angle": min_angle,
@@ -475,6 +640,8 @@ class Pipeline:
             "albedo_path": str(self.albedo_path),
             "alpha_path": str(self.alpha_path),
             "quality": self.quality_name,
+            "alpha_threshold": self.alpha_threshold,
+            "min_area": self.min_area,
             "shell_gap": self.shell_gap,
             "side_uv_inset": self.side_uv_inset,
             "no_shell": self.no_shell,

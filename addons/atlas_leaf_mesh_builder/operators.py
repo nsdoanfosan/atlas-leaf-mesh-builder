@@ -204,6 +204,142 @@ def average_vertex_uvs(obj):
     return vertex_uvs
 
 
+def percentile(sorted_values, pct):
+    if not sorted_values:
+        return 0.0
+    if len(sorted_values) == 1:
+        return float(sorted_values[0])
+    position = (len(sorted_values) - 1) * pct
+    lower = int(position)
+    upper = min(lower + 1, len(sorted_values) - 1)
+    factor = position - lower
+    return float(sorted_values[lower] * (1.0 - factor) + sorted_values[upper] * factor)
+
+
+def fill_missing_profile_values(values):
+    known = [index for index, value in enumerate(values) if value is not None]
+    if not known:
+        return []
+    filled = list(values)
+    first = known[0]
+    for index in range(0, first):
+        filled[index] = filled[first]
+    last = known[-1]
+    for index in range(last + 1, len(filled)):
+        filled[index] = filled[last]
+    for left, right in zip(known, known[1:]):
+        left_value = filled[left]
+        right_value = filled[right]
+        span = right - left
+        for index in range(left + 1, right):
+            factor = (index - left) / span
+            filled[index] = left_value * (1.0 - factor) + right_value * factor
+    return [float(value) for value in filled]
+
+
+def smooth_profile_values(values, radius, passes=3):
+    if not values:
+        return []
+    smoothed = list(values)
+    radius = max(1, int(radius))
+    for _pass_index in range(passes):
+        next_values = []
+        for index in range(len(smoothed)):
+            total = 0.0
+            total_weight = 0.0
+            start = max(0, index - radius)
+            end = min(len(smoothed), index + radius + 1)
+            for sample_index in range(start, end):
+                weight = radius + 1 - abs(sample_index - index)
+                total += smoothed[sample_index] * weight
+                total_weight += weight
+            next_values.append(total / total_weight if total_weight else smoothed[index])
+        smoothed = next_values
+    return smoothed
+
+
+def interpolated_profile_field(profile, field, long_value):
+    if not profile:
+        return 0.0
+    if long_value <= profile[0]["long"]:
+        return profile[0][field]
+    if long_value >= profile[-1]["long"]:
+        return profile[-1][field]
+    for index in range(len(profile) - 1):
+        current = profile[index]
+        next_item = profile[index + 1]
+        if current["long"] <= long_value <= next_item["long"]:
+            span = next_item["long"] - current["long"]
+            factor = 0.0 if span <= 1.0e-12 else (long_value - current["long"]) / span
+            return current[field] * (1.0 - factor) + next_item[field] * factor
+    return profile[-1][field]
+
+
+def build_stem_center_profile(samples, long_min, long_range, cross_range, long_scale, cross_scale, stem_is_min, stem_cross):
+    bin_count = max(24, min(96, len(samples) // 2))
+    bins = [[] for _index in range(bin_count)]
+    for long_value, cross_value, _index in samples:
+        normalized = (long_value - long_min) / long_range
+        bin_index = min(bin_count - 1, max(0, int(normalized * bin_count)))
+        bins[bin_index].append(cross_value)
+
+    centers = []
+    previous_center = stem_cross
+    base_window = max(cross_range * 0.035, 0.004)
+    max_step = max(cross_range * 0.05, 0.004)
+    ordered_bins = range(bin_count) if stem_is_min else range(bin_count - 1, -1, -1)
+    for bin_index in ordered_bins:
+        values = bins[bin_index]
+        if not values:
+            centers.append((bin_index, previous_center))
+            continue
+        ordered = sorted(values)
+
+        window = base_window
+        nearby = [value for value in ordered if abs(value - previous_center) <= window]
+        while len(nearby) < 4 and window < cross_range * 0.22:
+            window *= 1.6
+            nearby = [value for value in ordered if abs(value - previous_center) <= window]
+        if nearby:
+            nearby.sort()
+            low = percentile(nearby, 0.25)
+            high = percentile(nearby, 0.75)
+            center = (low + high) * 0.5
+        else:
+            center = min(ordered, key=lambda value: abs(value - previous_center))
+
+        delta = center - previous_center
+        if abs(delta) > max_step:
+            center = previous_center + max_step * (1.0 if delta > 0.0 else -1.0)
+        centers.append((bin_index, center))
+        previous_center = center
+
+    centers_by_bin = [None] * bin_count
+    for bin_index, center in centers:
+        centers_by_bin[bin_index] = center
+    filled_centers = fill_missing_profile_values(centers_by_bin)
+    if not filled_centers:
+        filled_centers = [stem_cross] * bin_count
+
+    radius = max(2, bin_count // 24)
+    smoothed_centers = smooth_profile_values(filled_centers, radius=radius, passes=3)
+
+    profile = []
+    cumulative = 0.0
+    previous_long = None
+    previous_center = None
+    for bin_index, center in enumerate(smoothed_centers):
+        long_value = long_min + long_range * ((bin_index + 0.5) / bin_count)
+        if previous_long is not None:
+            d_long = (long_value - previous_long) * long_scale
+            d_cross = (center - previous_center) * cross_scale
+            cumulative += (d_long * d_long + d_cross * d_cross) ** 0.5
+        profile.append({"long": long_value, "center": center, "arc": cumulative})
+        previous_long = long_value
+        previous_center = center
+    return profile
+
+
 def straighten_mesh_by_uv(obj, center_window_pct=0.04, end_window_pct=0.015):
     if obj.data.users > 1:
         obj.data = obj.data.copy()
@@ -232,71 +368,96 @@ def straighten_mesh_by_uv(obj, center_window_pct=0.04, end_window_pct=0.015):
     long_range = max(long_max - long_min, 1.0e-12)
 
     source_positions = {vertex.index: vertex.co.copy() for vertex in mesh.vertices}
-    x_values = [position.x for position in source_positions.values()]
-    length = max(x_values) - min(x_values)
-    if length <= 1.0e-12:
-        return False, "Mesh has no usable local X length"
+    local_values = {
+        "X": [position.x for position in source_positions.values()],
+        "Y": [position.y for position in source_positions.values()],
+    }
+    if long_axis == "U":
+        local_long_values = local_values["X"]
+        local_cross_values = local_values["Y"]
+    else:
+        local_long_values = local_values["Y"]
+        local_cross_values = local_values["X"]
 
-    def endpoint_center(use_min):
+    local_long_range = max(local_long_values) - min(local_long_values)
+    local_cross_range = max(local_cross_values) - min(local_cross_values)
+    cross_range = max(max(cross_values.values()) - min(cross_values.values()), 1.0e-12)
+    if local_long_range <= 1.0e-12:
+        return False, f"Mesh has no usable local {'X' if long_axis == 'U' else 'Y'} length"
+    if local_cross_range <= 1.0e-12:
+        local_cross_range = local_long_range * 0.05
+
+    def endpoint_info(use_min):
         window = long_range * end_window_pct
         if use_min:
             indices = [index for index, value in long_values.items() if value <= long_min + window]
         else:
             indices = [index for index, value in long_values.items() if value >= long_max - window]
         positions = [source_positions[index] for index in indices]
-        return Vector(
+        center = Vector(
             (
                 (min(position.x for position in positions) + max(position.x for position in positions)) * 0.5,
                 (min(position.y for position in positions) + max(position.y for position in positions)) * 0.5,
                 (min(position.z for position in positions) + max(position.z for position in positions)) * 0.5,
             )
         )
+        cross_center = (
+            min(cross_values[index] for index in indices) + max(cross_values[index] for index in indices)
+        ) * 0.5
+        return center, cross_center
 
-    min_endpoint = endpoint_center(True)
-    max_endpoint = endpoint_center(False)
+    min_endpoint, min_cross_center = endpoint_info(True)
+    max_endpoint, max_cross_center = endpoint_info(False)
     stem_is_min = Vector((min_endpoint.x, min_endpoint.y, 0.0)).length <= Vector(
         (max_endpoint.x, max_endpoint.y, 0.0)
     ).length
+    stem_cross = min_cross_center if stem_is_min else max_cross_center
 
     samples = [(long_values[index], cross_values[index], index) for index in vertex_uvs]
-    center_window = long_range * center_window_pct
-    center_cache = {}
+    long_scale = local_long_range / long_range
+    cross_scale = local_cross_range / cross_range
+    center_profile = build_stem_center_profile(
+        samples,
+        long_min,
+        long_range,
+        cross_range,
+        long_scale,
+        cross_scale,
+        stem_is_min,
+        stem_cross,
+    )
+    if len(center_profile) < 2:
+        return False, "Could not build a usable stem centerline"
 
-    for long_value, _cross_value, _index in samples:
-        key = round(long_value, 7)
-        if key in center_cache:
-            continue
-        values = [cross for sample_long, cross, _sample_index in samples if abs(sample_long - long_value) <= center_window]
-        multiplier = 1.0
-        while len(values) < 8 and multiplier < 4.0:
-            multiplier *= 1.5
-            values = [
-                cross
-                for sample_long, cross, _sample_index in samples
-                if abs(sample_long - long_value) <= center_window * multiplier
-            ]
-        center_cache[key] = (min(values) + max(values)) * 0.5
-
-    uv_to_local_scale = length / long_range
     new_positions = {}
     for long_value, cross_value, index in samples:
-        t = (long_value - long_min) / long_range
-        x = t * length if stem_is_min else -(1.0 - t) * length
-        y = (cross_value - center_cache[round(long_value, 7)]) * uv_to_local_scale
-        new_positions[index] = Vector((x, y, source_positions[index].z))
+        arc = interpolated_profile_field(center_profile, "arc", long_value)
+        center = interpolated_profile_field(center_profile, "center", long_value)
+        total_length = center_profile[-1]["arc"]
+        long_position = arc if stem_is_min else -(total_length - arc)
+        cross_position = (cross_value - center) * cross_scale
+        if long_axis == "U":
+            new_positions[index] = Vector((long_position, cross_position, source_positions[index].z))
+        else:
+            new_positions[index] = Vector((cross_position, long_position, source_positions[index].z))
 
     window = long_range * end_window_pct
     if stem_is_min:
         stem_indices = [index for index, value in long_values.items() if value <= long_min + window]
     else:
         stem_indices = [index for index, value in long_values.items() if value >= long_max - window]
-    anchor_x = (min(new_positions[index].x for index in stem_indices) + max(new_positions[index].x for index in stem_indices)) * 0.5
-    anchor_y = (min(new_positions[index].y for index in stem_indices) + max(new_positions[index].y for index in stem_indices)) * 0.5
+    anchor_x = (
+        min(new_positions[index].x for index in stem_indices) + max(new_positions[index].x for index in stem_indices)
+    ) * 0.5
+    anchor_y = (
+        min(new_positions[index].y for index in stem_indices) + max(new_positions[index].y for index in stem_indices)
+    ) * 0.5
 
     for index, position in new_positions.items():
         mesh.vertices[index].co = Vector((position.x - anchor_x, position.y - anchor_y, position.z))
     mesh.update()
-    return True, f"{long_axis} axis, stem {'min' if stem_is_min else 'max'}"
+    local_axis = "X" if long_axis == "U" else "Y"
+    return True, f"{long_axis} axis to local {local_axis}, stem centerline, stem {'min' if stem_is_min else 'max'}"
 
 
 class ATLASLEAF_OT_check_dependencies(Operator):

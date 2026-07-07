@@ -434,6 +434,20 @@ def upsert_speedtree_assets_in_spm(spm_path, manifest, material_name):
 
     mesh_paths = [Path(item["fbx"]) for item in manifest["meshes"]]
     mesh_template = first_external_mesh_template()
+    mesh_nodes_by_id = {node.attrib.get("ID"): node for node in assets.findall("Mesh")}
+    mesh_ids_by_filename = {}
+    for mesh_id_text, node in mesh_nodes_by_id.items():
+        try:
+            mesh_id = int(mesh_id_text)
+        except (TypeError, ValueError):
+            continue
+        filename = node.findtext("Filename") or ""
+        if filename:
+            mesh_ids_by_filename[Path(filename).name.lower()] = mesh_id
+        node_name = node.attrib.get("Name")
+        if node_name:
+            mesh_ids_by_filename[f"{node_name}.fbx".lower()] = mesh_id
+
     material = find_material_by_name(assets, material_name)
     action = "updated"
     old_mesh_ids = []
@@ -448,14 +462,28 @@ def upsert_speedtree_assets_in_spm(spm_path, manifest, material_name):
     else:
         material_id = int(material.attrib.get("ID", max_asset_id(assets, "Material_v8") + 1))
         old_mesh_ids = spm_material_mesh_ids(material)
-        mesh_ids = old_mesh_ids[: len(mesh_paths)]
+        old_mesh_id_set = set(old_mesh_ids)
+        mesh_ids = []
+        used_mesh_ids = set()
+        for mesh_path in mesh_paths:
+            existing_id = mesh_ids_by_filename.get(mesh_path.name.lower())
+            if existing_id in old_mesh_id_set and existing_id not in used_mesh_ids:
+                mesh_ids.append(existing_id)
+                used_mesh_ids.add(existing_id)
+            else:
+                mesh_ids.append(None)
+        reusable_old_ids = [mesh_id for mesh_id in old_mesh_ids if mesh_id not in used_mesh_ids]
         next_mesh_id = max_asset_id(assets, "Mesh") + 1
-        while len(mesh_ids) < len(mesh_paths):
-            mesh_ids.append(next_mesh_id)
-            next_mesh_id += 1
+        for index, mesh_id in enumerate(mesh_ids):
+            if mesh_id is not None:
+                continue
+            if reusable_old_ids:
+                mesh_ids[index] = reusable_old_ids.pop(0)
+            else:
+                mesh_ids[index] = next_mesh_id
+                next_mesh_id += 1
         update_spm_material(material, spm_path, manifest["textures"], mesh_ids)
 
-    mesh_nodes_by_id = {node.attrib.get("ID"): node for node in assets.findall("Mesh")}
     for mesh_id, mesh_path in zip(mesh_ids, mesh_paths):
         mesh_node = mesh_nodes_by_id.get(str(mesh_id))
         new_mesh = make_spm_mesh(mesh_template, mesh_id, mesh_path, spm_path)
@@ -538,12 +566,15 @@ def material_suffix_from_collection_name(collection_name):
 
 
 def grouped_source_objects(root_collection, base_material_name):
-    direct_objects = [obj for obj in root_collection.objects if obj.type == "MESH"]
+    def is_export_source(obj):
+        return obj.type == "MESH" and not obj.name.lower().startswith("codex_")
+
+    direct_objects = [obj for obj in root_collection.objects if is_export_source(obj)]
     child_groups = []
 
     def collect_meshes(collection, output):
         for obj in collection.objects:
-            if obj.type == "MESH":
+            if is_export_source(obj):
                 output.append(obj)
         for child in collection.children:
             collect_meshes(child, output)
@@ -568,6 +599,28 @@ def grouped_source_objects(root_collection, base_material_name):
     if direct_objects:
         groups.append({"collection": root_collection.name, "material": base_material_name, "objects": direct_objects})
     return groups
+
+
+def speedtree_mesh_sort_key(obj):
+    match = re.search(r"leaf_(\d+).*front_(\d+)", obj.name, re.IGNORECASE)
+    if match:
+        return (int(match.group(1)), int(match.group(2)), obj.name.lower())
+    match = re.search(r"(\d+)", obj.name)
+    if match:
+        return (int(match.group(1)), int(match.group(1)), obj.name.lower())
+    return (10_000_000, 10_000_000, obj.name.lower())
+
+
+def speedtree_mesh_export_name(source, used_names):
+    match = re.search(r"leaf_(\d+)", source.name, re.IGNORECASE)
+    prefix = f"{int(match.group(1)):02d}" if match else f"{len(used_names) + 1:02d}"
+    candidate = f"{prefix}_{source.name}.fbx"
+    suffix = 2
+    while candidate.lower() in used_names:
+        candidate = f"{prefix}_{source.name}_{suffix}.fbx"
+        suffix += 1
+    used_names.add(candidate.lower())
+    return candidate
 
 
 def export_speedtree_assets(props, export_dir):
@@ -615,14 +668,14 @@ def export_speedtree_assets(props, export_dir):
     depsgraph = bpy.context.evaluated_depsgraph_get()
     exported_meshes = []
     material_groups = []
-    mesh_index = 1
+    used_mesh_filenames = set()
     try:
         for group in source_groups:
             group_meshes = []
             material = materials.get(group["material"])
             if material is None:
                 continue
-            for source in group["objects"]:
+            for source in sorted(group["objects"], key=speedtree_mesh_sort_key):
                 evaluated = source.evaluated_get(depsgraph)
                 mesh = bpy.data.meshes.new_from_object(evaluated, depsgraph=depsgraph)
                 mesh.materials.clear()
@@ -642,7 +695,7 @@ def export_speedtree_assets(props, export_dir):
                 temp_obj.select_set(True)
                 bpy.context.view_layer.objects.active = temp_obj
 
-                fbx_path = mesh_dir / f"{mesh_index:02d}_{source.name}.fbx"
+                fbx_path = mesh_dir / speedtree_mesh_export_name(source, used_mesh_filenames)
                 bpy.ops.export_scene.fbx(
                     filepath=str(fbx_path),
                     use_selection=True,
@@ -662,7 +715,6 @@ def export_speedtree_assets(props, export_dir):
                 }
                 exported_meshes.append(item)
                 group_meshes.append(item)
-                mesh_index += 1
                 bpy.data.objects.remove(temp_obj, do_unlink=True)
                 bpy.data.meshes.remove(mesh, do_unlink=True)
             if group_meshes:
