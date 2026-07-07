@@ -6,75 +6,57 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from PIL import Image
-from skimage import measure
+from PIL import Image, ImageDraw, ImageFont
+from skimage import measure, morphology
 import triangle as tr
 
 
-DEFAULT_PAIRS = [
-    (1, 18),
-    (2, 17),
-    (3, 16),
-    (4, 15),
-    (10, 5),
-    (6, 19),
-    (7, 21),
-    (8, 23),
-    (9, 20),
-    (11, 14),
-    (12, 22),
-    (13, 24),
-]
-
-TRANSFORMS = {
-    "identity": lambda x, y: (x, y),
-    "rot90_cw": lambda x, y: (1.0 - y, x),
-    "rot180": lambda x, y: (1.0 - x, 1.0 - y),
-    "rot90_ccw": lambda x, y: (y, 1.0 - x),
-    "flip_x": lambda x, y: (1.0 - x, y),
-    "flip_y": lambda x, y: (x, 1.0 - y),
-    "transpose": lambda x, y: (y, x),
-    "anti_transpose": lambda x, y: (1.0 - y, 1.0 - x),
-}
+DEFAULT_FRONTS = [1, 2, 3, 4, 10, 6, 7, 8, 9, 11, 12, 13]
 
 QUALITY_PRESETS = {
     "FAST": {"q": 12, "area_factor": 0.24},
     "BALANCED": {"q": 18, "area_factor": 0.42},
     "HIGH": {"q": 22, "area_factor": 0.95},
+    "SPEEDTREE_LOW": {
+        "q": 6,
+        "area_factor": 0.04,
+        "epsilon_min": 2.4,
+        "epsilon_max": 6.0,
+        "epsilon_scale": 0.0024,
+        "near_duplicate": 1.5,
+        "collinear": 0.30,
+    },
 }
 
 
-def parse_pairs(text: str | None) -> list[tuple[int, int]]:
+def parse_pairs(text: str | None) -> list[dict]:
     if not text:
-        return DEFAULT_PAIRS
+        return []
     data = json.loads(text)
     pairs = []
     for item in data:
         if isinstance(item, dict):
-            pairs.append((int(item["front"]), int(item["back"])))
+            pairs.append({"front": int(item["front"])})
         else:
-            pairs.append((int(item[0]), int(item[1])))
+            pairs.append({"front": int(item[0])})
     return pairs
 
 
-def transform_image(image, name):
-    if name == "identity":
-        return image
-    if name == "rot90_cw":
-        return np.rot90(image, 3)
-    if name == "rot180":
-        return np.rot90(image, 2)
-    if name == "rot90_ccw":
-        return np.rot90(image, 1)
-    if name == "flip_x":
-        return np.fliplr(image)
-    if name == "flip_y":
-        return np.flipud(image)
-    if name == "transpose":
-        return image.T
-    if name == "anti_transpose":
-        return np.rot90(image.T, 2)
-    raise ValueError(name)
+def load_font(size):
+    for name in ("arial.ttf", "segoeui.ttf"):
+        try:
+            return ImageFont.truetype(name, size)
+        except OSError:
+            pass
+    return ImageFont.load_default()
+
+
+def draw_text_with_box(draw, xy, text, font, fill=(255, 255, 255), box_fill=(0, 0, 0)):
+    x, y = xy
+    bbox = draw.textbbox((x, y), text, font=font, stroke_width=0)
+    pad = 6
+    draw.rectangle((bbox[0] - pad, bbox[1] - pad, bbox[2] + pad, bbox[3] + pad), fill=box_fill)
+    draw.text((x, y), text, fill=fill, font=font)
 
 
 def signed_area(points):
@@ -139,7 +121,20 @@ def triangle_min_angle(a, b, c):
 
 
 class Pipeline:
-    def __init__(self, albedo_path, alpha_path, pairs, quality, alpha_threshold, min_area):
+    def __init__(
+        self,
+        albedo_path,
+        alpha_path,
+        pairs,
+        quality,
+        alpha_threshold,
+        min_area,
+        shell_gap,
+        side_uv_inset,
+        place_at_origin,
+        no_shell=False,
+        surface_mode="DOUBLE",
+    ):
         self.albedo_path = Path(albedo_path)
         self.alpha_path = Path(alpha_path)
         self.pairs = pairs
@@ -147,6 +142,13 @@ class Pipeline:
         self.quality_name = quality
         self.alpha_threshold = alpha_threshold
         self.min_area = min_area
+        self.shell_gap = shell_gap
+        self.side_uv_inset = side_uv_inset
+        self.place_at_origin = place_at_origin
+        self.no_shell = bool(no_shell)
+        self.surface_mode = str(surface_mode or "DOUBLE").upper()
+        if self.surface_mode not in {"SINGLE", "DOUBLE"}:
+            raise ValueError(f"Unknown surface mode: {surface_mode}")
 
         alpha = np.array(Image.open(self.alpha_path).convert("RGB"))[..., 0]
         self.height, self.width = alpha.shape
@@ -156,6 +158,8 @@ class Pipeline:
             self.mask, connectivity=8
         )
         self.components = self._collect_components()
+        if not self.pairs:
+            self.pairs = [{"front": index} for index in self.components]
 
     def _collect_components(self):
         components = []
@@ -178,22 +182,77 @@ class Pipeline:
         crop = self.component_mask(index)[y : y + h, x : x + w]
         return cv2.resize(crop, (size, size), interpolation=cv2.INTER_NEAREST) > 127
 
-    def select_transform(self, front_index, back_index):
-        front_canon = self.canonical_mask(front_index)
-        back_canon = self.canonical_mask(back_index)
-        scores = []
-        for name in TRANSFORMS:
-            moved_front = transform_image(front_canon, name)
-            if moved_front.shape != back_canon.shape:
-                moved_front = (
-                    cv2.resize(moved_front.astype(np.uint8), back_canon.shape[::-1], interpolation=cv2.INTER_NEAREST)
-                    > 0
-                )
-            intersection = np.logical_and(moved_front, back_canon).sum()
-            union = np.logical_or(moved_front, back_canon).sum()
-            scores.append((float(intersection / union) if union else 0.0, name))
-        scores.sort(reverse=True)
-        return scores[0][1], scores
+    def resolved_pairs(self):
+        rows = []
+        for pair_number, pair in enumerate(self.pairs, 1):
+            front_index = int(pair["front"])
+            rows.append(
+                {
+                    "pair": pair_number,
+                    "front": front_index,
+                }
+            )
+        return rows
+
+    def crop_component_image(self, image, index, size):
+        x, y, w, h = self.components[index]["bbox"]
+        pad = max(24, int(max(w, h) * 0.06))
+        crop = image.crop((max(0, x - pad), max(0, y - pad), min(image.width, x + w + pad), min(image.height, y + h + pad)))
+        crop.thumbnail(size, Image.Resampling.LANCZOS)
+        return crop
+
+    def write_label_previews(self, output_dir):
+        output = Path(output_dir)
+        output.mkdir(parents=True, exist_ok=True)
+        image = Image.open(self.albedo_path).convert("RGB")
+        front_set = {int(pair["front"]) for pair in self.pairs}
+
+        label_image = image.copy()
+        draw = ImageDraw.Draw(label_image)
+        number_font = load_font(82)
+        small_font = load_font(42)
+        for index, component in self.components.items():
+            x, y, w, h = component["bbox"]
+            if index in front_set:
+                color = (0, 220, 255)
+                tag = "F"
+            else:
+                color = (255, 120, 40)
+                tag = "?"
+            draw.rectangle((x, y, x + w, y + h), outline=color, width=8)
+            draw_text_with_box(draw, (x + 12, y + 12), f"{index:02d}", number_font, fill=color)
+            draw_text_with_box(draw, (x + 12, y + 112), tag, small_font, fill=color)
+
+        label_image.thumbnail((2200, 2200), Image.Resampling.LANCZOS)
+        label_path = output / "atlas_leaf_island_labels.jpg"
+        label_image.save(label_path, quality=94)
+
+        pairs = self.resolved_pairs()
+        tile_w = 420
+        tile_h = 520
+        columns = 4
+        rows = int(np.ceil(len(pairs) / columns))
+        sheet = Image.new("RGB", (tile_w * columns, tile_h * rows), (22, 22, 22))
+        title_font = load_font(34)
+        label_font = load_font(28)
+        for item in pairs:
+            pair_index = item["pair"] - 1
+            tile_x = (pair_index % columns) * tile_w
+            tile_y = (pair_index // columns) * tile_h
+            tile_draw = ImageDraw.Draw(sheet)
+            tile_draw.rectangle((tile_x + 8, tile_y + 8, tile_x + tile_w - 8, tile_y + tile_h - 8), outline=(90, 90, 90), width=2)
+            title = f"Leaf {item['pair']:02d}  F{item['front']:02d}"
+            draw_text_with_box(tile_draw, (tile_x + 22, tile_y + 20), title, title_font, fill=(255, 255, 255), box_fill=(40, 40, 40))
+
+            front_crop = self.crop_component_image(image, item["front"], (350, 410))
+            front_x = tile_x + (tile_w - front_crop.width) // 2
+            crop_y = tile_y + 96
+            sheet.paste(front_crop, (front_x, crop_y + (410 - front_crop.height) // 2))
+            draw_text_with_box(tile_draw, (tile_x + 38, tile_y + 466), f"front {item['front']:02d}", label_font, fill=(0, 220, 255))
+
+        pair_path = output / "atlas_leaf_front_preview.jpg"
+        sheet.save(pair_path, quality=94)
+        return {"island_labels": str(label_path), "pair_preview": str(pair_path), "pairs": pairs}
 
     def extract_subpixel_polygon(self, index):
         x, y, w, h = self.components[index]["bbox"]
@@ -207,13 +266,19 @@ class Pipeline:
         contours = measure.find_contours(crop, 0.5, fully_connected="high")
         contour = max(contours, key=len)
         image_points = [(float(x0 + col), float(y0 + row)) for row, col in contour]
-        image_points = remove_near_duplicates(image_points, 0.35)
+        image_points = remove_near_duplicates(image_points, float(self.quality.get("near_duplicate", 0.35)))
         contour_np = np.array(image_points, dtype=np.float32).reshape((-1, 1, 2))
         perimeter = cv2.arcLength(contour_np, True)
-        epsilon = max(0.55, min(1.35, perimeter * 0.00055))
+        epsilon = max(
+            float(self.quality.get("epsilon_min", 0.55)),
+            min(float(self.quality.get("epsilon_max", 1.35)), perimeter * float(self.quality.get("epsilon_scale", 0.00055))),
+        )
         approx = cv2.approxPolyDP(contour_np, epsilon, True).reshape((-1, 2))
-        simplified = remove_near_duplicates([(float(px), float(py)) for px, py in approx], 0.6)
-        simplified = remove_almost_collinear(simplified, 0.05)
+        simplified = remove_near_duplicates(
+            [(float(px), float(py)) for px, py in approx],
+            float(self.quality.get("near_duplicate", 0.6)),
+        )
+        simplified = remove_almost_collinear(simplified, float(self.quality.get("collinear", 0.05)))
         return simplified, len(image_points), epsilon
 
     def triangulate_quality(self, object_poly):
@@ -226,28 +291,78 @@ class Pipeline:
         result = tr.triangulate({"vertices": vertices, "segments": segments}, f"pq{self.quality['q']}a{max_area:.8f}")
         out_vertices = result["vertices"]
         triangles = result["triangles"]
+        out_segments = result.get("segments", segments)
         min_angles = [triangle_min_angle(out_vertices[a], out_vertices[b], out_vertices[c]) for a, b, c in triangles]
-        return out_vertices, triangles, max_area, float(min(min_angles))
+        return out_vertices, triangles, out_segments, max_area, float(min(min_angles))
 
     def uv_from_pixel(self, px, py):
         return px / self.width, 1.0 - py / self.height
 
-    def map_front_pixel_to_back(self, px, py, front_bbox, back_bbox, transform_name):
-        fx, fy, fw, fh = front_bbox
-        bx, by, bw, bh = back_bbox
-        nx = (px - fx) / max(1, fw)
-        ny = (py - fy) / max(1, fh)
-        tx, ty = TRANSFORMS[transform_name](nx, ny)
-        return bx + tx * bw, by + ty * bh
+    def inset_uv_toward(self, uv, target_uv):
+        u, v = uv
+        tu, tv = target_uv
+        factor = float(np.clip(self.side_uv_inset, 0.0, 0.95))
+        return [float(u + (tu - u) * factor), float(v + (tv - v) * factor)]
+
+    def stem_pivot_from_polygon(self, object_poly):
+        points = np.array(object_poly, dtype=np.float64)
+        min_y = float(points[:, 1].min())
+        max_y = float(points[:, 1].max())
+        height = max(max_y - min_y, 1e-8)
+        candidates = points[points[:, 1] <= min_y + height * 0.04]
+        if len(candidates) == 0:
+            candidates = points[points[:, 1] == min_y]
+        return float(np.median(candidates[:, 0])), min_y, "contour_bottom"
+
+    def stem_pivot_from_skeleton(self, front_index, object_poly, leaf_scale):
+        x, y, w, h = self.components[front_index]["bbox"]
+        crop = self.component_mask(front_index)[y : y + h, x : x + w] > 127
+        if crop.sum() == 0:
+            return self.stem_pivot_from_polygon(object_poly)
+
+        skeleton = morphology.skeletonize(crop)
+        if not skeleton.any():
+            return self.stem_pivot_from_polygon(object_poly)
+
+        padded = np.pad(skeleton.astype(np.uint8), 1)
+        endpoints = []
+        ys, xs = np.nonzero(skeleton)
+        for sy, sx in zip(ys, xs):
+            window = padded[sy : sy + 3, sx : sx + 3]
+            neighbor_count = int(window.sum()) - 1
+            if neighbor_count == 1:
+                endpoints.append((sx, sy))
+
+        if not endpoints:
+            return self.stem_pivot_from_polygon(object_poly)
+
+        centroid_x = float(self.components[front_index]["centroid"][0] - x)
+        centroid_y = float(self.components[front_index]["centroid"][1] - y)
+        height = max(float(h), 1.0)
+        width = max(float(w), 1.0)
+
+        def endpoint_score(point):
+            sx, sy = point
+            lower_score = sy / height
+            center_score = 1.0 - min(abs(sx - centroid_x) / width, 1.0)
+            distance_score = np.hypot((sx - centroid_x) / width, (sy - centroid_y) / height)
+            return lower_score * 3.0 + distance_score * 0.75 + center_score * 0.15
+
+        sx, sy = max(endpoints, key=endpoint_score)
+        px = x + float(sx)
+        py = y + float(sy)
+        ox = (px - (x + w * 0.5)) * leaf_scale
+        oy = ((y + h * 0.5) - py) * leaf_scale
+        return float(ox), float(oy), "skeleton_endpoint"
 
     def build(self):
         objects = []
         summaries = []
         leaf_scale = 1.0 / 620.0
-        for pair_number, (front_index, back_index) in enumerate(self.pairs, 1):
-            transform_name, transform_scores = self.select_transform(front_index, back_index)
+        single_plate = self.surface_mode == "SINGLE"
+        for pair_number, pair in enumerate(self.pairs, 1):
+            front_index = int(pair["front"])
             front_bbox = self.components[front_index]["bbox"]
-            back_bbox = self.components[back_index]["bbox"]
             fx, fy, fw, fh = front_bbox
             image_poly, dense_count, epsilon = self.extract_subpixel_polygon(front_index)
             object_poly = [
@@ -257,63 +372,102 @@ class Pipeline:
             if signed_area(object_poly) < 0:
                 image_poly = list(reversed(image_poly))
                 object_poly = list(reversed(object_poly))
-            q_vertices, q_triangles, max_area, min_angle = self.triangulate_quality(object_poly)
+            q_vertices, q_triangles, q_segments, max_area, min_angle = self.triangulate_quality(object_poly)
+            pivot_x, pivot_y, pivot_source = self.stem_pivot_from_skeleton(front_index, object_poly, leaf_scale)
 
             col = (pair_number - 1) % 4
             row = (pair_number - 1) // 4
-            leaf_center_x = (col - 1.5) * 1.45
-            leaf_center_y = (1 - row) * 1.45
+            leaf_center_x = 0.0 if self.place_at_origin else (col - 1.5) * 1.45
+            leaf_center_y = 0.0 if self.place_at_origin else (1 - row) * 1.45
 
-            front_vertices = []
-            back_vertices = []
+            vertices = []
+            uvs = []
+            front_z = 0.0 if single_plate else self.shell_gap * 0.5
+            back_z = -self.shell_gap * 0.5
             front_uvs = []
             back_uvs = []
+            face_uvs = []
+            front_center_uv = self.uv_from_pixel(
+                self.components[front_index]["centroid"][0],
+                self.components[front_index]["centroid"][1],
+            )
             for ox, oy in q_vertices:
                 px = ox / leaf_scale + (fx + fw * 0.5)
                 py = (fy + fh * 0.5) - oy / leaf_scale
-                world = [float(ox + leaf_center_x), float(oy + leaf_center_y), 0.0]
+                front_world = [float(ox - pivot_x + leaf_center_x), float(oy - pivot_y + leaf_center_y), float(front_z)]
                 fu, fv = self.uv_from_pixel(px, py)
-                bx, by = self.map_front_pixel_to_back(px, py, front_bbox, back_bbox, transform_name)
-                bu, bv = self.uv_from_pixel(bx, by)
-                front_vertices.append(world)
-                back_vertices.append(world)
+                vertices.append(front_world)
+                uvs.append([float(fu), float(fv)])
                 front_uvs.append([float(fu), float(fv)])
-                back_uvs.append([float(bu), float(bv)])
+                if not single_plate:
+                    back_world = [float(ox - pivot_x + leaf_center_x), float(oy - pivot_y + leaf_center_y), float(back_z)]
+                    vertices.append(back_world)
+                    uvs.append([float(fu), float(fv)])
+                    back_uvs.append([float(fu), float(fv)])
 
-            front_faces = [[int(a), int(b), int(c)] for a, b, c in q_triangles]
-            back_faces = [[int(c), int(b), int(a)] for a, b, c in q_triangles]
+            faces = []
+            face_materials = []
+            for a, b, c in q_triangles:
+                if single_plate:
+                    faces.append([int(a), int(b), int(c)])
+                else:
+                    faces.append([int(a * 2), int(b * 2), int(c * 2)])
+                face_materials.append(0)
+                face_uvs.append([front_uvs[int(a)], front_uvs[int(b)], front_uvs[int(c)]])
+            if not single_plate:
+                for a, b, c in q_triangles:
+                    faces.append([int(c * 2 + 1), int(b * 2 + 1), int(a * 2 + 1)])
+                    face_materials.append(1)
+                    face_uvs.append([back_uvs[int(c)], back_uvs[int(b)], back_uvs[int(a)]])
+
+            if not single_plate and not self.no_shell:
+                for start_index, end_index in q_segments:
+                    start_index = int(start_index)
+                    end_index = int(end_index)
+                    faces.append([start_index * 2, start_index * 2 + 1, end_index * 2 + 1, end_index * 2])
+                    face_materials.append(2)
+                    start_uv = front_uvs[start_index]
+                    end_uv = front_uvs[end_index]
+                    start_inner_uv = self.inset_uv_toward(start_uv, front_center_uv)
+                    end_inner_uv = self.inset_uv_toward(end_uv, front_center_uv)
+                    face_uvs.append([start_uv, start_inner_uv, end_inner_uv, end_uv])
+
             objects.append(
                 {
-                    "name": f"leaf_pair_{pair_number:02d}_front_{front_index:02d}_to_back_{back_index:02d}_{transform_name}",
-                    "material": "front",
-                    "vertices": front_vertices,
-                    "uvs": front_uvs,
-                    "faces": front_faces,
-                }
-            )
-            objects.append(
-                {
-                    "name": f"leaf_pair_{pair_number:02d}_back_{back_index:02d}_from_front_{front_index:02d}_{transform_name}",
-                    "material": "back",
-                    "vertices": back_vertices,
-                    "uvs": back_uvs,
-                    "faces": back_faces,
+                    "name": f"leaf_{pair_number:02d}_front_{front_index:02d}_{self.surface_mode.lower()}_plate",
+                    "materials": ["front"] if single_plate else ["front", "back", "side"],
+                    "vertices": vertices,
+                    "uvs": uvs,
+                    "faces": faces,
+                    "face_materials": face_materials,
+                    "face_uvs": face_uvs,
+                    "location": [0.0, 0.0, 0.0],
+                    "pivot": [pivot_x, pivot_y],
+                    "pivot_source": pivot_source,
+                    "shell_gap": self.shell_gap,
+                    "side_uv_inset": self.side_uv_inset,
+                    "no_shell": self.no_shell,
+                    "surface_mode": self.surface_mode,
+                    "boundary_count": int(len(q_segments)),
                 }
             )
             summaries.append(
                 {
                     "pair": pair_number,
                     "front": front_index,
-                    "back": back_index,
-                    "transform": transform_name,
-                    "iou": transform_scores[0][0],
                     "boundary_points": len(image_poly),
                     "quality_vertices": len(q_vertices),
                     "triangles_per_side": len(q_triangles),
+                    "side_quads": 0 if single_plate or self.no_shell else int(len(q_segments)),
+                    "shell_gap": self.shell_gap,
+                    "side_uv_inset": self.side_uv_inset,
+                    "no_shell": self.no_shell,
+                    "surface_mode": self.surface_mode,
+                    "pivot": [pivot_x, pivot_y],
+                    "pivot_source": pivot_source,
                     "epsilon": epsilon,
                     "max_area": max_area,
                     "min_angle": min_angle,
-                    "top_candidates": [{"transform": name, "score": score} for score, name in transform_scores[:4]],
                 }
             )
         return {
@@ -321,6 +475,11 @@ class Pipeline:
             "albedo_path": str(self.albedo_path),
             "alpha_path": str(self.alpha_path),
             "quality": self.quality_name,
+            "shell_gap": self.shell_gap,
+            "side_uv_inset": self.side_uv_inset,
+            "no_shell": self.no_shell,
+            "surface_mode": self.surface_mode,
+            "place_at_origin": self.place_at_origin,
             "component_count": len(self.components),
             "objects": objects,
             "summary": summaries,
@@ -333,20 +492,44 @@ def main():
     parser.add_argument("--alpha", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--pairs-json", default="")
+    parser.add_argument("--preview-dir", default="")
+    parser.add_argument("--preview-only", action="store_true")
     parser.add_argument("--quality", choices=sorted(QUALITY_PRESETS), default="BALANCED")
     parser.add_argument("--alpha-threshold", type=int, default=127)
     parser.add_argument("--min-area", type=int, default=400)
+    parser.add_argument("--shell-gap", type=float, default=0.012)
+    parser.add_argument("--side-uv-inset", type=float, default=0.035)
+    parser.add_argument("--no-shell", action="store_true")
+    parser.add_argument("--surface-mode", choices=("SINGLE", "DOUBLE"), default="DOUBLE")
+    parser.add_argument("--place-at-origin", action="store_true")
     args = parser.parse_args()
 
+    pairs = parse_pairs(args.pairs_json)
     pipeline = Pipeline(
         args.albedo,
         args.alpha,
-        parse_pairs(args.pairs_json),
+        pairs,
         args.quality,
         args.alpha_threshold,
         args.min_area,
+        args.shell_gap,
+        args.side_uv_inset,
+        args.place_at_origin,
+        args.no_shell,
+        args.surface_mode,
     )
-    data = pipeline.build()
+    if args.preview_only:
+        data = {
+            "version": 1,
+            "albedo_path": str(pipeline.albedo_path),
+            "alpha_path": str(pipeline.alpha_path),
+            "component_count": len(pipeline.components),
+            "preview": pipeline.write_label_previews(args.preview_dir or Path(args.output).parent),
+        }
+    else:
+        data = pipeline.build()
+        if args.preview_dir:
+            data["preview"] = pipeline.write_label_previews(args.preview_dir)
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(data), encoding="utf-8")
