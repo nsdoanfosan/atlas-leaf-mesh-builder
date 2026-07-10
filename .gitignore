@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 *.pyo
+desktop.ini
 *.blend1
 *.blend2
 .venv/

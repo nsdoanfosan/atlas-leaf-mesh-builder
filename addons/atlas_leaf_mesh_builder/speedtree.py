@@ -3,16 +3,22 @@ import gzip
 import json
 import re
 import shutil
+import uuid
 from pathlib import Path
 from xml.dom import minidom
 import xml.etree.ElementTree as ET
 
 import bpy
+from mathutils import Matrix, Vector
 
 from .constants import SPEEDTREE_101_BLANK_SPM, SPEEDTREE_101_EXTERNAL_MESH_SAMPLE, SPEEDTREE_101_MATERIAL_SAMPLE
 from .materials import make_speedtree_material
 from .props import speedtree_spm_targets
 from .utils import run_external_python
+
+
+ATLAS_LEAF_SPM_GENERATOR = "Atlas Leaf Mesh Builder"
+ATLAS_LEAF_COLLECTION_SCOPE_KEY = "atlas_leaf_speedtree_scope_id"
 
 
 def atlas_texture_paths(albedo_path):
@@ -156,17 +162,18 @@ def write_speedtree_readme(export_dir, manifest):
         "## Contents",
         "",
         "- The target `.spm` is a SpeedTree Modeler 10.1 asset file with one named material linked to all generated leaf meshes.",
-        f"- Mesh FBX files: `{mesh_count}`",
+        f"- Mesh asset files: `{mesh_count}` FBX/XML entries",
         "- Textures are in `textures/`.",
         "- Meshes are closed shells with the stem pivot at object origin.",
-        "- FBX export uses a single material per mesh for SpeedTree mesh assets.",
+        "- FBX export uses a single material per mesh; XML assets are written when anchors are present.",
         f"- FBX mesh geometry scale: `{manifest.get('mesh_geometry_scale', 1)}`; SpeedTree Mesh asset Scale remains `1`.",
+        f"- Anchor export mode: `{manifest.get('anchor_export_mode', 'OFF')}`.",
         "",
         "## Suggested SpeedTree Setup",
         "",
         "1. Open the target `.spm` in SpeedTree Modeler 10.1.",
         "2. The atlas material should already reference the texture maps in `textures/`.",
-        "3. The material's cutout mesh list should reference the FBX files in `meshes/`.",
+        "3. The material's cutout mesh list should reference the generated asset files in `meshes/`.",
         "4. Use that material/mesh set in a Leaf Mesh generator as leaf variants.",
         "5. If SpeedTree asks to relink files, keep the `.spm`, `meshes/`, and `textures/` folders together.",
         "",
@@ -177,6 +184,205 @@ def write_speedtree_readme(export_dir, manifest):
         lines.append(f"- {key}: `{Path(value).name}`")
     path.write_text("\n".join(lines), encoding="utf-8")
     return path
+
+
+def speedtree_float(value):
+    return f"{float(value):.7g}"
+
+
+def child_number_list(node, tag, values):
+    child = ET.SubElement(node, tag)
+    child.text = " ".join(speedtree_float(value) for value in values) + " "
+    return child
+
+
+def child_int_list(node, tag, values):
+    child = ET.SubElement(node, tag)
+    child.text = " ".join(str(int(value)) for value in values) + " "
+    return child
+
+
+def object_bounds(points):
+    if not points:
+        return {}
+    xs = [point[0] for point in points]
+    ys = [point[1] for point in points]
+    zs = [point[2] for point in points]
+    return {
+        "BoundsMinX": speedtree_float(min(xs)),
+        "BoundsMinY": speedtree_float(min(ys)),
+        "BoundsMinZ": speedtree_float(min(zs)),
+        "BoundsMaxX": speedtree_float(max(xs)),
+        "BoundsMaxY": speedtree_float(max(ys)),
+        "BoundsMaxZ": speedtree_float(max(zs)),
+    }
+
+
+def speedtree_anchor_prefix(props):
+    return (getattr(props, "speedtree_anchor_prefix", "") or "anchor").lower()
+
+
+def is_speedtree_anchor_empty(obj, props):
+    if obj.type != "EMPTY":
+        return False
+    prefix = speedtree_anchor_prefix(props)
+    return bool(obj.get("atlas_leaf_speedtree_anchor")) or obj.name.lower().startswith(prefix)
+
+
+def source_anchor_roots(source):
+    roots = []
+    parent = source.parent
+    if parent is not None and parent.type == "EMPTY" and parent.get("atlas_leaf_anchor_container"):
+        roots.extend(parent.children)
+    roots.extend(source.children)
+    return roots
+
+
+def collect_source_anchors(source, props, mesh_geometry_scale):
+    anchors = []
+
+    def walk(obj):
+        if obj == source:
+            return
+        if is_speedtree_anchor_empty(obj, props):
+            local_matrix = source.matrix_world.inverted() @ obj.matrix_world
+            position = local_matrix.translation * mesh_geometry_scale
+            rotation = local_matrix.to_quaternion()
+            axis, angle = rotation.to_axis_angle()
+            if abs(angle) <= 1.0e-8:
+                axis = Vector((0.0, 1.0, 0.0))
+            anchor_id = obj.get("speedtree_anchor_id", getattr(props, "speedtree_anchor_material_id", 0))
+            anchors.append(
+                {
+                    "name": obj.name,
+                    "position": [float(position.x), float(position.y), float(position.z)],
+                    "axis": [float(axis.x), float(axis.y), float(axis.z)],
+                    "angle_degrees": float(angle * 180.0 / 3.141592653589793),
+                    "scale": float(getattr(props, "speedtree_anchor_scale", 1.0)),
+                    "material_id": int(anchor_id),
+                    "local_matrix": Matrix.Translation(position) @ rotation.to_matrix().to_4x4(),
+                }
+            )
+        for child in obj.children:
+            walk(child)
+
+    for root in source_anchor_roots(source):
+        walk(root)
+    anchors.sort(key=lambda item: item["name"].lower())
+    return anchors
+
+
+def write_speedtree_xml_mesh(xml_path, mesh, material_name, anchors):
+    mesh.calc_loop_triangles()
+    uv_layer = mesh.uv_layers.active.data if mesh.uv_layers.active else None
+
+    points = []
+    normals = []
+    uvs = []
+    point_indices = []
+    vertex_indices = []
+    for triangle in mesh.loop_triangles:
+        for loop_index in triangle.loops:
+            vertex_index = mesh.loops[loop_index].vertex_index
+            vertex = mesh.vertices[vertex_index]
+            normal = mesh.loops[loop_index].normal
+            uv = uv_layer[loop_index].uv if uv_layer else None
+            index = len(points)
+            points.append((float(vertex.co.x), float(vertex.co.y), float(vertex.co.z)))
+            normals.append((float(normal.x), float(normal.y), float(normal.z)))
+            uvs.append((float(uv.x), float(uv.y)) if uv else (0.0, 0.0))
+            point_indices.append(index)
+            vertex_indices.append(index)
+
+    root = ET.Element(
+        "SpeedTreeRaw",
+        {
+            "VersionMajor": "9",
+            "VersionMinor": "4",
+            "UserData": "Atlas Leaf Mesh Builder",
+            "Source": str(xml_path),
+        },
+    )
+    materials = ET.SubElement(root, "Materials", {"Count": "1", "FlipOpacity": "0"})
+    ET.SubElement(
+        materials,
+        "Material",
+        {
+            "ID": "0",
+            "Name": material_name or "AtlasLeaf_Material",
+            "TwoSided": "1",
+            "UserData": "",
+            "VertexOpacity": "1",
+            "FlipNormalsOnBackside": "1",
+        },
+    )
+    objects = ET.SubElement(root, "Objects", {"Count": "3" if anchors else "2", **object_bounds(points)})
+    ET.SubElement(objects, "Object", {"ID": "0", "Name": Path(xml_path).stem, "AbsX": "0", "AbsY": "0", "AbsZ": "0", "RelX": "0", "RelY": "0", "RelZ": "0"})
+    mesh_object = ET.SubElement(
+        objects,
+        "Object",
+        {
+            "ID": "1",
+            "ParentID": "0",
+            "Name": Path(xml_path).stem,
+            "AbsX": "0",
+            "AbsY": "0",
+            "AbsZ": "0",
+            "RelX": "0",
+            "RelY": "0",
+            "RelZ": "0",
+            **object_bounds(points),
+        },
+    )
+    point_node = ET.SubElement(mesh_object, "Points", {"Count": str(len(points))})
+    child_number_list(point_node, "X", [point[0] for point in points])
+    child_number_list(point_node, "Y", [point[1] for point in points])
+    child_number_list(point_node, "Z", [point[2] for point in points])
+
+    vertex_node = ET.SubElement(mesh_object, "Vertices", {"Count": str(len(points))})
+    child_number_list(vertex_node, "NormalX", [normal[0] for normal in normals])
+    child_number_list(vertex_node, "NormalY", [normal[1] for normal in normals])
+    child_number_list(vertex_node, "NormalZ", [normal[2] for normal in normals])
+    child_number_list(vertex_node, "TexcoordU", [uv[0] for uv in uvs])
+    child_number_list(vertex_node, "TexcoordV", [uv[1] for uv in uvs])
+    child_number_list(vertex_node, "AO", [1.0] * len(points))
+    child_number_list(vertex_node, "Blend", [0.0] * len(points))
+    child_number_list(vertex_node, "VertexColorR", [1.0] * len(points))
+    child_number_list(vertex_node, "VertexColorG", [1.0] * len(points))
+    child_number_list(vertex_node, "VertexColorB", [1.0] * len(points))
+    child_number_list(vertex_node, "VertexColorA", [1.0] * len(points))
+    child_number_list(vertex_node, "GeometryType", [0.0] * len(points))
+
+    triangle_node = ET.SubElement(mesh_object, "Triangles", {"Material": "0", "Count": str(len(mesh.loop_triangles))})
+    child_int_list(triangle_node, "PointIndices", point_indices)
+    child_int_list(triangle_node, "VertexIndices", vertex_indices)
+
+    if anchors:
+        anchor_object = ET.SubElement(
+            objects,
+            "Object",
+            {"ID": "2", "ParentID": "0", "Name": "Anchors", "AbsX": "0", "AbsY": "0", "AbsZ": "0", "RelX": "0", "RelY": "0", "RelZ": "0"},
+        )
+        material_id = str(anchors[0]["material_id"])
+        refs = ET.SubElement(anchor_object, "LeafReferences", {"Material": material_id, "Count": str(len(anchors))})
+        child_number_list(refs, "X", [anchor["position"][0] for anchor in anchors])
+        child_number_list(refs, "Y", [anchor["position"][1] for anchor in anchors])
+        child_number_list(refs, "Z", [anchor["position"][2] for anchor in anchors])
+        child_number_list(refs, "Scale", [anchor["scale"] for anchor in anchors])
+        child_number_list(refs, "RotAxisX", [anchor["axis"][0] for anchor in anchors])
+        child_number_list(refs, "RotAxisY", [anchor["axis"][1] for anchor in anchors])
+        child_number_list(refs, "RotAxisZ", [anchor["axis"][2] for anchor in anchors])
+        child_number_list(refs, "RotAngle", [anchor["angle_degrees"] for anchor in anchors])
+        child_int_list(refs, "MeshID", [0] * len(anchors))
+        child_int_list(refs, "MeshLOD", [0] * len(anchors))
+        child_number_list(refs, "VertexColorR", [1.0] * len(anchors))
+        child_number_list(refs, "VertexColorG", [1.0] * len(anchors))
+        child_number_list(refs, "VertexColorB", [1.0] * len(anchors))
+
+    rough = ET.tostring(root, encoding="utf-8")
+    pretty = minidom.parseString(rough).toprettyxml(indent="\t", encoding="UTF-8")
+    Path(xml_path).write_bytes(pretty)
+    return xml_path
 
 
 def read_spm_xml(path):
@@ -206,6 +412,108 @@ def child_text(node, tag, value):
         child = ET.SubElement(node, tag)
     child.text = str(value)
     return child
+
+
+def spm_export_scope(manifest):
+    return str(manifest.get("export_scope_id") or manifest.get("source_collection") or "AtlasLeaf")
+
+
+def manifests_share_export_scope(manifest, previous_manifest):
+    if not isinstance(manifest, dict) or not isinstance(previous_manifest, dict):
+        return False
+    current_id = manifest.get("export_scope_id")
+    previous_id = previous_manifest.get("export_scope_id")
+    return bool(current_id and previous_id and str(current_id) == str(previous_id))
+
+
+def scope_manifest_filename(scope_id):
+    text = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(scope_id)).strip("._")
+    return f"{text or 'AtlasLeaf'}.json"
+
+
+def scope_manifest_path(export_dir, manifest):
+    return Path(export_dir) / ".atlas_leaf_speedtree_scopes" / scope_manifest_filename(spm_export_scope(manifest))
+
+
+def previous_scope_manifest(export_dir, manifest, fallback_manifest=None):
+    scoped_manifest = read_json_file(scope_manifest_path(export_dir, manifest), {})
+    if manifests_share_export_scope(manifest, scoped_manifest):
+        return scoped_manifest
+    if manifests_share_export_scope(manifest, fallback_manifest or {}):
+        return fallback_manifest
+    return {}
+
+
+def write_scope_manifest(export_dir, manifest):
+    path = scope_manifest_path(export_dir, manifest)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    return path
+
+
+def ensure_collection_export_scope_id(collection):
+    scope_id = collection.get(ATLAS_LEAF_COLLECTION_SCOPE_KEY)
+    if not scope_id:
+        scope_id = uuid.uuid4().hex
+        collection[ATLAS_LEAF_COLLECTION_SCOPE_KEY] = scope_id
+    return str(scope_id)
+
+
+def blend_paths_equal(path_a, path_b):
+    try:
+        return Path(path_a).resolve() == Path(path_b).resolve()
+    except OSError:
+        return str(path_a).replace("\\", "/").lower() == str(path_b).replace("\\", "/").lower()
+
+
+def resolve_export_scope_id(collection, export_dir):
+    scope_id = ensure_collection_export_scope_id(collection)
+    probe = {"export_scope_id": scope_id}
+    existing = read_json_file(scope_manifest_path(export_dir, probe), {})
+    if manifests_share_export_scope(probe, existing):
+        previous_blend = str(existing.get("blend_file") or "")
+        current_blend = str(bpy.data.filepath or "")
+        if (
+            previous_blend
+            and current_blend
+            and not blend_paths_equal(previous_blend, current_blend)
+            and Path(previous_blend).exists()
+        ):
+            # The scope id arrived here through a copied blend/collection and the
+            # original atlas still exists. Claim a fresh scope so the sibling
+            # atlas's SPM materials, meshes, and FBX files are left untouched.
+            scope_id = uuid.uuid4().hex
+            collection[ATLAS_LEAF_COLLECTION_SCOPE_KEY] = scope_id
+    return scope_id
+
+
+def atlas_leaf_spm_user_data(manifest, kind):
+    payload = {
+        "generator": ATLAS_LEAF_SPM_GENERATOR,
+        "scope": spm_export_scope(manifest),
+        "kind": kind,
+    }
+    group = manifest.get("material_collection") if isinstance(manifest, dict) else None
+    if group:
+        payload["group"] = str(group)
+    return json.dumps(payload, separators=(",", ":"), sort_keys=True)
+
+
+def parse_atlas_leaf_spm_user_data(text):
+    if not text:
+        return {}
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return {}
+    if payload.get("generator") != ATLAS_LEAF_SPM_GENERATOR:
+        return {}
+    return payload
+
+
+def tag_spm_asset(node, manifest, kind):
+    child_text(node, "UserData", atlas_leaf_spm_user_data(manifest, kind))
+    return node
 
 
 def make_season_control_point(x, y="1"):
@@ -276,11 +584,13 @@ def set_material_map(material, map_name, texture_path, spm_path, enabled=True):
         child_text(map_node, "TexEnabled", "false")
 
 
-def make_spm_material(spm_path, texture_exports, mesh_ids, material_name):
+def make_spm_material(spm_path, texture_exports, mesh_ids, material_name, manifest=None):
     material = first_material_template()
     material.attrib["ID"] = "1"
     material.attrib["Name"] = material_name
     update_spm_material(material, spm_path, texture_exports, mesh_ids)
+    if manifest is not None:
+        tag_spm_asset(material, manifest, "material")
     return material
 
 
@@ -345,7 +655,235 @@ def find_material_by_name(assets, material_name):
     return None
 
 
-def make_spm_mesh(mesh_template, mesh_id, fbx_path, spm_path):
+def material_scope_matches(material, manifest):
+    user_data = parse_atlas_leaf_spm_user_data(material.findtext("UserData"))
+    return bool(user_data) and user_data.get("scope") == spm_export_scope(manifest)
+
+
+def find_scope_group_material(assets, manifest):
+    if assets is None:
+        return None
+    group = str(manifest.get("material_collection") or "")
+    if not group:
+        return None
+    for node in assets.findall("Material_v8"):
+        user_data = parse_atlas_leaf_spm_user_data(node.findtext("UserData"))
+        if not user_data or user_data.get("scope") != spm_export_scope(manifest):
+            continue
+        if str(user_data.get("group") or "") == group:
+            return node
+    return None
+
+
+def manifest_material_names(manifest):
+    names = set()
+    if not isinstance(manifest, dict):
+        return names
+    for key in ("material", "material_name"):
+        value = manifest.get(key)
+        if value:
+            names.add(str(value))
+    for group_key in ("material_groups", "speedtree_material_groups"):
+        for group in manifest.get(group_key) or []:
+            value = group.get("material") if isinstance(group, dict) else None
+            if value:
+                names.add(str(value))
+    return names
+
+
+def manifest_mesh_asset_paths(manifest):
+    paths = set()
+    if not isinstance(manifest, dict):
+        return paths
+
+    def collect_meshes(meshes):
+        for item in meshes or []:
+            if not isinstance(item, dict):
+                continue
+            for key in ("asset", "fbx", "xml"):
+                value = item.get(key)
+                if value:
+                    paths.add(Path(value).resolve())
+
+    collect_meshes(manifest.get("meshes"))
+    for group in manifest.get("material_groups") or []:
+        if isinstance(group, dict):
+            collect_meshes(group.get("meshes"))
+    return paths
+
+
+def path_is_relative_to(path, parent):
+    try:
+        Path(path).resolve().relative_to(Path(parent).resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def spm_mesh_filename_path(spm_path, mesh_node):
+    filename = mesh_node.findtext("Filename") or ""
+    if not filename:
+        return None
+    filename_path = Path(filename.replace("\\", "/"))
+    if filename_path.is_absolute():
+        return filename_path.resolve()
+    return (Path(spm_path).resolve().parent / filename_path).resolve()
+
+
+def normalized_mesh_lookup_key(value):
+    return str(value).replace("\\", "/").lower()
+
+
+def mesh_path_lookup_keys(spm_path, mesh_path):
+    path = Path(mesh_path)
+    keys = {normalized_mesh_lookup_key(path.name)}
+    keys.add(normalized_mesh_lookup_key(relative_spm_path(spm_path, path)))
+    try:
+        keys.add(normalized_mesh_lookup_key(path.resolve()))
+    except OSError:
+        keys.add(normalized_mesh_lookup_key(path))
+    return keys
+
+
+def add_mesh_lookup(mesh_ids_by_key, mesh_key_counts, key, mesh_id):
+    if not key:
+        return
+    mesh_key_counts[key] = mesh_key_counts.get(key, 0) + 1
+    mesh_ids_by_key.setdefault(key, mesh_id)
+
+
+def build_spm_mesh_lookup(spm_path, mesh_nodes_by_id):
+    mesh_ids_by_key = {}
+    mesh_key_counts = {}
+    for mesh_id_text, node in mesh_nodes_by_id.items():
+        try:
+            mesh_id = int(mesh_id_text)
+        except (TypeError, ValueError):
+            continue
+        filename = node.findtext("Filename") or ""
+        if filename:
+            add_mesh_lookup(mesh_ids_by_key, mesh_key_counts, normalized_mesh_lookup_key(filename), mesh_id)
+            add_mesh_lookup(mesh_ids_by_key, mesh_key_counts, normalized_mesh_lookup_key(Path(filename).name), mesh_id)
+            mesh_path = spm_mesh_filename_path(spm_path, node)
+            if mesh_path is not None:
+                add_mesh_lookup(mesh_ids_by_key, mesh_key_counts, normalized_mesh_lookup_key(mesh_path), mesh_id)
+        node_name = node.attrib.get("Name")
+        if node_name:
+            add_mesh_lookup(mesh_ids_by_key, mesh_key_counts, normalized_mesh_lookup_key(f"{node_name}.fbx"), mesh_id)
+    return mesh_ids_by_key, mesh_key_counts
+
+
+def existing_spm_mesh_id_for_path(spm_path, mesh_path, mesh_ids_by_key, mesh_key_counts):
+    keys = list(mesh_path_lookup_keys(spm_path, mesh_path))
+    exact_keys = [key for key in keys if "/" in key or ":" in key]
+    fallback_keys = [key for key in keys if key not in exact_keys]
+    for key in exact_keys + fallback_keys:
+        if mesh_key_counts.get(key) == 1:
+            mesh_id = mesh_ids_by_key.get(key)
+            if mesh_id is not None:
+                return mesh_id
+    return None
+
+
+def material_is_atlas_leaf_owned(material, manifest, previous_material_names, mesh_nodes_by_id, spm_path):
+    user_data = parse_atlas_leaf_spm_user_data(material.findtext("UserData"))
+    if user_data and user_data.get("scope") == spm_export_scope(manifest):
+        return True
+
+    export_mesh_dir = Path(spm_path).resolve().parent / "meshes"
+    mesh_ids = spm_material_mesh_ids(material)
+    if not mesh_ids:
+        return False
+    for mesh_id in mesh_ids:
+        mesh_node = mesh_nodes_by_id.get(str(mesh_id))
+        mesh_path = spm_mesh_filename_path(spm_path, mesh_node) if mesh_node is not None else None
+        if mesh_path is None or not path_is_relative_to(mesh_path, export_mesh_dir):
+            return False
+    return material.attrib.get("Name") in previous_material_names
+
+
+def remove_stale_mesh_files(spm_path, removed_mesh_nodes, previous_paths, current_paths):
+    export_mesh_dir = Path(spm_path).resolve().parent / "meshes"
+    candidates = set()
+    for node in removed_mesh_nodes:
+        mesh_path = spm_mesh_filename_path(spm_path, node)
+        if mesh_path is not None:
+            candidates.add(mesh_path)
+    candidates.update(path for path in previous_paths if path_is_relative_to(path, export_mesh_dir))
+
+    removed = []
+    for path in sorted(candidates, key=lambda item: str(item).lower()):
+        if path in current_paths or not path_is_relative_to(path, export_mesh_dir):
+            continue
+        try:
+            if path.exists() and path.is_file():
+                path.unlink()
+                removed.append(str(path))
+        except OSError:
+            continue
+    return removed
+
+
+def cleanup_stale_spm_assets(spm_path, manifest, active_material_names, previous_manifest=None):
+    previous_manifest = previous_manifest or {}
+    previous_manifest_in_scope = manifests_share_export_scope(manifest, previous_manifest)
+    previous_material_names = manifest_material_names(previous_manifest) if previous_manifest_in_scope else set()
+    previous_paths = manifest_mesh_asset_paths(previous_manifest) if previous_manifest_in_scope else set()
+    current_paths = manifest_mesh_asset_paths(manifest)
+
+    root = read_spm_xml(spm_path)
+    assets = root.find("Assets")
+    if assets is None:
+        return {"removed_materials": [], "removed_mesh_ids": [], "removed_mesh_files": []}
+
+    mesh_nodes_by_id = {node.attrib.get("ID"): node for node in assets.findall("Mesh")}
+    removed_materials = []
+    removed_material_mesh_ids = set()
+    for material in list(assets.findall("Material_v8")):
+        material_name = material.attrib.get("Name", "")
+        if material_name in active_material_names:
+            continue
+        if not material_is_atlas_leaf_owned(material, manifest, previous_material_names, mesh_nodes_by_id, spm_path):
+            continue
+        removed_materials.append(material_name)
+        removed_material_mesh_ids.update(spm_material_mesh_ids(material))
+        assets.remove(material)
+
+    remaining_mesh_ids = set()
+    for material in assets.findall("Material_v8"):
+        remaining_mesh_ids.update(spm_material_mesh_ids(material))
+
+    removed_mesh_nodes = []
+    removed_mesh_ids = []
+    for mesh in list(assets.findall("Mesh")):
+        mesh_id_text = mesh.attrib.get("ID")
+        try:
+            mesh_id = int(mesh_id_text or "0")
+        except ValueError:
+            continue
+        if mesh_id in remaining_mesh_ids:
+            continue
+        user_data = parse_atlas_leaf_spm_user_data(mesh.findtext("UserData"))
+        mesh_path = spm_mesh_filename_path(spm_path, mesh)
+        owned_by_marker = user_data and user_data.get("scope") == spm_export_scope(manifest)
+        owned_by_previous_manifest = mesh_path in previous_paths if mesh_path is not None else False
+        owned_by_removed_material = mesh_id in removed_material_mesh_ids
+        if owned_by_marker or owned_by_previous_manifest or owned_by_removed_material:
+            removed_mesh_nodes.append(mesh)
+            removed_mesh_ids.append(mesh_id)
+            assets.remove(mesh)
+
+    removed_mesh_files = remove_stale_mesh_files(spm_path, removed_mesh_nodes, previous_paths, current_paths)
+    if removed_materials or removed_mesh_ids:
+        write_spm_xml(spm_path, root)
+    return {
+        "removed_materials": removed_materials,
+        "removed_mesh_ids": removed_mesh_ids,
+        "removed_mesh_files": removed_mesh_files,
+    }
+
+
+def make_spm_mesh(mesh_template, mesh_id, fbx_path, spm_path, manifest=None):
     mesh = copy.deepcopy(mesh_template)
     mesh.attrib["ID"] = str(mesh_id)
     mesh.attrib["Name"] = Path(fbx_path).stem
@@ -359,6 +897,8 @@ def make_spm_mesh(mesh_template, mesh_id, fbx_path, spm_path):
     for child in list(mesh):
         if child.tag.startswith("Lod_") or child.tag == "EmbeddedData_v7" or child.tag == "Cutout":
             mesh.remove(child)
+    if manifest is not None:
+        tag_spm_asset(mesh, manifest, "mesh")
     return mesh
 
 
@@ -384,15 +924,15 @@ def create_speedtree_spm(spm_path, manifest, material_name):
         if node.tag in {"Material_v8", "Mesh"}:
             assets.remove(node)
 
-    mesh_paths = [Path(item["fbx"]) for item in manifest["meshes"]]
+    mesh_paths = [Path(item.get("asset") or item["fbx"]) for item in manifest["meshes"]]
     mesh_ids = list(range(1, len(mesh_paths) + 1))
-    material = make_spm_material(spm_path, manifest["textures"], mesh_ids, material_name)
+    material = make_spm_material(spm_path, manifest["textures"], mesh_ids, material_name, manifest)
     mesh_template = first_external_mesh_template()
     insert_index = 0
     assets.insert(insert_index, material)
     insert_index += 1
     for mesh_id, mesh_path in zip(mesh_ids, mesh_paths):
-        assets.insert(insert_index, make_spm_mesh(mesh_template, mesh_id, mesh_path, spm_path))
+        assets.insert(insert_index, make_spm_mesh(mesh_template, mesh_id, mesh_path, spm_path, manifest))
         insert_index += 1
 
     write_spm_xml(spm_path, root)
@@ -432,41 +972,44 @@ def upsert_speedtree_assets_in_spm(spm_path, manifest, material_name):
     if assets is None:
         assets = ET.SubElement(root, "Assets")
 
-    mesh_paths = [Path(item["fbx"]) for item in manifest["meshes"]]
+    mesh_paths = [Path(item.get("asset") or item["fbx"]) for item in manifest["meshes"]]
     mesh_template = first_external_mesh_template()
     mesh_nodes_by_id = {node.attrib.get("ID"): node for node in assets.findall("Mesh")}
-    mesh_ids_by_filename = {}
-    for mesh_id_text, node in mesh_nodes_by_id.items():
-        try:
-            mesh_id = int(mesh_id_text)
-        except (TypeError, ValueError):
-            continue
-        filename = node.findtext("Filename") or ""
-        if filename:
-            mesh_ids_by_filename[Path(filename).name.lower()] = mesh_id
-        node_name = node.attrib.get("Name")
-        if node_name:
-            mesh_ids_by_filename[f"{node_name}.fbx".lower()] = mesh_id
+    mesh_ids_by_key, mesh_key_counts = build_spm_mesh_lookup(spm_path, mesh_nodes_by_id)
 
     material = find_material_by_name(assets, material_name)
     action = "updated"
     old_mesh_ids = []
     if material is None:
-        action = "injected"
-        material_id = max_asset_id(assets, "Material_v8") + 1
-        first_mesh_id = max_asset_id(assets, "Mesh") + 1
-        mesh_ids = list(range(first_mesh_id, first_mesh_id + len(mesh_paths)))
-        material = make_spm_material(spm_path, manifest["textures"], mesh_ids, material_name)
-        material.attrib["ID"] = str(material_id)
-        assets.append(material)
-    else:
+        # The material may have been renamed (blend file or collection rename).
+        # Only reclaim materials this export scope actually owns — a bare name
+        # match could hijack another atlas's material in a shared SPM.
+        material = find_scope_group_material(assets, manifest)
+        if material is None:
+            old_collection_name = manifest.get("material_collection")
+            candidate = find_material_by_name(assets, old_collection_name) if old_collection_name else None
+            if candidate is not None and material_scope_matches(candidate, manifest):
+                material = candidate
+        if material is not None:
+            action = "renamed"
+            material.attrib["Name"] = material_name
+        else:
+            action = "injected"
+            material_id = max_asset_id(assets, "Material_v8") + 1
+            first_mesh_id = max_asset_id(assets, "Mesh") + 1
+            mesh_ids = list(range(first_mesh_id, first_mesh_id + len(mesh_paths)))
+            material = make_spm_material(spm_path, manifest["textures"], mesh_ids, material_name, manifest)
+            material.attrib["ID"] = str(material_id)
+            assets.append(material)
+
+    if action in {"renamed", "updated"}:
         material_id = int(material.attrib.get("ID", max_asset_id(assets, "Material_v8") + 1))
         old_mesh_ids = spm_material_mesh_ids(material)
         old_mesh_id_set = set(old_mesh_ids)
         mesh_ids = []
         used_mesh_ids = set()
         for mesh_path in mesh_paths:
-            existing_id = mesh_ids_by_filename.get(mesh_path.name.lower())
+            existing_id = existing_spm_mesh_id_for_path(spm_path, mesh_path, mesh_ids_by_key, mesh_key_counts)
             if existing_id in old_mesh_id_set and existing_id not in used_mesh_ids:
                 mesh_ids.append(existing_id)
                 used_mesh_ids.add(existing_id)
@@ -483,10 +1026,11 @@ def upsert_speedtree_assets_in_spm(spm_path, manifest, material_name):
                 mesh_ids[index] = next_mesh_id
                 next_mesh_id += 1
         update_spm_material(material, spm_path, manifest["textures"], mesh_ids)
+        tag_spm_asset(material, manifest, "material")
 
     for mesh_id, mesh_path in zip(mesh_ids, mesh_paths):
         mesh_node = mesh_nodes_by_id.get(str(mesh_id))
-        new_mesh = make_spm_mesh(mesh_template, mesh_id, mesh_path, spm_path)
+        new_mesh = make_spm_mesh(mesh_template, mesh_id, mesh_path, spm_path, manifest)
         if mesh_node is None:
             assets.append(new_mesh)
         else:
@@ -545,7 +1089,27 @@ def material_suffix_from_collection_name(collection_name):
     return text or "group"
 
 
-def grouped_source_objects(root_collection, base_material_name):
+def sanitize_filename_component(text, fallback="asset"):
+    cleaned = re.sub(r'[\\/:*?"<>|]+', "_", str(text))
+    cleaned = re.sub(r"_+", "_", cleaned).strip(" ._")
+    return cleaned or fallback
+
+
+def blender_material_base_name(root_collection):
+    if bpy.data.filepath:
+        return Path(bpy.data.filepath).stem
+    return sanitize_filename_component(root_collection.name.strip(), "AtlasLeaf")
+
+
+def material_name_from_collection(root_collection, collection=None):
+    base_name = blender_material_base_name(root_collection)
+    if collection is None or collection == root_collection:
+        return base_name
+    suffix = material_suffix_from_collection_name(collection.name)
+    return f"{base_name}_{suffix}"
+
+
+def grouped_source_objects(root_collection):
     def is_export_source(obj):
         return obj.type == "MESH" and not obj.name.lower().startswith("codex_")
 
@@ -563,21 +1127,20 @@ def grouped_source_objects(root_collection, base_material_name):
         objects = []
         collect_meshes(child, objects)
         if objects:
-            suffix = material_suffix_from_collection_name(child.name)
             child_groups.append(
                 {
                     "collection": child.name,
-                    "material": f"{base_material_name}_{suffix}",
+                    "material": material_name_from_collection(root_collection, child),
                     "objects": objects,
                 }
             )
 
     if not child_groups:
-        return [{"collection": root_collection.name, "material": base_material_name, "objects": direct_objects}]
+        return [{"collection": root_collection.name, "material": material_name_from_collection(root_collection), "objects": direct_objects}]
 
     groups = child_groups
     if direct_objects:
-        groups.append({"collection": root_collection.name, "material": base_material_name, "objects": direct_objects})
+        groups.append({"collection": root_collection.name, "material": material_name_from_collection(root_collection), "objects": direct_objects})
     return groups
 
 
@@ -597,10 +1160,11 @@ def speedtree_mesh_export_name(source, used_names, group_material=None):
     group_prefix = ""
     if group_material:
         group_prefix = material_suffix_from_collection_name(group_material) + "__"
-    candidate = f"{group_prefix}{prefix}_{source.name}.fbx"
+    source_name = sanitize_filename_component(source.name, "mesh")
+    candidate = f"{group_prefix}{prefix}_{source_name}.fbx"
     suffix = 2
     while candidate.lower() in used_names:
-        candidate = f"{group_prefix}{prefix}_{source.name}_{suffix}.fbx"
+        candidate = f"{group_prefix}{prefix}_{source_name}_{suffix}.fbx"
         suffix += 1
     used_names.add(candidate.lower())
     return candidate
@@ -610,9 +1174,9 @@ def export_speedtree_assets(props, export_dir):
     collection = bpy.data.collections.get(props.collection_name)
     if not collection:
         raise RuntimeError(f"Collection not found: {props.collection_name}")
+    export_scope_id = resolve_export_scope_id(collection, export_dir)
 
-    base_material_name = props.speedtree_material_name.strip() or "Elm01_Atlas_Leaf"
-    source_groups = grouped_source_objects(collection, base_material_name)
+    source_groups = grouped_source_objects(collection)
     if not any(group["objects"] for group in source_groups):
         raise RuntimeError(f"No mesh objects in collection: {props.collection_name}")
 
@@ -652,6 +1216,7 @@ def export_speedtree_assets(props, export_dir):
     exported_meshes = []
     material_groups = []
     used_mesh_filenames = set()
+    anchor_export_mode = getattr(props, "speedtree_anchor_export_mode", "OFF")
     try:
         for group in source_groups:
             group_meshes = []
@@ -659,6 +1224,9 @@ def export_speedtree_assets(props, export_dir):
             if material is None:
                 continue
             for source in sorted(group["objects"], key=speedtree_mesh_sort_key):
+                anchor_records = []
+                if anchor_export_mode != "OFF":
+                    anchor_records = collect_source_anchors(source, props, mesh_geometry_scale)
                 evaluated = source.evaluated_get(depsgraph)
                 mesh = bpy.data.meshes.new_from_object(evaluated, depsgraph=depsgraph)
                 mesh.materials.clear()
@@ -679,32 +1247,56 @@ def export_speedtree_assets(props, export_dir):
                 temp_obj = bpy.data.objects.new(export_stem, mesh)
                 temp_obj.matrix_world = source.matrix_world.copy()
                 temp_collection.objects.link(temp_obj)
+                temp_anchor_objects = []
+                if anchor_export_mode == "FBX_EMPTY":
+                    for index, anchor in enumerate(anchor_records):
+                        temp_anchor = bpy.data.objects.new(anchor["name"] or f"anchor_{index + 1:02d}", None)
+                        temp_anchor.empty_display_type = "SINGLE_ARROW"
+                        temp_anchor.empty_display_size = max(float(anchor["scale"]) * 0.1, 0.01)
+                        temp_anchor["atlas_leaf_speedtree_anchor"] = True
+                        temp_collection.objects.link(temp_anchor)
+                        temp_anchor.matrix_world = temp_obj.matrix_world @ anchor["local_matrix"]
+                        temp_anchor_objects.append(temp_anchor)
 
                 for obj in bpy.context.selected_objects:
                     obj.select_set(False)
                 temp_obj.select_set(True)
+                for temp_anchor in temp_anchor_objects:
+                    temp_anchor.select_set(True)
                 bpy.context.view_layer.objects.active = temp_obj
 
                 fbx_path = mesh_dir / export_name
                 bpy.ops.export_scene.fbx(
                     filepath=str(fbx_path),
                     use_selection=True,
-                    object_types={"MESH"},
+                    object_types={"MESH", "EMPTY"} if anchor_export_mode == "FBX_EMPTY" else {"MESH"},
                     apply_unit_scale=True,
                     bake_space_transform=False,
                     add_leaf_bones=False,
                     path_mode="RELATIVE",
                     embed_textures=False,
                 )
+                xml_path = None
+                asset_path = fbx_path
+                if anchor_export_mode == "XML" and anchor_records:
+                    xml_path = mesh_dir / f"{export_stem}.xml"
+                    write_speedtree_xml_mesh(xml_path, mesh, material.name, anchor_records)
+                    asset_path = xml_path
                 item = {
                     "name": export_stem,
                     "fbx": str(fbx_path),
+                    "xml": str(xml_path) if xml_path else None,
+                    "asset": str(asset_path),
+                    "anchor_count": len(anchor_records),
+                    "anchor_names": [anchor["name"] for anchor in anchor_records],
                     "source_object": source.name,
                     "source_collection": group["collection"],
                     "material": material.name,
                 }
                 exported_meshes.append(item)
                 group_meshes.append(item)
+                for temp_anchor in temp_anchor_objects:
+                    bpy.data.objects.remove(temp_anchor, do_unlink=True)
                 bpy.data.objects.remove(temp_obj, do_unlink=True)
                 bpy.data.meshes.remove(mesh, do_unlink=True)
             if group_meshes:
@@ -731,20 +1323,25 @@ def export_speedtree_assets(props, export_dir):
 
     manifest = {
         "source_collection": props.collection_name,
+        "export_scope_id": export_scope_id,
+        "blend_file": bpy.data.filepath,
         "speedtree_version_target": "10.1.0",
-        "material": base_material_name if len(material_groups) == 1 else None,
+        "material": material_groups[0]["material"] if len(material_groups) == 1 else None,
         "material_groups": material_groups,
         "single_material_per_mesh": True,
         "mesh_geometry_scale": mesh_geometry_scale,
+        "anchor_export_mode": anchor_export_mode,
+        "anchor_count": sum(item.get("anchor_count", 0) for item in exported_meshes),
         "mesh_count": len(exported_meshes),
         "meshes": exported_meshes,
         "removed_stale_mesh_exports": removed_stale_mesh_exports,
         "textures": texture_exports,
         "notes": [
-            "Use the exported FBX files as SpeedTree mesh assets.",
+            "Use each mesh item's asset path as the SpeedTree mesh asset source.",
             "Use one atlas material for all leaf mesh variants.",
             "The SPM material mesh list is synchronized to the current Blender collection when rebuilt.",
             "Use gloss_from_roughness when the SpeedTree material slot expects gloss.",
+            "SpeedTree XML anchor assets store child empties as LeafReferences.",
         ],
     }
     manifest_path = export_dir / "speedtree_import_manifest.json"
@@ -760,12 +1357,15 @@ def export_or_update_speedtree_spm_path(props, target_spm):
     if target_spm.suffix.lower() != ".spm":
         raise RuntimeError("Target SPM must end with .spm")
 
+    previous_global_manifest_path = target_spm.parent / "speedtree_import_manifest.json"
+    previous_global_manifest = read_json_file(previous_global_manifest_path, {})
     manifest_path, readme_path, exported_meshes = export_speedtree_assets(props, target_spm.parent)
     manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+    previous_manifest = previous_scope_manifest(target_spm.parent, manifest, previous_global_manifest)
     material_groups = manifest.get("material_groups") or [
         {
             "collection": manifest.get("source_collection", props.collection_name),
-            "material": props.speedtree_material_name.strip() or "Elm01_Atlas_Leaf",
+            "material": manifest.get("source_collection", props.collection_name),
             "meshes": manifest.get("meshes", []),
         }
     ]
@@ -774,9 +1374,10 @@ def export_or_update_speedtree_spm_path(props, target_spm):
     for group in material_groups:
         group_manifest = dict(manifest)
         group_manifest["meshes"] = group.get("meshes", [])
+        group_manifest["material_collection"] = group.get("collection")
         if not group_manifest["meshes"]:
             continue
-        material_name = group.get("material") or props.speedtree_material_name.strip() or "Elm01_Atlas_Leaf"
+        material_name = group.get("material") or group.get("collection") or manifest.get("source_collection", props.collection_name)
         spm_path, action, material_id, mesh_ids = upsert_speedtree_assets_in_spm(
             target_spm,
             group_manifest,
@@ -797,7 +1398,15 @@ def export_or_update_speedtree_spm_path(props, target_spm):
     if not group_results:
         raise RuntimeError("No SpeedTree material groups contained meshes.")
 
+    cleanup = cleanup_stale_spm_assets(
+        target_spm,
+        manifest,
+        {group["material"] for group in group_results},
+        previous_manifest,
+    )
     action = ",".join(sorted({group["action"] for group in group_results}))
+    if cleanup["removed_materials"] or cleanup["removed_mesh_ids"]:
+        action = f"{action},cleaned"
     material_id = group_results[0]["material_id"]
     mesh_ids = [mesh_id for group in group_results for mesh_id in group["mesh_ids"]]
     manifest["spm"] = str(spm_path)
@@ -806,8 +1415,10 @@ def export_or_update_speedtree_spm_path(props, target_spm):
     manifest["speedtree_material_groups"] = group_results
     manifest["material_id"] = material_id
     manifest["mesh_ids"] = mesh_ids
+    manifest["removed_stale_spm_assets"] = cleanup
     Path(manifest_path).write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-    return spm_path, manifest_path, exported_meshes, action, material_id, mesh_ids, group_results
+    write_scope_manifest(target_spm.parent, manifest)
+    return spm_path, manifest_path, exported_meshes, action, material_id, mesh_ids, group_results, cleanup
 
 
 def export_or_update_speedtree_spm_targets(props):
@@ -817,7 +1428,7 @@ def export_or_update_speedtree_spm_targets(props):
 
     results = []
     for target_spm in targets:
-        spm_path, manifest_path, exported_meshes, action, material_id, mesh_ids, material_groups = export_or_update_speedtree_spm_path(
+        spm_path, manifest_path, exported_meshes, action, material_id, mesh_ids, material_groups, cleanup = export_or_update_speedtree_spm_path(
             props,
             target_spm,
         )
@@ -830,6 +1441,7 @@ def export_or_update_speedtree_spm_targets(props):
                 "material_id": material_id,
                 "mesh_ids": mesh_ids,
                 "material_groups": material_groups,
+                "cleanup": cleanup,
             }
         )
     return results

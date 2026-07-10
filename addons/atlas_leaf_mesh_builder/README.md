@@ -119,7 +119,7 @@ The `Material Name` field controls the SpeedTree `Material_v8` name. When that m
 
 `FBX Geometry Scale` is applied to the exported FBX mesh geometry before it is linked into the SPM. The SpeedTree external Mesh asset's own `Scale` field stays `1`, so updating an SPM does not bake a `0.01` Scale value into the SPM itself. The default exported geometry scale is `0.01` so SpeedTree generators using `Use Actual Size` start from a manageable size, and you can adjust it per atlas before rebuilding the target SPMs.
 
-Rebuilding existing SPMs synchronizes each material's mesh list to the current Blender collection. If you delete a generated leaf mesh in Blender and run `Build/Update Target SPMs` again, that mesh is removed from every listed SPM material's cutout mesh IDs and its stale FBX export is removed when it was listed in the previous manifest for that target.
+Rebuilding existing SPMs synchronizes each material's mesh list to the current Blender collection. Each Blender source collection gets a persistent SpeedTree export scope ID, so multiple atlases can share one `.spm` without cleaning each other up. If a generated material or mesh from the same scope's previous manifest is no longer part of the current export, the add-on removes that stale SpeedTree material/mesh asset and deletes stale FBX/XML files only when they live inside that target's generated `meshes/` folder. Pre-existing SpeedTree materials and meshes outside the add-on's manifest/UserData scope are left untouched.
 
 The managed atlas material's `SeasonCurve` is flattened to `1` from season `0` through `1` so the imported atlas leaves are not hidden or faded by SpeedTree seasonal material graphs. Other materials' season curves are left untouched.
 

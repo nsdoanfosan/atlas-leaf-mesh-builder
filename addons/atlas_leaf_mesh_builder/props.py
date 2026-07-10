@@ -212,5 +212,33 @@ class ATLASLEAF_Properties(PropertyGroup):
         precision=6,
         description="Multiplier applied to exported FBX mesh geometry; SpeedTree Mesh Scale stays 1",
     )
+    speedtree_anchor_export_mode: EnumProperty(
+        name="Anchor Export",
+        items=[
+            ("XML", "SpeedTree XML", "Export child anchor empties as SpeedTree XML LeafReferences"),
+            ("FBX_EMPTY", "FBX Empties", "Include child anchor empties in each exported FBX for probing"),
+            ("OFF", "Off", "Ignore anchor empties during SpeedTree mesh export"),
+        ],
+        default="XML",
+    )
+    speedtree_anchor_prefix: StringProperty(
+        name="Anchor Prefix",
+        default="anchor",
+        description="Anchor empty name prefix used when collecting anchors under a mesh container",
+    )
+    speedtree_anchor_material_id: IntProperty(
+        name="Anchor ID",
+        default=0,
+        min=0,
+        description="Material/id value written to SpeedTree XML LeafReferences for these anchors",
+    )
+    speedtree_anchor_scale: FloatProperty(
+        name="Anchor Scale",
+        default=1.0,
+        min=0.000001,
+        soft_max=10.0,
+        precision=4,
+        description="Scale value written to SpeedTree XML LeafReferences",
+    )
     last_report: StringProperty(name="Last Report", default="")
 

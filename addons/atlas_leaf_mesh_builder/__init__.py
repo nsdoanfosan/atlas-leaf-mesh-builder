@@ -54,6 +54,7 @@ ATLASLEAF_OT_build_label_preview = _modules["operators"].ATLASLEAF_OT_build_labe
 ATLASLEAF_OT_generate = _modules["operators"].ATLASLEAF_OT_generate
 ATLASLEAF_OT_straight_mesh = _modules["operators"].ATLASLEAF_OT_straight_mesh
 ATLASLEAF_OT_auto_split_material_collections = _modules["operators"].ATLASLEAF_OT_auto_split_material_collections
+ATLASLEAF_OT_create_anchor_container = _modules["operators"].ATLASLEAF_OT_create_anchor_container
 ATLASLEAF_OT_build_speedtree_spm = _modules["operators"].ATLASLEAF_OT_build_speedtree_spm
 ATLASLEAF_OT_add_speedtree_spm = _modules["operators"].ATLASLEAF_OT_add_speedtree_spm
 ATLASLEAF_OT_remove_speedtree_spm = _modules["operators"].ATLASLEAF_OT_remove_speedtree_spm
@@ -75,6 +76,7 @@ classes = (
     ATLASLEAF_OT_generate,
     ATLASLEAF_OT_straight_mesh,
     ATLASLEAF_OT_auto_split_material_collections,
+    ATLASLEAF_OT_create_anchor_container,
     ATLASLEAF_OT_build_speedtree_spm,
     ATLASLEAF_OT_add_speedtree_spm,
     ATLASLEAF_OT_remove_speedtree_spm,
