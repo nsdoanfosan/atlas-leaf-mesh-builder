@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Atlas Leaf Mesh Builder",
     "author": "Codex for PARK",
-    "version": (0, 3, 0),
+    "version": (0, 3, 1),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Atlas Leaf",
     "description": "Build no-opacity leaf meshes from atlas alpha islands.",
@@ -17,6 +17,7 @@ import bpy
 _SUBMODULE_NAMES = (
     "constants",
     "utils",
+    "texture_paths",
     "props",
     "materials",
     "speedtree",

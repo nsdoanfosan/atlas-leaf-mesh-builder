@@ -2,7 +2,6 @@ import copy
 import gzip
 import json
 import re
-import shutil
 import uuid
 from pathlib import Path
 from xml.dom import minidom
@@ -14,141 +13,11 @@ from mathutils import Matrix, Vector
 from .constants import SPEEDTREE_101_BLANK_SPM, SPEEDTREE_101_EXTERNAL_MESH_SAMPLE, SPEEDTREE_101_MATERIAL_SAMPLE
 from .materials import make_speedtree_material
 from .props import speedtree_spm_targets
-from .utils import run_external_python
+from .texture_paths import atlas_texture_paths
 
 
 ATLAS_LEAF_SPM_GENERATOR = "Atlas Leaf Mesh Builder"
 ATLAS_LEAF_COLLECTION_SCOPE_KEY = "atlas_leaf_speedtree_scope_id"
-
-
-def atlas_texture_paths(albedo_path):
-    albedo = Path(albedo_path)
-    texture_dir = albedo.parent
-    paths = {"albedo": albedo}
-
-    role_tokens = {
-        "albedo": ("albedo", "basecolor", "base_color", "base color", "diffuse", "color"),
-        "alpha": ("opacity", "alpha", "cutout", "mask"),
-        "height": ("height", "displacement", "disp"),
-        "normal": ("normal", "norm", "nrm"),
-        "roughness": ("roughness", "rough"),
-        "translucency": (
-            "translucency",
-            "translucent",
-            "transmission",
-            "subsurface",
-            "subsurfacecolor",
-            "subsurface_color",
-            "sss",
-            "transqulin",
-        ),
-    }
-    texture_extensions = {".bmp", ".exr", ".jpeg", ".jpg", ".png", ".tga", ".tif", ".tiff"}
-
-    def normalized_stem(path):
-        text = path.stem.lower()
-        for char in ("-", ".", " "):
-            text = text.replace(char, "_")
-        while "__" in text:
-            text = text.replace("__", "_")
-        return text.strip("_")
-
-    def strip_role(stem, tokens):
-        result = stem
-        for token in sorted(tokens, key=len, reverse=True):
-            token = token.lower().replace(" ", "_")
-            for pattern in (f"_{token}_", f"_{token}", f"{token}_", token):
-                if pattern in result:
-                    result = result.replace(pattern, "_")
-        while "__" in result:
-            result = result.replace("__", "_")
-        return result.strip("_")
-
-    albedo_stem = normalized_stem(albedo)
-    albedo_base = strip_role(albedo_stem, role_tokens["albedo"])
-    candidates = [path for path in texture_dir.iterdir() if path.is_file() and path.suffix.lower() in texture_extensions]
-
-    for key, tokens in role_tokens.items():
-        if key == "albedo":
-            continue
-
-        best_score = -1
-        best_path = None
-        for candidate in candidates:
-            if candidate == albedo:
-                continue
-            candidate_stem = normalized_stem(candidate)
-            if not any(token.lower().replace(" ", "_") in candidate_stem for token in tokens):
-                continue
-
-            candidate_base = strip_role(candidate_stem, tokens)
-            score = 0
-            if candidate_base == albedo_base:
-                score += 100
-            elif candidate_base.startswith(albedo_base) or albedo_base.startswith(candidate_base):
-                score += 40
-            if candidate.suffix.lower() == albedo.suffix.lower():
-                score += 10
-            if candidate_stem.startswith(albedo_base):
-                score += 5
-
-            if score > best_score:
-                best_score = score
-                best_path = candidate
-
-        if best_path is not None:
-            paths[key] = best_path
-    return paths
-
-
-def convert_textures_for_speedtree(python_exe, texture_paths, export_dir):
-    texture_dir = Path(export_dir) / "textures"
-    texture_dir.mkdir(parents=True, exist_ok=True)
-    payload = {
-        key: str(path)
-        for key, path in texture_paths.items()
-        if Path(path).exists()
-    }
-    code = r"""
-import json
-from pathlib import Path
-from PIL import Image, ImageOps
-import re
-
-payload = json.loads(ARG_PAYLOAD)
-out_dir = Path(payload["out_dir"])
-out_dir.mkdir(parents=True, exist_ok=True)
-result = {}
-for key, src in payload["textures"].items():
-    src_path = Path(src)
-    image = Image.open(src_path)
-    if key in {"roughness", "alpha", "height"}:
-        image = image.convert("L")
-    else:
-        image = image.convert("RGB")
-    out_path = out_dir / f"{src_path.stem}.png"
-    image.save(out_path)
-    result[key] = str(out_path)
-    if key == "roughness":
-        gloss = ImageOps.invert(image)
-        gloss_stem = re.sub(r"(?i)([_\-. ])roughness$", r"\1gloss_from_roughness", src_path.stem)
-        if gloss_stem == src_path.stem:
-            gloss_stem = f"{src_path.stem}_gloss_from_roughness"
-        gloss_path = out_dir / f"{gloss_stem}.png"
-        gloss.save(gloss_path)
-        result["gloss"] = str(gloss_path)
-print(json.dumps(result))
-""".replace("ARG_PAYLOAD", repr(json.dumps({"textures": payload, "out_dir": str(texture_dir)})))
-    result = run_external_python(python_exe, ["-c", code], timeout=300)
-    if result.returncode == 0:
-        return json.loads(result.stdout.strip() or "{}")
-
-    copied = {}
-    for key, src in payload.items():
-        destination = texture_dir / Path(src).name
-        shutil.copy2(src, destination)
-        copied[key] = str(destination)
-    return copied
 
 
 def write_speedtree_readme(export_dir, manifest):
@@ -163,7 +32,7 @@ def write_speedtree_readme(export_dir, manifest):
         "",
         "- The target `.spm` is a SpeedTree Modeler 10.1 asset file with one named material linked to all generated leaf meshes.",
         f"- Mesh asset files: `{mesh_count}` FBX/XML entries",
-        "- Textures are in `textures/`.",
+        "- Materials reference the original source textures directly; no texture copies are generated.",
         "- Meshes are closed shells with the stem pivot at object origin.",
         "- FBX export uses a single material per mesh; XML assets are written when anchors are present.",
         f"- FBX mesh geometry scale: `{manifest.get('mesh_geometry_scale', 1)}`; SpeedTree Mesh asset Scale remains `1`.",
@@ -172,10 +41,10 @@ def write_speedtree_readme(export_dir, manifest):
         "## Suggested SpeedTree Setup",
         "",
         "1. Open the target `.spm` in SpeedTree Modeler 10.1.",
-        "2. The atlas material should already reference the texture maps in `textures/`.",
+        "2. The atlas material should already reference the original texture maps.",
         "3. The material's cutout mesh list should reference the generated asset files in `meshes/`.",
         "4. Use that material/mesh set in a Leaf Mesh generator as leaf variants.",
-        "5. If SpeedTree asks to relink files, keep the `.spm`, `meshes/`, and `textures/` folders together.",
+        "5. If SpeedTree asks to relink files, select the original source texture folder.",
         "",
         "## Texture Map Hints",
         "",
@@ -1192,8 +1061,11 @@ def export_speedtree_assets(props, export_dir):
     mesh_dir = export_dir / "meshes"
     mesh_dir.mkdir(parents=True, exist_ok=True)
 
-    texture_paths = atlas_texture_paths(bpy.path.abspath(props.albedo_path))
-    texture_exports = convert_textures_for_speedtree(props.external_python, texture_paths, export_dir)
+    texture_exports = {
+        key: str(path.resolve())
+        for key, path in atlas_texture_paths(bpy.path.abspath(props.albedo_path)).items()
+        if path.exists()
+    }
     materials = {
         group["material"]: make_speedtree_material(group["material"], bpy.path.abspath(props.albedo_path))
         for group in source_groups
@@ -1340,7 +1212,8 @@ def export_speedtree_assets(props, export_dir):
             "Use each mesh item's asset path as the SpeedTree mesh asset source.",
             "Use one atlas material for all leaf mesh variants.",
             "The SPM material mesh list is synchronized to the current Blender collection when rebuilt.",
-            "Use gloss_from_roughness when the SpeedTree material slot expects gloss.",
+            "Texture maps reference the original source files and are not copied into the SPM folder.",
+            "The original roughness map is connected to the SpeedTree gloss slot when present.",
             "SpeedTree XML anchor assets store child empties as LeafReferences.",
         ],
     }

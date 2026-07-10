@@ -101,19 +101,15 @@ speedtree_export/
   meshes/
     01_leaf_pair_...fbx
     ...
-  textures/
-    TCom_Leaves_Elm01_4K_albedo.png
-    TCom_Leaves_Elm01_4K_normal.png
-    TCom_Leaves_Elm01_4K_roughness.png
-    TCom_Leaves_Elm01_4K_gloss_from_roughness.png
-    ...
   speedtree_import_manifest.json
   README_SPEEDTREE_IMPORT.md
 ```
 
+SpeedTree materials reference the selected original texture set directly. The add-on does not copy, convert, or create texture files in the target SPM folder.
+
 The FBX files are temporary evaluated export copies with all faces assigned to one atlas material. This includes the sharp-edge/weighted-normal setup and matches SpeedTree's mesh asset workflow better than the Blender working meshes, which keep separate front/back/side material slots for inspection.
 
-Each `.spm` target is treated as a separate SpeedTree update target. Add one or more files to the `Target SPMs` list with `SPM To Add` and `+`; each target's parent folder becomes its export folder for `meshes/`, `textures/`, the manifest, and the import notes.
+Each `.spm` target is treated as a separate SpeedTree update target. Add one or more files to the `Target SPMs` list with `SPM To Add` and `+`; each target's parent folder becomes its export folder for `meshes/`, the manifest, and the import notes.
 
 The `Material Name` field controls the SpeedTree `Material_v8` name. When that material already exists in the target `.spm`, the add-on updates its texture paths and reuses its existing cutout mesh IDs. When the material is missing, the add-on appends a new material and new mesh assets using IDs after the existing material/mesh IDs.
 
@@ -123,7 +119,7 @@ Rebuilding existing SPMs synchronizes each material's mesh list to the current B
 
 The managed atlas material's `SeasonCurve` is flattened to `1` from season `0` through `1` so the imported atlas leaves are not hidden or faded by SpeedTree seasonal material graphs. Other materials' season curves are left untouched.
 
-Texture maps are matched from the selected Albedo texture's folder. The SPM material auto-fills matching `Opacity`/`Alpha`, `Roughness`, `Translucency`/`Subsurface`, `Normal`, and `Height`/`Displacement` maps when files with the same base name are present.
+Texture maps are matched from the selected Albedo texture's folder. Selecting Albedo automatically fills the matching `Opacity`/`Alpha` field, and generation rechecks that match before use. The SPM material references the original matching `Opacity`/`Alpha`, `Roughness`, `Translucency`/`Subsurface`, `Normal`, and `Height`/`Displacement` files when the same texture-set base name is present.
 
 ## Notes
 

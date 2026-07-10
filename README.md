@@ -52,7 +52,7 @@ The add-on includes `Check Dependencies` and `Install Dependencies` buttons.
 
 Implemented:
 
-- albedo/alpha file inputs,
+- albedo input with automatic same-folder opacity/alpha matching,
 - Elm01 front island preset,
 - editable front island JSON,
 - visible Front Island Editor rows,
@@ -83,4 +83,4 @@ Validated with Blender 5.1.2:
 - front/back material slots both reference the same source albedo atlas and use matching UVs,
 - shell bridge side faces have inset UVs inside the front atlas island,
 - generated shell meshes use simple side quads, material-boundary sharp edges, shell-side angle sharp edges, and weighted normals,
-- SpeedTree build/update operator creates or updates one target `.spm`, exports 12 FBX files, writes PNG atlas textures, writes a gloss-from-roughness texture, and records the material/mesh IDs in a manifest.
+- SpeedTree build/update operator creates or updates one target `.spm`, exports 12 FBX files, references the original texture files without creating copies, and records the material/mesh IDs in a manifest.

@@ -10,7 +10,7 @@ from mathutils import Matrix, Vector
 
 from .constants import DEFAULT_PAIRS, HELPER_PATH
 from .materials import build_mesh_object, ensure_collection, make_atlas_material, make_side_material, show_preview_images_in_view
-from .props import ensure_pair_items, fill_pair_items, pair_items_to_json, add_spm_target_item
+from .props import add_spm_target_item, ensure_pair_items, fill_pair_items, pair_items_to_json, sync_alpha_path
 from .speedtree import export_or_update_speedtree_spm_targets
 from .utils import dependency_status, run_external_python, write_report
 
@@ -858,6 +858,7 @@ class ATLASLEAF_OT_build_label_preview(Operator):
 
     def execute(self, context):
         props = context.scene.atlas_leaf_builder
+        sync_alpha_path(props)
         albedo = bpy.path.abspath(props.albedo_path)
         alpha = bpy.path.abspath(props.alpha_path)
         output_dir = Path(bpy.path.abspath(props.output_dir))
@@ -918,6 +919,7 @@ class ATLASLEAF_OT_generate(Operator):
 
     def execute(self, context):
         props = context.scene.atlas_leaf_builder
+        sync_alpha_path(props)
         albedo = bpy.path.abspath(props.albedo_path)
         alpha = bpy.path.abspath(props.alpha_path)
         output_dir = Path(bpy.path.abspath(props.output_dir))
@@ -1023,6 +1025,7 @@ class ATLASLEAF_OT_auto_split_material_collections(Operator):
 
     def execute(self, context):
         props = context.scene.atlas_leaf_builder
+        sync_alpha_path(props)
         root = bpy.data.collections.get(props.collection_name)
         if root is None:
             self.report({"ERROR"}, f"Collection not found: {props.collection_name}")

@@ -6,6 +6,7 @@ from bpy.props import BoolProperty, CollectionProperty, EnumProperty, FloatPrope
 from bpy.types import PropertyGroup
 
 from .constants import DEFAULT_ALBEDO, DEFAULT_ALPHA, DEFAULT_PAIRS, default_output_dir, default_speedtree_spm_path
+from .texture_paths import matching_alpha_path
 
 
 def read_pair_json(text):
@@ -92,6 +93,19 @@ def speedtree_spm_targets(props):
     return targets
 
 
+def sync_alpha_path(props):
+    albedo = bpy.path.abspath(props.albedo_path)
+    alpha = matching_alpha_path(albedo) if albedo else None
+    alpha_text = str(alpha) if alpha is not None else ""
+    if props.alpha_path != alpha_text:
+        props.alpha_path = alpha_text
+    return alpha_text
+
+
+def update_alpha_from_albedo(props, _context):
+    sync_alpha_path(props)
+
+
 class ATLASLEAF_PairItem(PropertyGroup):
     front: IntProperty(name="F", default=1, min=1, description="Front island number")
 
@@ -105,6 +119,7 @@ class ATLASLEAF_Properties(PropertyGroup):
         name="Albedo",
         subtype="FILE_PATH",
         default=DEFAULT_ALBEDO,
+        update=update_alpha_from_albedo,
     )
     alpha_path: StringProperty(
         name="Alpha",
