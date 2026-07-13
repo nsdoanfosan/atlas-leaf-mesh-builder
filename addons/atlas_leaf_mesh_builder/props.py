@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 
 import bpy
-from bpy.props import BoolProperty, CollectionProperty, EnumProperty, FloatProperty, IntProperty, StringProperty
+from bpy.props import BoolProperty, CollectionProperty, EnumProperty, FloatProperty, IntProperty, PointerProperty, StringProperty
 from bpy.types import PropertyGroup
 
 from .constants import DEFAULT_ALBEDO, DEFAULT_ALPHA, DEFAULT_PAIRS, default_output_dir, default_speedtree_spm_path
@@ -106,6 +106,14 @@ def update_alpha_from_albedo(props, _context):
     sync_alpha_path(props)
 
 
+def mesh_object_poll(_self, obj):
+    return (
+        obj is not None
+        and obj.type == "MESH"
+        and not obj.get("atlas_leaf_projected_source_backup")
+    )
+
+
 class ATLASLEAF_PairItem(PropertyGroup):
     front: IntProperty(name="F", default=1, min=1, description="Front island number")
 
@@ -205,6 +213,18 @@ class ATLASLEAF_Properties(PropertyGroup):
         name="Stem Pivot At Origin",
         default=True,
         description="Move each generated leaf mesh so the stem-side pivot is the object origin at 0,0,0",
+    )
+    projected_shell_front: PointerProperty(
+        name="Front",
+        type=bpy.types.Object,
+        poll=mesh_object_poll,
+        description="One-plate mesh whose geometry, topology, pivot, and front UVs define the projected shell",
+    )
+    projected_shell_back: PointerProperty(
+        name="Back Projection",
+        type=bpy.types.Object,
+        poll=mesh_object_poll,
+        description="Manually aligned one-plate mesh used only to project back atlas UVs",
     )
     clear_existing: BoolProperty(name="Clear Collection", default=True)
     speedtree_spm_path: StringProperty(

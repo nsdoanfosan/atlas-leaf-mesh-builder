@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Atlas Leaf Mesh Builder",
     "author": "Codex for PARK",
-    "version": (0, 3, 1),
+    "version": (0, 4, 2),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Atlas Leaf",
     "description": "Build no-opacity leaf meshes from atlas alpha islands.",
@@ -53,6 +53,9 @@ ATLASLEAF_OT_remove_pair = _modules["operators"].ATLASLEAF_OT_remove_pair
 ATLASLEAF_OT_clear_pairs = _modules["operators"].ATLASLEAF_OT_clear_pairs
 ATLASLEAF_OT_build_label_preview = _modules["operators"].ATLASLEAF_OT_build_label_preview
 ATLASLEAF_OT_generate = _modules["operators"].ATLASLEAF_OT_generate
+ATLASLEAF_OT_set_projected_shell_front = _modules["operators"].ATLASLEAF_OT_set_projected_shell_front
+ATLASLEAF_OT_set_projected_shell_back = _modules["operators"].ATLASLEAF_OT_set_projected_shell_back
+ATLASLEAF_OT_build_projected_shell = _modules["operators"].ATLASLEAF_OT_build_projected_shell
 ATLASLEAF_OT_straight_mesh = _modules["operators"].ATLASLEAF_OT_straight_mesh
 ATLASLEAF_OT_auto_split_material_collections = _modules["operators"].ATLASLEAF_OT_auto_split_material_collections
 ATLASLEAF_OT_create_anchor_container = _modules["operators"].ATLASLEAF_OT_create_anchor_container
@@ -75,6 +78,9 @@ classes = (
     ATLASLEAF_OT_clear_pairs,
     ATLASLEAF_OT_build_label_preview,
     ATLASLEAF_OT_generate,
+    ATLASLEAF_OT_set_projected_shell_front,
+    ATLASLEAF_OT_set_projected_shell_back,
+    ATLASLEAF_OT_build_projected_shell,
     ATLASLEAF_OT_straight_mesh,
     ATLASLEAF_OT_auto_split_material_collections,
     ATLASLEAF_OT_create_anchor_container,
