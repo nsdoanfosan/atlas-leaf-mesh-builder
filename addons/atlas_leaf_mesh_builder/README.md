@@ -25,7 +25,7 @@ Location:
 3D Viewport > Sidebar > Atlas Leaf > Atlas Leaf Mesh
 ```
 
-The panel also includes `SPM To Add`, a `Target SPMs` list, `Material Name`, and `Build/Update Target SPMs`. If a listed `.spm` does not exist, it is created from the local SpeedTree 10.1 blank template. If it already exists, the add-on updates the material with the matching material name or appends it if missing.
+The panel also includes `SPM To Add`, a `Target SPMs` list, `Atlas Asset Name`, and `Build/Update Target SPMs`. A missing `.spm` is rejected by default; enable `Create Missing Target SPM` only when a blank SpeedTree 10.1 target is intentional.
 
 ## Current Default Preset
 
@@ -111,11 +111,15 @@ The FBX files are temporary evaluated export copies with all faces assigned to o
 
 Each `.spm` target is treated as a separate SpeedTree update target. Add one or more files to the `Target SPMs` list with `SPM To Add` and `+`; each target's parent folder becomes its export folder for `meshes/`, the manifest, and the import notes.
 
-The `Material Name` field controls the SpeedTree `Material_v8` name. When that material already exists in the target `.spm`, the add-on updates its texture paths and reuses its existing cutout mesh IDs. When the material is missing, the add-on appends a new material and new mesh assets using IDs after the existing material/mesh IDs.
+`Atlas Asset Name` explicitly controls the base SpeedTree `Material_v8` name for a new export. Explicit names beginning with `M_cluster_` are canonicalized to `M_leaf_`; leaving the field blank preserves a legacy blend/file-derived name. An existing same-name material is updated when its UUID export scope matches. Older Atlas Leaf materials whose name-based scope exactly equals that same material name are reclaimed once and retagged with the current UUID; a same-name material owned by a different UUID scope remains a conflict.
+
+`Generator Source Mapping` is a JSON object keyed by absolute target SPM path. Each value is a list of exact source `Material_v8` names (or an object with `source_material_names` and optional same-order `source_material_ids`). After asset upsert, matching `Leaf Mesh`/`LeafMesh` and `Frond` Generator `:Material`/`:Mesh` slot pairs are replaced together. Source cutout mesh order maps to exported `leaf_NN` order; SpeedTree's `Mesh=-10` sentinel maps deterministically to `leaf_01`. The target SPM is restored byte-for-byte if any group or connection validation fails.
 
 `FBX Geometry Scale` is applied to the exported FBX mesh geometry before it is linked into the SPM. The SpeedTree external Mesh asset's own `Scale` field stays `1`, so updating an SPM does not bake a `0.01` Scale value into the SPM itself. The default exported geometry scale is `0.01` so SpeedTree generators using `Use Actual Size` start from a manageable size, and you can adjust it per atlas before rebuilding the target SPMs.
 
 Rebuilding existing SPMs synchronizes each material's mesh list to the current Blender collection. Each Blender source collection gets a persistent SpeedTree export scope ID, so multiple atlases can share one `.spm` without cleaning each other up. If a generated material or mesh from the same scope's previous manifest is no longer part of the current export, the add-on removes that stale SpeedTree material/mesh asset and deletes stale FBX/XML files only when they live inside that target's generated `meshes/` folder. Pre-existing SpeedTree materials and meshes outside the add-on's manifest/UserData scope are left untouched.
+
+Final manifests are stored per target under `.atlas_leaf_speedtree_targets/<SPM stem>.json`; per-scope/per-target cleanup records live under `.atlas_leaf_speedtree_scopes/`. Generator-referenced mesh IDs are protected from stale-asset cleanup.
 
 The managed atlas material's `SeasonCurve` is flattened to `1` from season `0` through `1` so the imported atlas leaves are not hidden or faded by SpeedTree seasonal material graphs. Other materials' season curves are left untouched.
 

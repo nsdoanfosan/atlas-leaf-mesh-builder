@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Atlas Leaf Mesh Builder",
     "author": "Codex for PARK",
-    "version": (0, 4, 2),
+    "version": (0, 5, 0),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Atlas Leaf",
     "description": "Build no-opacity leaf meshes from atlas alpha islands.",

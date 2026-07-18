@@ -237,7 +237,25 @@ class ATLASLEAF_Properties(PropertyGroup):
     speedtree_material_name: StringProperty(
         name="Material Name",
         default="Elm01_Atlas_Leaf",
-        description="Material_v8 name to create or update inside every target SPM",
+        description="Legacy field kept for older blend files",
+    )
+    speedtree_atlas_asset_name: StringProperty(
+        name="Atlas Asset Name",
+        default="",
+        description=(
+            "Explicit base name for newly exported atlas materials; M_cluster_ is canonicalized to M_leaf_. "
+            "Leave blank to preserve a legacy blend/file-derived name"
+        ),
+    )
+    speedtree_source_materials_json: StringProperty(
+        name="Generator Source Mapping",
+        default="{}",
+        description="JSON mapping from absolute target SPM path to source Material_v8 names to replace",
+    )
+    speedtree_create_missing_spm: BoolProperty(
+        name="Create Missing Target SPM",
+        default=False,
+        description="Explicitly allow creating a blank SpeedTree target when a listed SPM does not exist",
     )
     speedtree_mesh_scale: FloatProperty(
         name="FBX Geometry Scale",
