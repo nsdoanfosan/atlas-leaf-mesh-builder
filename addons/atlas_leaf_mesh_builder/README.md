@@ -15,6 +15,7 @@ Blender add-on for building no-opacity leaf meshes from texture-atlas alpha isla
 - Bridges the actual triangulated boundary between front and back surfaces when shell side faces are enabled.
 - Assigns bridge side UVs as a narrow inset strip inside the front island.
 - Places each leaf at a stem-side pivot origin when enabled.
+- Can split selected meshes at the world X axis, delete the part below it, and center the new bottom pivot at the world origin.
 - Keeps the original atlas texture set intact.
 
 ## Blender UI
@@ -26,6 +27,8 @@ Location:
 ```
 
 The panel also includes `SPM To Add`, a `Target SPMs` list, `Atlas Asset Name`, and `Build/Update Target SPMs`. A missing `.spm` is rejected by default; enable `Create Missing Target SPM` only when a blank SpeedTree 10.1 target is intentional.
+
+`Split Below X Axis + Center Pivot` processes every selected mesh. It cuts at world `Y=0`, deletes world `Y<0`, uses the center of the new bottom boundary as the object pivot, and places that pivot at world `0,0,0` while preserving rotation and scale.
 
 ## Current Default Preset
 

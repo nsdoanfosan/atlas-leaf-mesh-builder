@@ -889,6 +889,41 @@ def material_legacy_scope_matches(material, manifest, material_name):
     return not legacy_group or not current_group or legacy_group == current_group
 
 
+def material_untagged_legacy_meshes_match(
+    material,
+    manifest,
+    material_name,
+    spm_path,
+    mesh_nodes_by_id,
+    mesh_paths,
+):
+    """Recognize pre-ownership-tag exports by their exact external mesh paths."""
+    if str(material.attrib.get("Name") or "") != str(material_name):
+        return False
+    if str(material.findtext("UserData") or "").strip():
+        return False
+
+    mesh_ids = spm_material_mesh_ids(material)
+    if not mesh_ids or len(mesh_ids) != len(mesh_paths):
+        return False
+
+    existing_paths = []
+    for mesh_id in mesh_ids:
+        mesh_node = mesh_nodes_by_id.get(str(mesh_id))
+        if mesh_node is None or str(mesh_node.findtext("UserData") or "").strip():
+            return False
+        mesh_path = spm_mesh_filename_path(spm_path, mesh_node)
+        if mesh_path is None:
+            return False
+        existing_paths.append(normalized_mesh_lookup_key(mesh_path))
+
+    expected_paths = [
+        normalized_mesh_lookup_key(Path(mesh_path).resolve())
+        for mesh_path in mesh_paths
+    ]
+    return sorted(existing_paths) == sorted(expected_paths)
+
+
 def find_scope_group_material(assets, manifest):
     if assets is None:
         return None
@@ -1221,10 +1256,22 @@ def upsert_speedtree_assets_in_spm(spm_path, manifest, material_name, allow_crea
 
     named_material = find_material_by_name(assets, material_name)
     scoped_material = find_scope_group_material(assets, manifest)
+    untagged_legacy_match = (
+        named_material is not None
+        and material_untagged_legacy_meshes_match(
+            named_material,
+            manifest,
+            material_name,
+            spm_path,
+            mesh_nodes_by_id,
+            mesh_paths,
+        )
+    )
     if (
         named_material is not None
         and not material_scope_matches(named_material, manifest)
         and not material_legacy_scope_matches(named_material, manifest, material_name)
+        and not untagged_legacy_match
     ):
         raise RuntimeError(
             f"Material name conflict in {spm_path.name}: '{material_name}' belongs to another atlas/source. "
@@ -1446,6 +1493,50 @@ def speedtree_mesh_export_name(source, used_names, group_material=None):
     return candidate
 
 
+def _matrix_is_identity(matrix, tolerance=1.0e-6):
+    identity = Matrix.Identity(4)
+    return all(
+        abs(matrix[row][col] - identity[row][col]) <= tolerance
+        for row in range(4)
+        for col in range(4)
+    )
+
+
+def apply_source_mesh_transforms(source_groups):
+    """Bake each source mesh object's world transform into its mesh data so the
+    exported pivot sits at the world origin.
+
+    Only MESH objects are applied. Anchor empties and anchor containers are left
+    untouched, and direct children of an applied mesh keep their world placement
+    so anchor positions/rotations survive the apply.
+    """
+    identity = Matrix.Identity(4)
+    applied = []
+    seen = set()
+    for group in source_groups:
+        for obj in group["objects"]:
+            if obj.name in seen or obj.type != "MESH":
+                continue
+            seen.add(obj.name)
+            world = obj.matrix_world.copy()
+            if _matrix_is_identity(world):
+                continue
+            child_worlds = [(child, child.matrix_world.copy()) for child in obj.children]
+            if obj.data.users > 1:
+                obj.data = obj.data.copy()
+            obj.data.transform(world)
+            obj.data.update()
+            obj.matrix_world = identity
+            if child_worlds:
+                bpy.context.view_layer.update()
+                for child, child_world in child_worlds:
+                    child.matrix_world = child_world
+            applied.append(obj.name)
+    if applied:
+        bpy.context.view_layer.update()
+    return applied
+
+
 def export_speedtree_assets(props, export_dir, atlas_asset_name=None):
     collection = bpy.data.collections.get(props.collection_name)
     if not collection:
@@ -1461,6 +1552,11 @@ def export_speedtree_assets(props, export_dir, atlas_asset_name=None):
     source_groups = grouped_source_objects(collection, atlas_asset_name)
     if not any(group["objects"] for group in source_groups):
         raise RuntimeError(f"No mesh objects in collection: {props.collection_name}")
+
+    # SpeedTree misplaces external meshes whose FBX pivot is not at the origin,
+    # so bake every source mesh's transform before export. Anchor empties keep
+    # their world placement (their values must not be zeroed by the apply).
+    applied_transform_objects = apply_source_mesh_transforms(source_groups)
 
     if not hasattr(bpy.ops.export_scene, "fbx"):
         try:
@@ -1613,6 +1709,7 @@ def export_speedtree_assets(props, export_dir, atlas_asset_name=None):
         "material_groups": material_groups,
         "single_material_per_mesh": True,
         "mesh_geometry_scale": mesh_geometry_scale,
+        "applied_transform_objects": applied_transform_objects,
         "anchor_export_mode": anchor_export_mode,
         "anchor_count": sum(item.get("anchor_count", 0) for item in exported_meshes),
         "mesh_count": len(exported_meshes),
@@ -1626,6 +1723,7 @@ def export_speedtree_assets(props, export_dir, atlas_asset_name=None):
             "Texture maps reference the original source files and are not copied into the SPM folder.",
             "The original roughness map is connected to the SpeedTree gloss slot when present.",
             "SpeedTree XML anchor assets store child empties as LeafReferences.",
+            "Source mesh transforms are applied on build so FBX pivots sit at the origin; anchor empties keep their transforms.",
         ],
     }
     manifest_path = export_dir / "speedtree_import_manifest.json"

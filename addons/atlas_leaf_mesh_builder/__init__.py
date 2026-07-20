@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Atlas Leaf Mesh Builder",
     "author": "Codex for PARK",
-    "version": (0, 5, 0),
+    "version": (0, 5, 1),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > Atlas Leaf",
     "description": "Build no-opacity leaf meshes from atlas alpha islands.",
@@ -57,6 +57,7 @@ ATLASLEAF_OT_set_projected_shell_front = _modules["operators"].ATLASLEAF_OT_set_
 ATLASLEAF_OT_set_projected_shell_back = _modules["operators"].ATLASLEAF_OT_set_projected_shell_back
 ATLASLEAF_OT_build_projected_shell = _modules["operators"].ATLASLEAF_OT_build_projected_shell
 ATLASLEAF_OT_straight_mesh = _modules["operators"].ATLASLEAF_OT_straight_mesh
+ATLASLEAF_OT_split_below_x_axis = _modules["operators"].ATLASLEAF_OT_split_below_x_axis
 ATLASLEAF_OT_auto_split_material_collections = _modules["operators"].ATLASLEAF_OT_auto_split_material_collections
 ATLASLEAF_OT_create_anchor_container = _modules["operators"].ATLASLEAF_OT_create_anchor_container
 ATLASLEAF_OT_build_speedtree_spm = _modules["operators"].ATLASLEAF_OT_build_speedtree_spm
@@ -82,6 +83,7 @@ classes = (
     ATLASLEAF_OT_set_projected_shell_back,
     ATLASLEAF_OT_build_projected_shell,
     ATLASLEAF_OT_straight_mesh,
+    ATLASLEAF_OT_split_below_x_axis,
     ATLASLEAF_OT_auto_split_material_collections,
     ATLASLEAF_OT_create_anchor_container,
     ATLASLEAF_OT_build_speedtree_spm,

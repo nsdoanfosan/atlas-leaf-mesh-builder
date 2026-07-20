@@ -222,13 +222,15 @@ class SafetyTests(unittest.TestCase):
         material_name = "M_cluster_lauraceae_atlas_01"
         root = ET.Element("SpeedTreeModel")
         assets = ET.SubElement(root, "Assets")
-        marker = json.dumps(
-            {
-                "generator": speedtree.ATLAS_LEAF_SPM_GENERATOR,
-                "scope": existing_scope,
-                "kind": "material",
-            }
-        )
+        marker = ""
+        if existing_scope is not None:
+            marker = json.dumps(
+                {
+                    "generator": speedtree.ATLAS_LEAF_SPM_GENERATOR,
+                    "scope": existing_scope,
+                    "kind": "material",
+                }
+            )
         add_material(assets, 8, material_name, [18], marker)
         add_mesh(assets, 18, marker.replace('"material"', '"mesh"'))
         write_spm(target, root)
@@ -249,6 +251,53 @@ class SafetyTests(unittest.TestCase):
             "meshes": [{"asset": str(folder / "meshes" / "18.fbx")}],
         }
         return target, sample, manifest, material_name
+
+    def test_untagged_legacy_mesh_paths_are_migrated_to_uuid(self):
+        with tempfile.TemporaryDirectory() as folder:
+            target, sample, manifest, material_name = self._write_upsert_fixture(folder, None)
+            original_material_sample = speedtree.SPEEDTREE_101_MATERIAL_SAMPLE
+            original_mesh_sample = speedtree.SPEEDTREE_101_EXTERNAL_MESH_SAMPLE
+            speedtree.SPEEDTREE_101_MATERIAL_SAMPLE = sample
+            speedtree.SPEEDTREE_101_EXTERNAL_MESH_SAMPLE = sample
+            try:
+                _, action, material_id, mesh_ids = speedtree.upsert_speedtree_assets_in_spm(
+                    target, manifest, material_name
+                )
+            finally:
+                speedtree.SPEEDTREE_101_MATERIAL_SAMPLE = original_material_sample
+                speedtree.SPEEDTREE_101_EXTERNAL_MESH_SAMPLE = original_mesh_sample
+
+            parsed_assets = speedtree.read_spm_xml(target).find("Assets")
+            material = speedtree.find_material_by_name(parsed_assets, material_name)
+            mesh = parsed_assets.find("Mesh[@ID='18']")
+            self.assertEqual(action, "updated")
+            self.assertEqual(material_id, 8)
+            self.assertEqual(mesh_ids, [18])
+            self.assertEqual(
+                speedtree.parse_atlas_leaf_spm_user_data(material.findtext("UserData"))["scope"],
+                "new-uuid-scope",
+            )
+            self.assertEqual(
+                speedtree.parse_atlas_leaf_spm_user_data(mesh.findtext("UserData"))["scope"],
+                "new-uuid-scope",
+            )
+
+    def test_untagged_same_name_with_different_mesh_paths_still_conflicts(self):
+        with tempfile.TemporaryDirectory() as folder:
+            target, sample, manifest, material_name = self._write_upsert_fixture(folder, None)
+            manifest["meshes"] = [{"asset": str(Path(folder) / "meshes" / "different.fbx")}]
+            before = target.read_bytes()
+            original_material_sample = speedtree.SPEEDTREE_101_MATERIAL_SAMPLE
+            original_mesh_sample = speedtree.SPEEDTREE_101_EXTERNAL_MESH_SAMPLE
+            speedtree.SPEEDTREE_101_MATERIAL_SAMPLE = sample
+            speedtree.SPEEDTREE_101_EXTERNAL_MESH_SAMPLE = sample
+            try:
+                with self.assertRaisesRegex(RuntimeError, "Material name conflict"):
+                    speedtree.upsert_speedtree_assets_in_spm(target, manifest, material_name)
+            finally:
+                speedtree.SPEEDTREE_101_MATERIAL_SAMPLE = original_material_sample
+                speedtree.SPEEDTREE_101_EXTERNAL_MESH_SAMPLE = original_mesh_sample
+            self.assertEqual(target.read_bytes(), before)
 
     def test_legacy_name_scope_is_updated_and_retagged_with_uuid(self):
         with tempfile.TemporaryDirectory() as folder:

@@ -2,6 +2,7 @@ import colorsys
 import json
 from pathlib import Path
 
+import bmesh
 import bpy
 import numpy as np
 from bpy.props import IntProperty
@@ -314,6 +315,102 @@ def auto_split_classifications(objects, props):
 
 def selected_mesh_objects(context):
     return [obj for obj in context.selected_objects if obj.type == "MESH"]
+
+
+def split_below_world_x_axis_and_center(obj, tolerance=1.0e-6):
+    """Delete world Y < 0, then place the cut-bottom pivot at world origin."""
+    if obj.data.shape_keys is not None:
+        return False, "Shape keys are not supported", None
+
+    mesh = obj.data
+    bm = bmesh.new()
+    try:
+        bm.from_mesh(mesh)
+        if not bm.verts:
+            return False, "Mesh has no vertices", None
+
+        original_matrix = obj.matrix_world.copy()
+        bmesh.ops.transform(bm, matrix=original_matrix, verts=list(bm.verts))
+        world_y = [float(vertex.co.y) for vertex in bm.verts]
+        minimum_y = min(world_y)
+        maximum_y = max(world_y)
+        cut_applied = minimum_y < -tolerance
+
+        if cut_applied and maximum_y <= tolerance:
+            return False, "Mesh has no geometry above the world X axis", None
+
+        if cut_applied:
+            geometry = list(bm.verts) + list(bm.edges) + list(bm.faces)
+            bmesh.ops.bisect_plane(
+                bm,
+                geom=geometry,
+                dist=tolerance,
+                plane_co=Vector((0.0, 0.0, 0.0)),
+                plane_no=Vector((0.0, 1.0, 0.0)),
+                clear_inner=True,
+                clear_outer=False,
+            )
+            if not bm.verts or not bm.faces:
+                return False, "Split left no usable faces", None
+
+        post_minimum_y = min(float(vertex.co.y) for vertex in bm.verts)
+        extent = max(
+            max(float(vertex.co.y) for vertex in bm.verts) - post_minimum_y,
+            1.0,
+        )
+        bottom_tolerance = max(tolerance * 10.0, extent * 1.0e-6)
+        bottom_y = 0.0 if cut_applied else post_minimum_y
+        bottom_vertices = [
+            vertex
+            for vertex in bm.verts
+            if abs(float(vertex.co.y) - bottom_y) <= bottom_tolerance
+        ]
+        if not bottom_vertices:
+            return False, "Could not find the bottom boundary", None
+
+        pivot_world = Vector(
+            (
+                (
+                    min(float(vertex.co.x) for vertex in bottom_vertices)
+                    + max(float(vertex.co.x) for vertex in bottom_vertices)
+                )
+                * 0.5,
+                bottom_y,
+                (
+                    min(float(vertex.co.z) for vertex in bottom_vertices)
+                    + max(float(vertex.co.z) for vertex in bottom_vertices)
+                )
+                * 0.5,
+            )
+        )
+
+        origin_matrix = original_matrix.copy()
+        origin_matrix.translation = pivot_world
+        bmesh.ops.transform(
+            bm,
+            matrix=origin_matrix.inverted(),
+            verts=list(bm.verts),
+        )
+        bm.to_mesh(mesh)
+        mesh.update()
+
+        child_world_matrices = {
+            child: child.matrix_world.copy()
+            for child in obj.children
+        }
+        obj.matrix_world = origin_matrix
+        for child, child_matrix in child_world_matrices.items():
+            child.matrix_world = child_matrix
+
+        centered_matrix = origin_matrix.copy()
+        centered_matrix.translation = Vector((0.0, 0.0, 0.0))
+        obj.matrix_world = centered_matrix
+        return True, "Split and centered" if cut_applied else "Centered", {
+            "cut_applied": cut_applied,
+            "bottom_vertex_count": len(bottom_vertices),
+        }
+    finally:
+        bm.free()
 
 
 def generation_pair_json(props):
@@ -1946,6 +2043,79 @@ class ATLASLEAF_OT_straight_mesh(Operator):
         return {"FINISHED"}
 
 
+class ATLASLEAF_OT_split_below_x_axis(Operator):
+    bl_idname = "atlas_leaf.split_below_x_axis"
+    bl_label = "Split Below X Axis + Center Pivot"
+    bl_description = (
+        "Cut selected meshes at the world X axis, delete world Y below zero, "
+        "then move the bottom-center pivot to the world origin"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        objects = selected_mesh_objects(context)
+        if not objects:
+            self.report({"ERROR"}, "Select one or more mesh objects.")
+            return {"CANCELLED"}
+
+        processed = 0
+        cut_count = 0
+        centered_count = 0
+        skipped = []
+        for obj in objects:
+            source_data = obj.data
+            source_data_name = source_data.name
+            source_matrix = obj.matrix_world.copy()
+            child_world_matrices = {
+                child: child.matrix_world.copy()
+                for child in obj.children
+            }
+            working_data = source_data.copy()
+            working_data.name = f"{source_data_name}__split_work"
+            obj.data = working_data
+            try:
+                ok, message, details = split_below_world_x_axis_and_center(obj)
+            except Exception as exc:
+                ok, message, details = False, str(exc), None
+
+            if ok:
+                if source_data.users == 0:
+                    bpy.data.meshes.remove(source_data)
+                    working_data.name = source_data_name
+                else:
+                    working_data.name = f"{source_data_name}_split"
+                processed += 1
+                if details["cut_applied"]:
+                    cut_count += 1
+                else:
+                    centered_count += 1
+            else:
+                obj.data = source_data
+                obj.matrix_world = source_matrix
+                for child, child_matrix in child_world_matrices.items():
+                    child.matrix_world = child_matrix
+                if working_data.users == 0:
+                    bpy.data.meshes.remove(working_data)
+                skipped.append(f"{obj.name}: {message}")
+
+        context.view_layer.update()
+        if processed == 0:
+            self.report({"ERROR"}, "; ".join(skipped) or "No meshes were split.")
+            return {"CANCELLED"}
+        if skipped:
+            self.report(
+                {"WARNING"},
+                f"Processed {processed}; cut {cut_count}, centered {centered_count}; skipped {len(skipped)}.",
+            )
+        else:
+            self.report(
+                {"INFO"},
+                f"Processed {processed} selected mesh{'es' if processed != 1 else ''}; "
+                f"cut {cut_count}, centered {centered_count} at the world origin.",
+            )
+        return {"FINISHED"}
+
+
 class ATLASLEAF_OT_auto_split_material_collections(Operator):
     bl_idname = "atlas_leaf.auto_split_material_collections"
     bl_label = "Auto Split Material Collections"
@@ -2108,6 +2278,7 @@ class ATLASLEAF_PT_panel(Panel):
         projected_box.label(text="Align and enlarge Back over Front, then build.")
         projected_box.operator("atlas_leaf.build_projected_shell", icon="MOD_UVPROJECT")
         layout.operator("atlas_leaf.straight_mesh", text="Straight Mesh (Backup Original)", icon="MOD_SIMPLEDEFORM")
+        layout.operator("atlas_leaf.split_below_x_axis", icon="MOD_BOOLEAN")
         layout.operator("atlas_leaf.auto_split_material_collections", icon="OUTLINER_COLLECTION")
         layout.separator()
         layout.prop(props, "speedtree_atlas_asset_name")
