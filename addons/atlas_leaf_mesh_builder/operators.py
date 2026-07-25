@@ -1,5 +1,6 @@
 import colorsys
 import json
+import shutil
 from pathlib import Path
 
 import bmesh
@@ -11,8 +12,16 @@ from mathutils import Matrix, Vector
 
 from .constants import DEFAULT_PAIRS, HELPER_PATH
 from .materials import build_mesh_object, configure_leaf_surface, ensure_collection, make_atlas_material, make_side_material, show_preview_images_in_view
-from .props import add_spm_target_item, ensure_pair_items, fill_pair_items, pair_items_to_json, sync_alpha_path
-from .speedtree import export_or_update_speedtree_spm_targets
+from .props import (
+    add_spm_target_item,
+    ensure_pair_items,
+    fill_pair_items,
+    pair_items_to_json,
+    save_spm_target_registry,
+    sync_alpha_path,
+    sync_spm_target_registry,
+)
+from .speedtree import export_or_update_speedtree_spm_targets, remove_blend_target_from_spm
 from .utils import dependency_status, run_external_python, write_report
 
 
@@ -2177,6 +2186,7 @@ class ATLASLEAF_OT_build_speedtree_spm(Operator):
     def execute(self, context):
         props = context.scene.atlas_leaf_builder
         try:
+            save_spm_target_registry(props)
             results = export_or_update_speedtree_spm_targets(props)
         except Exception as exc:
             self.report({"ERROR"}, str(exc))
@@ -2199,9 +2209,14 @@ class ATLASLEAF_OT_add_speedtree_spm(Operator):
     def execute(self, context):
         props = context.scene.atlas_leaf_builder
         try:
+            sync_spm_target_registry(props)
             added, path = add_spm_target_item(props, props.speedtree_spm_path)
+            save_spm_target_registry(props)
         except ValueError as exc:
             self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+        except Exception as exc:
+            self.report({"ERROR"}, f"Target removal failed; list and SPM were preserved: {exc}")
             return {"CANCELLED"}
         self.report({"INFO"}, f"{'Added' if added else 'Already listed'} target SPM: {path}")
         return {"FINISHED"}
@@ -2210,29 +2225,74 @@ class ATLASLEAF_OT_add_speedtree_spm(Operator):
 class ATLASLEAF_OT_remove_speedtree_spm(Operator):
     bl_idname = "atlas_leaf.remove_speedtree_spm"
     bl_label = "Remove Target SPM"
-    bl_options = {"REGISTER", "UNDO"}
+    bl_options = {"REGISTER"}
 
     index: IntProperty(default=-1)
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_confirm(self, event)
 
     def execute(self, context):
         props = context.scene.atlas_leaf_builder
         if self.index < 0 or self.index >= len(props.speedtree_spm_items):
             self.report({"ERROR"}, "SPM target index is outside the current list.")
             return {"CANCELLED"}
-        removed = props.speedtree_spm_items[self.index].path
-        props.speedtree_spm_items.remove(self.index)
-        self.report({"INFO"}, f"Removed target SPM: {removed}")
+        previous = [item.path for item in props.speedtree_spm_items]
+        removed = previous[self.index]
+        try:
+            cleanup = remove_blend_target_from_spm(bpy.data.filepath, bpy.path.abspath(removed))
+            props.speedtree_spm_items.remove(self.index)
+            save_spm_target_registry(props)
+        except Exception as exc:
+            props.speedtree_spm_items.clear()
+            for path in previous:
+                item = props.speedtree_spm_items.add()
+                item.path = path
+            backup = locals().get("cleanup", {}).get("backup")
+            if backup and Path(backup).is_file():
+                shutil.copy2(backup, bpy.path.abspath(removed))
+            self.report({"ERROR"}, f"Target registry update failed: {exc}")
+            return {"CANCELLED"}
+        self.report(
+            {"INFO"},
+            f"Removed target SPM and detached managed data ({cleanup['status']}): {removed}",
+        )
         return {"FINISHED"}
 
 
 class ATLASLEAF_OT_clear_speedtree_spms(Operator):
     bl_idname = "atlas_leaf.clear_speedtree_spms"
     bl_label = "Clear Target SPMs"
-    bl_options = {"REGISTER", "UNDO"}
+    bl_options = {"REGISTER"}
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_confirm(self, event)
 
     def execute(self, context):
-        context.scene.atlas_leaf_builder.speedtree_spm_items.clear()
-        self.report({"INFO"}, "Cleared target SPM list.")
+        props = context.scene.atlas_leaf_builder
+        previous = [item.path for item in props.speedtree_spm_items]
+        cleanups = []
+        try:
+            for path in previous:
+                cleanups.append(
+                    remove_blend_target_from_spm(
+                        bpy.data.filepath, bpy.path.abspath(path)
+                    )
+                )
+            props.speedtree_spm_items.clear()
+            save_spm_target_registry(props)
+        except Exception as exc:
+            for cleanup, path in zip(cleanups, previous):
+                backup = cleanup.get("backup")
+                if backup and Path(backup).is_file():
+                    shutil.copy2(backup, bpy.path.abspath(path))
+            props.speedtree_spm_items.clear()
+            for path in previous:
+                item = props.speedtree_spm_items.add()
+                item.path = path
+            self.report({"ERROR"}, f"Target clear failed; list and SPMs were preserved: {exc}")
+            return {"CANCELLED"}
+        self.report({"INFO"}, f"Cleared {len(previous)} target SPMs and detached managed data.")
         return {"FINISHED"}
 
 
@@ -2246,6 +2306,11 @@ class ATLASLEAF_PT_panel(Panel):
     def draw(self, context):
         layout = self.layout
         props = context.scene.atlas_leaf_builder
+        registry_error = ""
+        try:
+            sync_spm_target_registry(props)
+        except Exception as exc:
+            registry_error = str(exc)
         layout.prop(props, "albedo_path")
         layout.prop(props, "alpha_path")
         layout.prop(props, "output_dir")
@@ -2285,6 +2350,7 @@ class ATLASLEAF_PT_panel(Panel):
         layout.prop(props, "speedtree_create_missing_spm")
         layout.prop(props, "speedtree_source_materials_json")
         layout.prop(props, "speedtree_mesh_scale")
+        layout.prop(props, "speedtree_mesh_asset_scale")
         layout.prop(props, "speedtree_anchor_export_mode")
         layout.prop(props, "speedtree_anchor_prefix")
         row = layout.row(align=True)
@@ -2297,8 +2363,12 @@ class ATLASLEAF_PT_panel(Panel):
         box = layout.box()
         header = box.row(align=True)
         header.label(text="Target SPMs")
-        header.label(text=f"{len(props.speedtree_spm_items)} listed")
+        header.label(text=f"{len(props.speedtree_spm_items)} listed · JSON")
         header.operator("atlas_leaf.clear_speedtree_spms", text="", icon="TRASH")
+        if registry_error:
+            row = box.row()
+            row.alert = True
+            row.label(text=f"Target JSON error: {registry_error}", icon="ERROR")
         for index, item in enumerate(props.speedtree_spm_items):
             row = box.row(align=True)
             row.label(text=f"{index + 1:02d}")

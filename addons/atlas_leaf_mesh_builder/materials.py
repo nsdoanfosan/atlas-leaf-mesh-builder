@@ -123,17 +123,34 @@ def show_preview_images_in_view(preview_data):
     return objects
 
 
-def make_speedtree_material(name, image_path):
+def make_speedtree_material(name, image_path, opacity_path=None):
     material = bpy.data.materials.get(name) or bpy.data.materials.new(name)
     material.use_nodes = True
     material.use_backface_culling = False
     nodes = material.node_tree.nodes
     nodes.clear()
-    tex = nodes.new("ShaderNodeTexImage")
-    tex.image = bpy.data.images.load(image_path, check_existing=True)
+    color = nodes.new("ShaderNodeTexImage")
+    color.name = "SpeedTree Color"
+    color.label = "SpeedTree Color"
+    color.image = bpy.data.images.load(str(image_path), check_existing=True)
+    color.image.reload()
+    color.extension = "CLIP"
     bsdf = nodes.new("ShaderNodeBsdfPrincipled")
     output = nodes.new("ShaderNodeOutputMaterial")
-    material.node_tree.links.new(tex.outputs["Color"], bsdf.inputs["Base Color"])
+    material.node_tree.links.new(color.outputs["Color"], bsdf.inputs["Base Color"])
+    if opacity_path:
+        opacity = nodes.new("ShaderNodeTexImage")
+        opacity.name = "SpeedTree Opacity"
+        opacity.label = "SpeedTree Opacity"
+        opacity.image = bpy.data.images.load(str(opacity_path), check_existing=True)
+        opacity.image.reload()
+        opacity.extension = "CLIP"
+        opacity.image.colorspace_settings.name = "Non-Color"
+        material.node_tree.links.new(opacity.outputs["Color"], bsdf.inputs["Alpha"])
+        if hasattr(material, "surface_render_method"):
+            material.surface_render_method = "DITHERED"
+        elif hasattr(material, "blend_method"):
+            material.blend_method = "HASHED"
     material.node_tree.links.new(bsdf.outputs["BSDF"], output.inputs["Surface"])
     return material
 

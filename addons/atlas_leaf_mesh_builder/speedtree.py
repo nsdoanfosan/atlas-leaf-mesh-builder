@@ -1,9 +1,13 @@
+import base64
 import copy
 import gzip
 import hashlib
 import json
+import math
 import re
+import shutil
 import uuid
+from datetime import datetime
 from pathlib import Path
 from xml.dom import minidom
 import xml.etree.ElementTree as ET
@@ -19,6 +23,28 @@ from .texture_paths import atlas_texture_paths
 
 ATLAS_LEAF_SPM_GENERATOR = "Atlas Leaf Mesh Builder"
 ATLAS_LEAF_COLLECTION_SCOPE_KEY = "atlas_leaf_speedtree_scope_id"
+GENERATOR_VARIANT_POLICY_PRESERVE_EXISTING = "preserve_existing_slots"
+GENERATOR_VARIANT_POLICY_ENSURE_ALL_MATERIAL_CUTOUTS = (
+    "ensure_all_material_cutouts"
+)
+FROND_BAKED_GEOMETRY_SCALE_PROPERTIES = (
+    "Shape:Scale:Width",
+    "Shape:Scale:Height",
+)
+
+
+def normalize_generator_variant_policy(value):
+    policy = str(value or GENERATOR_VARIANT_POLICY_PRESERVE_EXISTING).strip()
+    valid = {
+        GENERATOR_VARIANT_POLICY_PRESERVE_EXISTING,
+        GENERATOR_VARIANT_POLICY_ENSURE_ALL_MATERIAL_CUTOUTS,
+    }
+    if policy not in valid:
+        raise ValueError(
+            "Generator variant policy must be one of: "
+            + ", ".join(sorted(valid))
+        )
+    return policy
 
 
 def write_speedtree_readme(export_dir, manifest):
@@ -36,7 +62,8 @@ def write_speedtree_readme(export_dir, manifest):
         "- Materials reference the original source textures directly; no texture copies are generated.",
         "- Meshes are closed shells with the stem pivot at object origin.",
         "- FBX export uses a single material per mesh; XML assets are written when anchors are present.",
-        f"- FBX mesh geometry scale: `{manifest.get('mesh_geometry_scale', 1)}`; SpeedTree Mesh asset Scale remains `1`.",
+        f"- FBX mesh geometry scale: `{manifest.get('mesh_geometry_scale', 1)}`.",
+        f"- SpeedTree Mesh asset Scale: `{manifest.get('mesh_asset_scale', 1)}`.",
         f"- Anchor export mode: `{manifest.get('anchor_export_mode', 'OFF')}`.",
         "",
         "## Suggested SpeedTree Setup",
@@ -259,10 +286,27 @@ def read_spm_xml(path):
     return ET.fromstring(gzip.decompress(Path(path).read_bytes()))
 
 
+def strip_spm_layout_whitespace(node):
+    """Drop the indentation a previous pretty-print pass left as text nodes.
+
+    ``toprettyxml`` treats that leftover indentation as content and indents it
+    again, so every save multiplied the blank lines: one elm SPM grew from 0.4M
+    to 9.2M lines in two days and each save cost ~8s. Only whitespace-only text
+    and tails are cleared, so no authored value is touched.
+    """
+    for child in node:
+        strip_spm_layout_whitespace(child)
+    if node.text is not None and not node.text.strip():
+        node.text = None
+    if node.tail is not None and not node.tail.strip():
+        node.tail = None
+    return node
+
+
 def write_spm_xml(path, root):
-    rough = ET.tostring(root, encoding="utf-8")
-    pretty = minidom.parseString(rough).toprettyxml(indent="\t", encoding="UTF-8")
-    Path(path).write_bytes(gzip.compress(pretty, mtime=0))
+    ET.indent(strip_spm_layout_whitespace(root), space="\t")
+    payload = ET.tostring(root, encoding="UTF-8", xml_declaration=True)
+    Path(path).write_bytes(gzip.compress(payload, mtime=0))
 
 
 def relative_spm_path(spm_path, target_path):
@@ -356,10 +400,23 @@ def blend_paths_equal(path_a, path_b):
 
 
 def texture_path_signature(texture_exports):
-    payload = {
-        str(key): str(value).replace("\\", "/").lower()
-        for key, value in sorted((texture_exports or {}).items())
-    }
+    payload = {}
+    for key, value in sorted((texture_exports or {}).items()):
+        normalized_path = str(value).replace("\\", "/").lower()
+        row = {"path": normalized_path}
+        candidate = Path(value)
+        if candidate.is_file():
+            digest = hashlib.sha256()
+            with candidate.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            row.update(
+                {
+                    "size": candidate.stat().st_size,
+                    "sha256": digest.hexdigest(),
+                }
+            )
+        payload[str(key)] = row
     encoded = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
@@ -481,7 +538,74 @@ def first_external_mesh_template():
     raise RuntimeError("SpeedTree 10.1 mesh sample has no external Mesh node.")
 
 
-def set_material_map(material, map_name, texture_path, spm_path, enabled=True):
+def texture_pixel_dimensions(texture_path):
+    """Read exact pixel dimensions without depending on a loaded Blender image."""
+    path = Path(texture_path)
+    suffix = path.suffix.casefold()
+    header = path.read_bytes()[:32]
+    if suffix == ".tga":
+        if len(header) < 18:
+            raise RuntimeError(f"TGA texture header is incomplete: {path}")
+        width = int.from_bytes(header[12:14], "little")
+        height = int.from_bytes(header[14:16], "little")
+    elif suffix == ".png":
+        if len(header) < 24 or header[:8] != b"\x89PNG\r\n\x1a\n":
+            raise RuntimeError(f"PNG texture header is invalid: {path}")
+        width = int.from_bytes(header[16:20], "big")
+        height = int.from_bytes(header[20:24], "big")
+    elif suffix == ".bmp":
+        if len(header) < 26 or header[:2] != b"BM":
+            raise RuntimeError(f"BMP texture header is invalid: {path}")
+        width = abs(int.from_bytes(header[18:22], "little", signed=True))
+        height = abs(int.from_bytes(header[22:26], "little", signed=True))
+    else:
+        image = None
+        try:
+            image = bpy.data.images.load(str(path), check_existing=False)
+            width, height = (int(image.size[0]), int(image.size[1]))
+        except Exception as exc:
+            raise RuntimeError(
+                f"Cannot determine texture dimensions for {path}"
+            ) from exc
+        finally:
+            if image is not None:
+                bpy.data.images.remove(image)
+    if width <= 0 or height <= 0:
+        raise RuntimeError(f"Texture has invalid pixel dimensions: {path}")
+    return width, height
+
+
+def common_texture_dimensions(texture_exports, fallback=None):
+    dimensions = {}
+    for role, texture_path in sorted((texture_exports or {}).items()):
+        if not texture_path:
+            continue
+        path = Path(texture_path)
+        if not path.is_file():
+            continue
+        dimensions[role] = texture_pixel_dimensions(path)
+    unique = sorted(set(dimensions.values()))
+    if len(unique) > 1:
+        details = ", ".join(
+            f"{role}={size[0]}x{size[1]}"
+            for role, size in sorted(dimensions.items())
+        )
+        raise RuntimeError(
+            "SpeedTree atlas maps must share one pixel resolution; " + details
+        )
+    if unique:
+        return unique[0]
+    return fallback
+
+
+def set_material_map(
+    material,
+    map_name,
+    texture_path,
+    spm_path,
+    enabled=True,
+    texture_size=None,
+):
     map_node = None
     for candidate in material.findall("Map"):
         if candidate.attrib.get("Name") == map_name:
@@ -494,8 +618,10 @@ def set_material_map(material, map_name, texture_path, spm_path, enabled=True):
     if texture_path:
         tex_filename.text = relative_spm_path(spm_path, texture_path)
         child_text(map_node, "TexEnabled", "true" if enabled else "false")
-        child_text(map_node, "TexSizeX", "4096")
-        child_text(map_node, "TexSizeY", "4096")
+        if texture_size is None:
+            texture_size = texture_pixel_dimensions(texture_path)
+        child_text(map_node, "TexSizeX", str(int(texture_size[0])))
+        child_text(map_node, "TexSizeY", str(int(texture_size[1])))
     else:
         tex_filename.text = ""
         child_text(map_node, "TexEnabled", "false")
@@ -511,15 +637,10 @@ def make_spm_material(spm_path, texture_exports, mesh_ids, material_name, manife
     return material
 
 
-def update_spm_material(material, spm_path, texture_exports, mesh_ids):
-    child_text(material, "TwoSided", "true")
+def update_spm_material_mesh_ids(material, mesh_ids):
+    if not mesh_ids:
+        raise RuntimeError("A SpeedTree material requires at least one cutout mesh ID.")
     child_text(material, "CutoutMeshID", str(mesh_ids[0]))
-    child_text(material, "Width", "4096")
-    child_text(material, "Height", "4096")
-    child_text(material, "Atlas", "0")
-    child_text(material, "AtlasName", "")
-    child_text(material, "BackMaterialID", "-1")
-
     supplemental = material.find("SupplementalCutoutMeshIDs")
     if supplemental is None:
         supplemental = ET.SubElement(material, "SupplementalCutoutMeshIDs")
@@ -528,16 +649,46 @@ def update_spm_material(material, spm_path, texture_exports, mesh_ids):
     supplemental.attrib["Count"] = str(max(0, len(mesh_ids) - 1))
     for mesh_id in mesh_ids[1:]:
         ET.SubElement(supplemental, "CutoutMesh", {"ID": str(mesh_id)})
+    return material
 
-    set_material_map(material, "Color", texture_exports.get("albedo"), spm_path)
-    set_material_map(material, "Opacity", texture_exports.get("alpha"), spm_path)
-    set_material_map(material, "Normal", texture_exports.get("normal"), spm_path)
-    set_material_map(material, "Gloss", texture_exports.get("gloss") or texture_exports.get("roughness"), spm_path)
-    set_material_map(material, "Height", texture_exports.get("height"), spm_path)
-    set_material_map(material, "SubsurfaceColor", texture_exports.get("translucency"), spm_path)
-    set_material_map(material, "SubsurfaceAmount", texture_exports.get("translucency"), spm_path)
-    for empty_map in ("Specular", "Metallic", "AO", "Custom", "Custom2"):
+
+def update_spm_material_texture_maps(material, spm_path, texture_exports):
+    previous_size = (
+        integer_value(material.findtext("Width")),
+        integer_value(material.findtext("Height")),
+    )
+    fallback_size = (
+        previous_size
+        if all(value is not None and value > 0 for value in previous_size)
+        else (4096, 4096)
+    )
+    texture_size = common_texture_dimensions(
+        texture_exports,
+        fallback=fallback_size,
+    )
+    child_text(material, "Width", str(int(texture_size[0])))
+    child_text(material, "Height", str(int(texture_size[1])))
+
+    set_material_map(material, "Color", texture_exports.get("albedo"), spm_path, texture_size=texture_size)
+    set_material_map(material, "Opacity", texture_exports.get("alpha"), spm_path, texture_size=texture_size)
+    set_material_map(material, "Normal", texture_exports.get("normal"), spm_path, texture_size=texture_size)
+    set_material_map(material, "Gloss", texture_exports.get("gloss") or texture_exports.get("roughness"), spm_path, texture_size=texture_size)
+    set_material_map(material, "Height", texture_exports.get("height"), spm_path, texture_size=texture_size)
+    set_material_map(material, "SubsurfaceColor", texture_exports.get("translucency"), spm_path, texture_size=texture_size)
+    set_material_map(material, "SubsurfaceAmount", texture_exports.get("translucency"), spm_path, texture_size=texture_size)
+    set_material_map(material, "AO", texture_exports.get("ao"), spm_path, texture_size=texture_size)
+    for empty_map in ("Specular", "Metallic", "Custom", "Custom2"):
         set_material_map(material, empty_map, None, spm_path, enabled=False)
+    return material
+
+
+def update_spm_material(material, spm_path, texture_exports, mesh_ids):
+    child_text(material, "TwoSided", "true")
+    update_spm_material_mesh_ids(material, mesh_ids)
+    child_text(material, "Atlas", "0")
+    child_text(material, "AtlasName", "")
+    child_text(material, "BackMaterialID", "-1")
+    update_spm_material_texture_maps(material, spm_path, texture_exports)
     force_material_season_curve_one(material)
     return material
 
@@ -568,19 +719,491 @@ def positive_int(value):
     return number if number is not None and number > 0 else None
 
 
+def normalized_generator_type(value):
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+
+
+def generator_variant_parent_name(generator_type):
+    normalized = normalized_generator_type(generator_type)
+    if normalized == "frond":
+        return "Material:Frond"
+    if normalized == "leafmesh":
+        return "Leaves:Type"
+    return None
+
+
+def generator_variant_slot_descriptor(pair):
+    parent_name = generator_variant_parent_name(pair.get("generator_type"))
+    if parent_name is None:
+        return None
+    match = re.fullmatch(
+        rf"{re.escape(parent_name)}:(\d+)",
+        str(pair.get("slot_prefix") or ""),
+    )
+    if match is None:
+        return None
+    return parent_name, int(match.group(1))
+
+
+def generator_variant_parent_state(generator, parent_name):
+    properties = generator.find("Properties")
+    if properties is None:
+        raise RuntimeError(
+            f"Generator '{generator.findtext('Name') or ''}' has no Properties node."
+        )
+    nodes_by_name = {}
+    for prop in list(properties):
+        name = str(prop.findtext("Name") or "").strip()
+        if not name:
+            continue
+        if name in nodes_by_name:
+            raise RuntimeError(
+                f"Generator '{generator.findtext('Name') or ''}' duplicates Property '{name}'."
+            )
+        nodes_by_name[name] = prop
+    parent = nodes_by_name.get(parent_name)
+    if parent is None:
+        raise RuntimeError(
+            f"Generator '{generator.findtext('Name') or ''}' has no '{parent_name}' "
+            "multi-property parent."
+        )
+    child_count = integer_value(parent.findtext("MultiPropertyChildren"))
+    if child_count is None or child_count <= 0:
+        raise RuntimeError(
+            f"Generator '{generator.findtext('Name') or ''}' has invalid "
+            f"{parent_name} MultiPropertyChildren."
+        )
+
+    slots = {}
+    slot_nodes = {}
+    pattern = re.compile(
+        rf"^{re.escape(parent_name)}:(\d+):(.+)$"
+    )
+    for name, prop in nodes_by_name.items():
+        match = pattern.fullmatch(name)
+        if match is None:
+            continue
+        index = int(match.group(1))
+        suffix = match.group(2)
+        slot_nodes.setdefault(index, []).append(
+            {
+                "name": name,
+                "suffix": suffix,
+                "node": prop,
+            }
+        )
+        kind = suffix.lower()
+        if kind in {"material", "mesh"}:
+            slot = slots.setdefault(index, {})
+            slot[kind] = prop
+    expected_indices = list(range(child_count))
+    if sorted(slot_nodes) != expected_indices:
+        raise RuntimeError(
+            f"Generator '{generator.findtext('Name') or ''}' {parent_name} child "
+            f"indices are {sorted(slot_nodes)}, expected {expected_indices}."
+        )
+    for index in expected_indices:
+        if set(slots.get(index, {})) != {"material", "mesh"}:
+            raise RuntimeError(
+                f"Generator '{generator.findtext('Name') or ''}' "
+                f"{parent_name}:{index} has an incomplete Material/Mesh pair."
+            )
+    return {
+        "properties": properties,
+        "parent": parent,
+        "child_count": child_count,
+        "slots": slots,
+        "slot_nodes": slot_nodes,
+    }
+
+
+def reorder_generator_variant_slot_nodes(generator, parent_name, reference_index=0):
+    """Keep every multi-property child grouped by slot and schema order."""
+    state = generator_variant_parent_state(generator, parent_name)
+    if reference_index not in state["slot_nodes"]:
+        raise RuntimeError(
+            f"Generator '{generator.findtext('Name') or ''}' has no "
+            f"{parent_name}:{reference_index} reference slot."
+        )
+    properties = state["properties"]
+    all_children = list(properties)
+    related = [
+        item["node"]
+        for index in range(state["child_count"])
+        for item in state["slot_nodes"][index]
+    ]
+    insert_at = min(all_children.index(node) for node in related)
+    reference_suffixes = [
+        item["suffix"] for item in state["slot_nodes"][reference_index]
+    ]
+    reference_order = {
+        suffix: index for index, suffix in enumerate(reference_suffixes)
+    }
+    ordered = []
+    for slot_index in range(state["child_count"]):
+        current = state["slot_nodes"][slot_index]
+        original_order = {
+            item["suffix"]: index for index, item in enumerate(current)
+        }
+        ordered.extend(
+            item["node"]
+            for item in sorted(
+                current,
+                key=lambda item: (
+                    reference_order.get(
+                        item["suffix"], len(reference_order)
+                    ),
+                    original_order[item["suffix"]],
+                ),
+            )
+        )
+    changed = related != ordered or any(
+        all_children[insert_at + offset] is not node
+        for offset, node in enumerate(ordered)
+    )
+    if changed:
+        for node in related:
+            properties.remove(node)
+        for offset, node in enumerate(ordered):
+            properties.insert(insert_at + offset, node)
+    return changed
+
+
+def append_generator_variant_slots(
+    generator,
+    parent_name,
+    source_material_id,
+    ordinal_mesh_pairs,
+):
+    state = generator_variant_parent_state(generator, parent_name)
+    properties = state["properties"]
+    before_count = state["child_count"]
+    template_nodes = state["slot_nodes"][before_count - 1]
+    created = []
+    for offset, (ordinal, source_mesh_id) in enumerate(ordinal_mesh_pairs):
+        slot_index = before_count + offset
+        slot_prefix = f"{parent_name}:{slot_index}"
+        created_property_names = []
+        for template in template_nodes:
+            property_node = copy.deepcopy(template["node"])
+            property_name = f"{slot_prefix}:{template['suffix']}"
+            child_text(property_node, "Name", property_name)
+            if template["suffix"].lower() == "material":
+                child_text(property_node, "Value", source_material_id)
+            elif template["suffix"].lower() == "mesh":
+                child_text(property_node, "Value", source_mesh_id)
+            properties.append(property_node)
+            created_property_names.append(property_name)
+        created.append(
+            {
+                "created_slot": True,
+                "variant_parent_property": parent_name,
+                "variant_parent_children_before": before_count,
+                "variant_parent_children_after": (
+                    before_count + len(ordinal_mesh_pairs)
+                ),
+                "created_material_property": f"{slot_prefix}:Material",
+                "created_mesh_property": f"{slot_prefix}:Mesh",
+                "created_property_names": created_property_names,
+                "slot_prefix": slot_prefix,
+                "leaf_ordinal": int(ordinal),
+            }
+        )
+    child_text(
+        state["parent"],
+        "MultiPropertyChildren",
+        before_count + len(ordinal_mesh_pairs),
+    )
+    generator_variant_parent_state(generator, parent_name)
+    reorder_generator_variant_slot_nodes(
+        generator,
+        parent_name,
+        reference_index=before_count - 1,
+    )
+    return created
+
+
+def repair_created_generator_variant_slots(root, bindings):
+    """Repair old Atlas-created tail slots from their authored source schema."""
+    generators = list(root.iter("Generator"))
+    groups = {}
+    for binding in bindings or []:
+        if not isinstance(binding, dict) or not binding.get("created_slot"):
+            continue
+        generator_index = integer_value(binding.get("generator_index"))
+        parent_name = str(binding.get("variant_parent_property") or "")
+        before_count = integer_value(
+            binding.get("variant_parent_children_before")
+        )
+        after_count = integer_value(
+            binding.get("variant_parent_children_after")
+        )
+        slot_prefix = str(binding.get("slot_prefix") or "")
+        if (
+            generator_index is None
+            or not parent_name
+            or before_count is None
+            or before_count <= 0
+            or after_count is None
+            or after_count <= before_count
+            or not slot_prefix
+        ):
+            raise RuntimeError(
+                "Created Generator variant provenance is incomplete."
+            )
+        key = (generator_index, parent_name, before_count, after_count)
+        row = groups.setdefault(key, {})
+        if slot_prefix in row and row[slot_prefix] != binding:
+            raise RuntimeError(
+                "Created Generator variant provenance conflicts for one slot."
+            )
+        row[slot_prefix] = binding
+
+    repairs = []
+    for (
+        generator_index,
+        parent_name,
+        before_count,
+        after_count,
+    ), records_by_slot in sorted(groups.items()):
+        if generator_index < 0 or generator_index >= len(generators):
+            raise RuntimeError(
+                "Cannot repair created Generator variants: Generator disappeared."
+            )
+        generator = generators[generator_index]
+        state = generator_variant_parent_state(generator, parent_name)
+        if state["child_count"] != after_count:
+            raise RuntimeError(
+                f"Cannot repair created Generator variants on "
+                f"'{generator.findtext('Name') or ''}': {parent_name} has "
+                f"{state['child_count']} children, expected {after_count}."
+            )
+        expected_prefixes = {
+            f"{parent_name}:{index}"
+            for index in range(before_count, after_count)
+        }
+        if set(records_by_slot) != expected_prefixes:
+            raise RuntimeError(
+                "Cannot repair created Generator variants: recorded tail slots "
+                "are incomplete."
+            )
+        template_nodes = state["slot_nodes"][before_count - 1]
+        template_suffixes = [item["suffix"] for item in template_nodes]
+        properties = state["properties"]
+        added_names = []
+        for slot_index in range(before_count, after_count):
+            slot_prefix = f"{parent_name}:{slot_index}"
+            binding = records_by_slot[slot_prefix]
+            current_pair = (
+                positive_int(
+                    state["slots"][slot_index]["material"].findtext("Value")
+                ),
+                integer_value(
+                    state["slots"][slot_index]["mesh"].findtext("Value")
+                ),
+            )
+            recorded_target = (
+                positive_int(binding.get("target_material_id")),
+                positive_int(binding.get("target_mesh_id")),
+            )
+            if None in recorded_target or current_pair != recorded_target:
+                raise RuntimeError(
+                    f"Cannot repair Atlas-created Generator slot "
+                    f"'{slot_prefix}': current pair {current_pair} has drifted "
+                    f"from recorded target {recorded_target}."
+                )
+            existing = {
+                item["suffix"]: item
+                for item in state["slot_nodes"][slot_index]
+            }
+            unexpected = sorted(set(existing) - set(template_suffixes))
+            if unexpected:
+                raise RuntimeError(
+                    f"Cannot repair Atlas-created Generator slot "
+                    f"'{slot_prefix}': unexpected child properties "
+                    + ", ".join(unexpected)
+                    + "."
+                )
+            for template in template_nodes:
+                suffix = template["suffix"]
+                if suffix in existing:
+                    continue
+                property_node = copy.deepcopy(template["node"])
+                property_name = f"{slot_prefix}:{suffix}"
+                child_text(property_node, "Name", property_name)
+                properties.append(property_node)
+                added_names.append(property_name)
+
+        state = generator_variant_parent_state(generator, parent_name)
+        reordered = reorder_generator_variant_slot_nodes(
+            generator,
+            parent_name,
+            reference_index=before_count - 1,
+        )
+        for slot_index in range(before_count, after_count):
+            slot_prefix = f"{parent_name}:{slot_index}"
+            repairs.append(
+                {
+                    "generator_index": generator_index,
+                    "generator_name": str(generator.findtext("Name") or ""),
+                    "slot_prefix": slot_prefix,
+                    "created_property_names": [
+                        item["name"]
+                        for item in state["slot_nodes"][slot_index]
+                    ],
+                    "added_property_names": [
+                        name
+                        for name in added_names
+                        if name.startswith(f"{slot_prefix}:")
+                    ],
+                    "reordered": reordered,
+                }
+            )
+    return repairs
+
+
+def remove_created_generator_variant_slots(root, bindings):
+    """Remove only tail slots whose creation provenance is fully recorded."""
+    generators = list(root.iter("Generator"))
+    groups = {}
+    for binding in bindings or []:
+        if not isinstance(binding, dict) or not binding.get("created_slot"):
+            continue
+        generator_index = integer_value(binding.get("generator_index"))
+        parent_name = str(binding.get("variant_parent_property") or "")
+        before_count = integer_value(
+            binding.get("variant_parent_children_before")
+        )
+        after_count = integer_value(
+            binding.get("variant_parent_children_after")
+        )
+        material_property = str(binding.get("created_material_property") or "")
+        mesh_property = str(binding.get("created_mesh_property") or "")
+        if (
+            generator_index is None
+            or not parent_name
+            or before_count is None
+            or before_count <= 0
+            or after_count is None
+            or after_count <= before_count
+            or not material_property
+            or not mesh_property
+        ):
+            raise RuntimeError(
+                "Created Generator variant provenance is incomplete."
+            )
+        key = (generator_index, parent_name, before_count, after_count)
+        row = groups.setdefault(key, {})
+        slot_prefix = str(binding.get("slot_prefix") or "")
+        previous = row.get(slot_prefix)
+        record = {
+            "binding": binding,
+            "material_property": material_property,
+            "mesh_property": mesh_property,
+        }
+        if previous is not None and previous != record:
+            raise RuntimeError(
+                "Created Generator variant provenance conflicts for one slot."
+            )
+        row[slot_prefix] = record
+
+    removed = []
+    for (
+        generator_index,
+        parent_name,
+        before_count,
+        after_count,
+    ), records_by_slot in sorted(groups.items()):
+        if generator_index < 0 or generator_index >= len(generators):
+            raise RuntimeError(
+                "Cannot remove created Generator variants: Generator disappeared."
+            )
+        generator = generators[generator_index]
+        state = generator_variant_parent_state(generator, parent_name)
+        if state["child_count"] != after_count:
+            raise RuntimeError(
+                f"Cannot remove created Generator variants from "
+                f"'{generator.findtext('Name') or ''}': {parent_name} has "
+                f"{state['child_count']} children, expected {after_count}."
+            )
+        expected_prefixes = {
+            f"{parent_name}:{index}"
+            for index in range(before_count, after_count)
+        }
+        if set(records_by_slot) != expected_prefixes:
+            raise RuntimeError(
+                "Cannot remove created Generator variants: recorded tail slots "
+                "are incomplete."
+            )
+        properties = state["properties"]
+        nodes_by_name = {
+            str(prop.findtext("Name") or "").strip(): prop
+            for prop in list(properties)
+            if str(prop.findtext("Name") or "").strip()
+        }
+        for slot_prefix in sorted(
+            records_by_slot,
+            key=lambda value: int(value.rsplit(":", 1)[1]),
+        ):
+            record = records_by_slot[slot_prefix]
+            material_property = nodes_by_name.get(record["material_property"])
+            mesh_property = nodes_by_name.get(record["mesh_property"])
+            if material_property is None or mesh_property is None:
+                raise RuntimeError(
+                    f"Cannot remove created Generator slot '{slot_prefix}': "
+                    "recorded Property disappeared."
+                )
+            slot_index = int(slot_prefix.rsplit(":", 1)[1])
+            slot_property_nodes = [
+                item["node"] for item in state["slot_nodes"][slot_index]
+            ]
+            recorded_property_names = record["binding"].get(
+                "created_property_names"
+            )
+            if recorded_property_names:
+                current_property_names = {
+                    str(node.findtext("Name") or "").strip()
+                    for node in slot_property_nodes
+                }
+                if current_property_names != set(recorded_property_names):
+                    raise RuntimeError(
+                        f"Cannot remove created Generator slot '{slot_prefix}': "
+                        "its recorded child-property schema has drifted."
+                    )
+            for node in slot_property_nodes:
+                properties.remove(node)
+            binding = record["binding"]
+            removed.append(
+                {
+                    "generator_index": generator_index,
+                    "generator_name": str(generator.findtext("Name") or ""),
+                    "slot_prefix": slot_prefix,
+                    "material_id": positive_int(
+                        binding.get("source_material_id")
+                    ),
+                    "mesh_id": integer_value(binding.get("source_mesh_id")),
+                    "mode": "removed_created_variant_slot",
+                }
+            )
+        child_text(state["parent"], "MultiPropertyChildren", before_count)
+        generator_variant_parent_state(generator, parent_name)
+    return removed
+
+
 def spm_generator_property_pairs(root, allowed_types=None):
-    normalize_type = lambda value: re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
-    allowed = {normalize_type(value) for value in allowed_types} if allowed_types else None
+    allowed = {
+        normalized_generator_type(value) for value in allowed_types
+    } if allowed_types else None
     pairs = []
     for generator_index, generator in enumerate(root.iter("Generator")):
         generator_type = str(generator.attrib.get("Type") or generator.findtext("Type") or "").strip()
-        if allowed is not None and normalize_type(generator_type) not in allowed:
+        if allowed is not None and normalized_generator_type(generator_type) not in allowed:
             continue
         properties = generator.find("Properties")
         if properties is None:
             continue
         nodes_by_name = {}
-        for prop in properties.findall("Property"):
+        for prop in list(properties):
             name = str(prop.findtext("Name") or "").strip()
             if name:
                 nodes_by_name[name] = prop
@@ -625,7 +1248,12 @@ def spm_generator_referenced_material_ids(root):
     return material_ids
 
 
-def source_materials_by_name(assets, source_material_names, source_material_ids=None):
+def source_materials_by_name(
+    assets,
+    source_material_names,
+    source_material_ids=None,
+    source_mesh_ids_by_name=None,
+):
     names = []
     for value in source_material_names or []:
         name = str(value or "").strip()
@@ -662,6 +1290,14 @@ def source_materials_by_name(assets, source_material_names, source_material_ids=
                 f"Source material '{name}' ID is {material_id}, expected {requested_ids.get(name)}."
             )
         mesh_ids = spm_material_mesh_ids(material)
+        if source_mesh_ids_by_name and name in source_mesh_ids_by_name:
+            mesh_ids = [
+                positive_int(value) for value in source_mesh_ids_by_name[name]
+            ]
+            if any(value is None for value in mesh_ids):
+                raise RuntimeError(
+                    f"Source material '{name}' adoption contains an invalid mesh ID."
+                )
         if not mesh_ids:
             raise RuntimeError(f"Source material '{name}' has no cutout mesh IDs.")
         records[material_id] = {"name": name, "material": material, "mesh_ids": mesh_ids}
@@ -695,12 +1331,14 @@ def atlas_output_bindings(assets, material_groups):
                     f"Generated atlas mesh ID {mesh_id} is not owned by material '{material_name}'."
                 )
             source_object = str(item.get("source_object") or "")
+            ordinal = positive_int(item.get("source_ordinal"))
             match = re.search(r"(?:^|[^a-z0-9])leaf[_ -]?(\d+)", source_object, re.IGNORECASE)
-            if not match:
+            if ordinal is None and match:
+                ordinal = int(match.group(1))
+            if ordinal is None:
                 raise RuntimeError(
-                    f"Exported mesh '{item.get('name') or source_object}' has no leaf_NN source ordinal."
+                    f"Exported mesh '{item.get('name') or source_object}' has no explicit source ordinal or leaf_NN fallback."
                 )
-            ordinal = int(match.group(1))
             binding = {
                 "leaf_ordinal": ordinal,
                 "target_material_id": material_id,
@@ -721,13 +1359,23 @@ def connect_atlas_generators_in_spm(
     source_material_names,
     material_groups,
     source_material_ids=None,
+    previous_bindings=None,
+    source_mesh_ids_by_name=None,
+    generator_variant_policy=None,
 ):
     """Connect source Leaf Mesh/Frond slots to generated atlas assets.
 
     The source material's CutoutMeshID/SupplementalCutoutMeshIDs order is the
     stable leaf ordinal. Exported Blender source objects named leaf_NN select
-    the generated material/mesh pair for that ordinal.
+    the generated material/mesh pair for that ordinal. The opt-in
+    ``ensure_all_material_cutouts`` policy creates only missing tail slots on
+    one existing supported multi-property parent. Coverage is evaluated across
+    all matching Generators so authored duplicate slots and their weights stay
+    intact.
     """
+    variant_policy = normalize_generator_variant_policy(
+        generator_variant_policy
+    )
     spm_path = Path(spm_path)
     if not spm_path.exists():
         raise RuntimeError(f"Target SPM does not exist: {spm_path}")
@@ -739,12 +1387,142 @@ def connect_atlas_generators_in_spm(
         assets,
         source_material_names,
         source_material_ids,
+        source_mesh_ids_by_name,
     )
     output_bindings = atlas_output_bindings(assets, material_groups)
     generated_pair_to_binding = {
         (item["target_material_id"], item["target_mesh_id"]): item
         for item in output_bindings.values()
     }
+    previous_by_slot = {
+        (integer_value(item.get("generator_index")), item.get("slot_prefix")): item
+        for item in previous_bindings or []
+        if isinstance(item, dict)
+    }
+    variant_schema_repairs = []
+    repair_by_slot = {}
+    if (
+        variant_policy
+        == GENERATOR_VARIANT_POLICY_ENSURE_ALL_MATERIAL_CUTOUTS
+    ):
+        variant_schema_repairs = repair_created_generator_variant_slots(
+            root,
+            previous_bindings,
+        )
+        repair_by_slot = {
+            (item["generator_index"], item["slot_prefix"]): item
+            for item in variant_schema_repairs
+        }
+
+    created_by_slot = {}
+    if (
+        variant_policy
+        == GENERATOR_VARIANT_POLICY_ENSURE_ALL_MATERIAL_CUTOUTS
+    ):
+        if len(source_records) != 1:
+            raise RuntimeError(
+                "Generator variant coverage requires exactly one source "
+                "material per target request."
+            )
+        source_material_id, source = next(iter(source_records.items()))
+        expected_ordinals = set(range(1, len(source["mesh_ids"]) + 1))
+        missing_outputs = sorted(expected_ordinals - set(output_bindings))
+        if missing_outputs:
+            raise RuntimeError(
+                "Generator variant coverage cannot map source cutout ordinal(s) "
+                + ", ".join(str(value) for value in missing_outputs)
+                + " because no generated atlas output exists."
+            )
+
+        generator_groups = {}
+        covered_ordinals = set()
+        for pair in spm_generator_property_pairs(
+            root, {"Leaf Mesh", "Frond"}
+        ):
+            descriptor = generator_variant_slot_descriptor(pair)
+            if descriptor is None:
+                continue
+            parent_name, _slot_index = descriptor
+            material_id = positive_int(
+                pair["material_property"].findtext("Value")
+            )
+            mesh_property = pair.get("mesh_property")
+            mesh_id = (
+                integer_value(mesh_property.findtext("Value"))
+                if mesh_property is not None
+                else None
+            )
+            ordinal = None
+            target = generated_pair_to_binding.get((material_id, mesh_id))
+            if target is not None:
+                ordinal = target["leaf_ordinal"]
+            elif material_id == source_material_id:
+                if mesh_property is None:
+                    raise RuntimeError(
+                        f"Generator '{pair['generator_name']}' slot "
+                        f"'{pair['slot_prefix']}' has Material but no Mesh property."
+                    )
+                if mesh_id == -10:
+                    ordinal = 1
+                elif mesh_id in source["mesh_ids"]:
+                    ordinal = source["mesh_ids"].index(mesh_id) + 1
+                else:
+                    raise RuntimeError(
+                        f"Generator '{pair['generator_name']}' mesh ID {mesh_id} "
+                        f"is not in source material '{source['name']}' cutout "
+                        f"mesh list {source['mesh_ids']}."
+                    )
+            if ordinal not in expected_ordinals:
+                continue
+            key = (pair["generator_index"], parent_name)
+            group = generator_groups.setdefault(
+                key,
+                {
+                    "generator": pair["generator"],
+                    "generator_index": pair["generator_index"],
+                    "parent_name": parent_name,
+                    "ordinals": [],
+                },
+            )
+            group["ordinals"].append(ordinal)
+            covered_ordinals.add(ordinal)
+
+        missing_ordinals = sorted(expected_ordinals - covered_ordinals)
+        if missing_ordinals:
+            if not generator_groups:
+                raise RuntimeError(
+                    "Generator variant coverage found no supported Frond or "
+                    "Leaf Mesh multi-property parent referencing the source "
+                    "material or generated atlas."
+                )
+            candidates = []
+            for group in generator_groups.values():
+                state = generator_variant_parent_state(
+                    group["generator"], group["parent_name"]
+                )
+                group["child_count"] = state["child_count"]
+                candidates.append(group)
+            host = sorted(
+                candidates,
+                key=lambda item: (
+                    0 if 1 in item["ordinals"] else 1,
+                    -len(item["ordinals"]),
+                    item["generator_index"],
+                ),
+            )[0]
+            created = append_generator_variant_slots(
+                host["generator"],
+                host["parent_name"],
+                source_material_id,
+                [
+                    (ordinal, source["mesh_ids"][ordinal - 1])
+                    for ordinal in missing_ordinals
+                ],
+            )
+            for item in created:
+                created_by_slot[
+                    (host["generator_index"], item["slot_prefix"])
+                ] = item
 
     staged = []
     already = []
@@ -753,6 +1531,10 @@ def connect_atlas_generators_in_spm(
         mesh_property = pair["mesh_property"]
         material_id = positive_int(material_property.findtext("Value"))
         mesh_id = integer_value(mesh_property.findtext("Value")) if mesh_property is not None else None
+        target = generated_pair_to_binding.get((material_id, mesh_id))
+        if target is not None:
+            already.append((pair, target))
+            continue
         if material_id in source_records:
             if mesh_property is None:
                 raise RuntimeError(
@@ -781,50 +1563,98 @@ def connect_atlas_generators_in_spm(
                 )
             staged.append((pair, source, mesh_id, target, sentinel_policy))
             continue
-        target = generated_pair_to_binding.get((material_id, mesh_id))
-        if target is not None:
-            already.append((pair, target))
 
     if not staged and not already:
         raise RuntimeError(
             "No Leaf Mesh/Frond Generator slot references the requested source materials or this generated atlas."
         )
 
+    provenance_fields = (
+        "created_slot",
+        "variant_parent_property",
+        "variant_parent_children_before",
+        "variant_parent_children_after",
+        "created_material_property",
+        "created_mesh_property",
+        "created_property_names",
+    )
     bindings = []
     for pair, source, source_mesh_id, target, sentinel_policy in staged:
         child_text(pair["material_property"], "Value", target["target_material_id"])
         child_text(pair["mesh_property"], "Value", target["target_mesh_id"])
-        bindings.append(
-            {
-                "state": "changed",
-                "generator_index": pair["generator_index"],
-                "generator_name": pair["generator_name"],
-                "generator_type": pair["generator_type"],
-                "slot_prefix": pair["slot_prefix"],
-                "source_material_id": positive_int(source["material"].attrib.get("ID")),
-                "source_material_name": source["name"],
-                "source_mesh_id": source_mesh_id,
-                "sentinel_policy": sentinel_policy,
-                **target,
-            }
+        binding = {
+            "state": "changed",
+            "generator_index": pair["generator_index"],
+            "generator_name": pair["generator_name"],
+            "generator_type": pair["generator_type"],
+            "slot_prefix": pair["slot_prefix"],
+            "source_material_id": positive_int(
+                source["material"].attrib.get("ID")
+            ),
+            "source_material_name": source["name"],
+            "source_mesh_id": source_mesh_id,
+            "sentinel_policy": sentinel_policy,
+            "created_slot": False,
+            **target,
+        }
+        created = created_by_slot.get(
+            (pair["generator_index"], pair["slot_prefix"])
         )
+        if created is not None:
+            binding.update(created)
+        bindings.append(binding)
     for pair, target in already:
-        bindings.append(
-            {
-                "state": "already_connected",
-                "generator_index": pair["generator_index"],
-                "generator_name": pair["generator_name"],
-                "generator_type": pair["generator_type"],
-                "slot_prefix": pair["slot_prefix"],
-                "source_material_id": None,
-                "source_material_name": None,
-                "source_mesh_id": None,
-                "sentinel_policy": None,
-                **target,
-            }
+        previous = previous_by_slot.get(
+            (pair["generator_index"], pair["slot_prefix"]), {}
         )
+        previous_matches_target = (
+            positive_int(previous.get("target_material_id"))
+            == target["target_material_id"]
+            and positive_int(previous.get("target_mesh_id"))
+            == target["target_mesh_id"]
+        )
+        binding = {
+            "state": "already_connected",
+            "generator_index": pair["generator_index"],
+            "generator_name": pair["generator_name"],
+            "generator_type": pair["generator_type"],
+            "slot_prefix": pair["slot_prefix"],
+            "source_material_id": (
+                previous.get("source_material_id")
+                if previous_matches_target else None
+            ),
+            "source_material_name": (
+                previous.get("source_material_name")
+                if previous_matches_target else None
+            ),
+            "source_mesh_id": (
+                previous.get("source_mesh_id")
+                if previous_matches_target else None
+            ),
+            "sentinel_policy": (
+                previous.get("sentinel_policy")
+                if previous_matches_target else None
+            ),
+            "created_slot": False,
+            **target,
+        }
+        if previous_matches_target:
+            for field in provenance_fields:
+                if field in previous:
+                    binding[field] = previous[field]
+            repair = repair_by_slot.get(
+                (pair["generator_index"], pair["slot_prefix"])
+            )
+            if repair is not None:
+                binding["created_property_names"] = repair[
+                    "created_property_names"
+                ]
+        bindings.append(binding)
 
-    if staged:
+    if staged or any(
+        item["added_property_names"] or item["reordered"]
+        for item in variant_schema_repairs
+    ):
         write_spm_xml(spm_path, root)
     validated_root = read_spm_xml(spm_path)
     validated_pairs = {
@@ -842,15 +1672,1106 @@ def connect_atlas_generators_in_spm(
                 f"Generator connection validation failed for '{binding['generator_name']}' "
                 f"slot '{binding['slot_prefix']}'."
             )
+    if (
+        variant_policy
+        == GENERATOR_VARIANT_POLICY_ENSURE_ALL_MATERIAL_CUTOUTS
+    ):
+        source = next(iter(source_records.values()))
+        expected_ordinals = set(range(1, len(source["mesh_ids"]) + 1))
+        connected_ordinals = {
+            positive_int(binding.get("leaf_ordinal"))
+            for binding in bindings
+        }
+        missing_ordinals = sorted(expected_ordinals - connected_ordinals)
+        if missing_ordinals:
+            raise RuntimeError(
+                "Generator variant coverage validation failed for source "
+                "cutout ordinal(s): "
+                + ", ".join(str(value) for value in missing_ordinals)
+            )
+        generators = list(validated_root.iter("Generator"))
+        for binding in bindings:
+            if not binding.get("created_slot"):
+                continue
+            generator_index = integer_value(binding.get("generator_index"))
+            if (
+                generator_index is None
+                or generator_index < 0
+                or generator_index >= len(generators)
+            ):
+                raise RuntimeError(
+                    "Generator variant coverage validation lost a created Generator."
+                )
+            state = generator_variant_parent_state(
+                generators[generator_index],
+                binding["variant_parent_property"],
+            )
+            if (
+                state["child_count"]
+                != integer_value(
+                    binding.get("variant_parent_children_after")
+                )
+            ):
+                raise RuntimeError(
+                    "Generator variant coverage validation found an unexpected "
+                    "multi-property child count."
+                )
+            recorded_property_names = binding.get("created_property_names")
+            if recorded_property_names:
+                descriptor = generator_variant_slot_descriptor(binding)
+                if descriptor is None:
+                    raise RuntimeError(
+                        "Generator variant coverage validation lost the "
+                        "created slot descriptor."
+                    )
+                _parent_name, slot_index = descriptor
+                current_property_names = {
+                    item["name"]
+                    for item in state["slot_nodes"][slot_index]
+                }
+                if current_property_names != set(recorded_property_names):
+                    raise RuntimeError(
+                        "Generator variant coverage validation found an "
+                        "unexpected created slot child-property schema."
+                    )
 
     return {
         "requested": True,
         "complete": True,
+        "generator_variant_policy": variant_policy,
         "source_material_names": names,
         "matched_generators": len({item["generator_index"] for item in bindings}),
         "changed_slot_pairs": len(staged),
         "already_connected_slot_pairs": len(already),
+        "created_slot_pairs": len(created_by_slot),
+        "repaired_variant_slot_schemas": variant_schema_repairs,
         "bindings": bindings,
+    }
+
+
+def _generator_property_node(generator, property_name):
+    matches = [
+        node
+        for node in generator.findall("./Properties/*")
+        if str(node.findtext("Name") or "").strip() == property_name
+    ]
+    if len(matches) != 1:
+        raise RuntimeError(
+            f"Generator '{generator.findtext('Name') or '?'}' must contain exactly "
+            f"one '{property_name}' property; found {len(matches)}."
+        )
+    value = matches[0].find("Value")
+    if value is None:
+        raise RuntimeError(
+            f"Generator '{generator.findtext('Name') or '?'}' property "
+            f"'{property_name}' has no Value."
+        )
+    return matches[0], value
+
+
+def _same_float(first, second, tolerance=1.0e-9):
+    first = float(first)
+    second = float(second)
+    # Blender FloatProperty values use float32 precision.  For example, 0.1
+    # round-trips through RNA as 0.10000000149, which is not contract drift.
+    return abs(first - second) <= max(
+        tolerance,
+        max(abs(first), abs(second)) * 1.0e-7,
+    )
+
+
+def normalize_connected_frond_generator_geometry_scale(
+    spm_path,
+    generator_connection,
+    previous_manifest,
+    mesh_geometry_scale,
+):
+    """Bake the external-FBX geometry scale into connected Frond generators.
+
+    SpeedTree applies external mesh geometry scaling consistently to Leaf Mesh
+    generators, but Frond output normalizes the source mesh and ignores that
+    scale during FBX export. Scaling the Frond Shape width/height by the same
+    factor preserves the authored effective size and makes CLI FBX output
+    deterministic across both generator types.
+    """
+    factor = float(mesh_geometry_scale)
+    if factor <= 0.0:
+        raise RuntimeError("Frond generator geometry scale must be greater than zero.")
+    bindings = [
+        binding
+        for binding in (generator_connection or {}).get("bindings") or []
+        if str(binding.get("generator_type") or "").casefold() == "frond"
+    ]
+    if not bindings:
+        return {
+            "mode": "bake_external_geometry_scale_into_frond_shape",
+            "geometry_scale": factor,
+            "changed": False,
+            "generators": [],
+        }
+
+    root = read_spm_xml(spm_path)
+    generators = list(root.iter("Generator"))
+    previous_rows = {
+        str(row.get("generator_guid") or ""): row
+        for row in (
+            (previous_manifest or {}).get("generator_scale_normalization") or {}
+        ).get("generators") or []
+        if str(row.get("generator_guid") or "")
+    }
+    seen = set()
+    rows = []
+    changed = False
+    for binding in sorted(
+        bindings,
+        key=lambda item: (
+            integer_value(item.get("generator_index")) or -1,
+            str(item.get("generator_name") or ""),
+        ),
+    ):
+        generator_index = integer_value(binding.get("generator_index"))
+        if (
+            generator_index is None
+            or generator_index < 0
+            or generator_index >= len(generators)
+        ):
+            raise RuntimeError("Connected Frond generator index is invalid.")
+        if generator_index in seen:
+            continue
+        seen.add(generator_index)
+        generator = generators[generator_index]
+        generator_type = str(generator.attrib.get("Type") or "")
+        if generator_type.casefold() != "frond":
+            raise RuntimeError(
+                f"Recorded Frond binding points to generator type '{generator_type}'."
+            )
+        generator_name = str(generator.findtext("Name") or "")
+        generator_guid = str(generator.findtext("GUID") or "")
+        if not generator_guid:
+            raise RuntimeError(
+                f"Connected Frond generator '{generator_name}' has no GUID."
+            )
+        previous = previous_rows.get(generator_guid) or {}
+        previous_properties = {
+            str(item.get("name") or ""): item
+            for item in previous.get("properties") or []
+        }
+        property_rows = []
+        for property_name in FROND_BAKED_GEOMETRY_SCALE_PROPERTIES:
+            _node, value = _generator_property_node(generator, property_name)
+            try:
+                current = float(value.text)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"Frond generator '{generator_name}' property "
+                    f"'{property_name}' is not numeric."
+                ) from exc
+            previous_property = previous_properties.get(property_name)
+            if previous_property:
+                baseline = float(previous_property["baseline"])
+                previous_after = float(previous_property["after"])
+                if not (
+                    _same_float(current, previous_after)
+                    or _same_float(current, baseline)
+                ):
+                    raise RuntimeError(
+                        f"Frond generator '{generator_name}' property "
+                        f"'{property_name}' drifted from its recorded normalized "
+                        "or baseline value."
+                    )
+            else:
+                baseline = current
+            desired = baseline * factor
+            if not _same_float(current, desired):
+                value.text = format(desired, ".17g")
+                changed = True
+            property_rows.append(
+                {
+                    "name": property_name,
+                    "baseline": baseline,
+                    "before": current,
+                    "after": desired,
+                }
+            )
+        rows.append(
+            {
+                "generator_index": generator_index,
+                "generator_name": generator_name,
+                "generator_guid": generator_guid,
+                "generator_type": generator_type,
+                "properties": property_rows,
+            }
+        )
+    if changed:
+        write_spm_xml(spm_path, root)
+    return {
+        "mode": "bake_external_geometry_scale_into_frond_shape",
+        "geometry_scale": factor,
+        "changed": changed,
+        "generators": rows,
+    }
+
+
+def restore_frond_generator_geometry_scale(root, manifests):
+    recorded = {}
+    for manifest in manifests:
+        normalization = manifest.get("generator_scale_normalization") or {}
+        for row in normalization.get("generators") or []:
+            guid = str(row.get("generator_guid") or "")
+            if not guid:
+                continue
+            for item in row.get("properties") or []:
+                key = (guid, str(item.get("name") or ""))
+                baseline = float(item["baseline"])
+                after = float(item["after"])
+                previous = recorded.get(key)
+                if previous and not (
+                    _same_float(previous["baseline"], baseline)
+                    and _same_float(previous["after"], after)
+                ):
+                    raise RuntimeError(
+                        "Cannot restore Frond generator scale: scope manifests disagree."
+                    )
+                recorded[key] = {
+                    "generator_name": str(row.get("generator_name") or ""),
+                    "baseline": baseline,
+                    "after": after,
+                }
+    if not recorded:
+        return []
+    generators = {
+        str(generator.findtext("GUID") or ""): generator
+        for generator in root.iter("Generator")
+    }
+    restored = []
+    for (guid, property_name), item in sorted(recorded.items()):
+        generator = generators.get(guid)
+        if generator is None:
+            raise RuntimeError(
+                f"Cannot restore Frond generator scale: generator {guid} is missing."
+            )
+        _node, value = _generator_property_node(generator, property_name)
+        current = float(value.text)
+        if not (
+            _same_float(current, item["after"])
+            or _same_float(current, item["baseline"])
+        ):
+            raise RuntimeError(
+                f"Cannot restore Frond generator '{item['generator_name']}' "
+                f"property '{property_name}': current value drifted."
+            )
+        if not _same_float(current, item["baseline"]):
+            value.text = format(item["baseline"], ".17g")
+            restored.append(
+                {
+                    "generator_guid": guid,
+                    "generator_name": item["generator_name"],
+                    "property": property_name,
+                    "before": current,
+                    "after": item["baseline"],
+                }
+            )
+    return restored
+
+
+SOURCE_MATERIAL_ADOPTION_VERSION = 1
+
+
+def encode_spm_node_snapshot(node):
+    raw = ET.tostring(node, encoding="utf-8")
+    return base64.b64encode(gzip.compress(raw, mtime=0)).decode("ascii")
+
+
+def decode_spm_node_snapshot(payload):
+    try:
+        raw = gzip.decompress(base64.b64decode(str(payload).encode("ascii")))
+        return ET.fromstring(raw)
+    except Exception as exc:
+        raise RuntimeError("Atlas source-material adoption snapshot is invalid.") from exc
+
+
+def adoption_original_mesh_ids(adoption):
+    return [
+        positive_int(value)
+        for value in adoption.get("original_mesh_ids") or []
+        if positive_int(value) is not None
+    ]
+
+
+def prepare_source_material_adoption(
+    spm_path,
+    manifest,
+    material_name,
+    material_id=None,
+    previous_manifest=None,
+):
+    """Capture or reuse the unmanaged source Material/Mesh payload for rollback."""
+    previous = (previous_manifest or {}).get("source_material_adoption") or {}
+    requested_id = positive_int(material_id)
+    if previous:
+        previous_id = positive_int(previous.get("material_id"))
+        if (
+            previous.get("version") != SOURCE_MATERIAL_ADOPTION_VERSION
+            or previous.get("material_name") != material_name
+            or (requested_id is not None and previous_id != requested_id)
+            or not previous.get("original_material_snapshot")
+            or not previous.get("original_mesh_snapshots")
+        ):
+            raise RuntimeError("Previous source-material adoption manifest is incomplete or mismatched.")
+        record = copy.deepcopy(previous)
+        record["reused_original_snapshot"] = True
+        return record
+
+    root = read_spm_xml(spm_path)
+    assets = root.find("Assets")
+    if assets is None:
+        raise RuntimeError("Target SPM has no Assets node for source-material adoption.")
+    matches = [
+        node
+        for node in assets.findall("Material_v8")
+        if node.attrib.get("Name") == material_name
+    ]
+    if len(matches) != 1:
+        raise RuntimeError(
+            f"Source material adoption requires exactly one Material_v8 named '{material_name}'; "
+            f"found {len(matches)}."
+        )
+    material = matches[0]
+    existing_id = positive_int(material.attrib.get("ID"))
+    if existing_id is None or (requested_id is not None and existing_id != requested_id):
+        raise RuntimeError(
+            f"Source material '{material_name}' ID is {existing_id}, expected {requested_id}."
+        )
+    marker = parse_atlas_leaf_spm_user_data(material.findtext("UserData"))
+    if marker:
+        raise RuntimeError(
+            f"Cannot newly adopt '{material_name}': it is already managed by Atlas scope "
+            f"{marker.get('scope')!r} and no matching original snapshot was found."
+        )
+
+    original_mesh_ids = spm_material_mesh_ids(material)
+    if not original_mesh_ids:
+        raise RuntimeError(f"Source material '{material_name}' has no cutout meshes to adopt.")
+    mesh_nodes_by_id = {
+        positive_int(node.attrib.get("ID")): node
+        for node in assets.findall("Mesh")
+        if positive_int(node.attrib.get("ID")) is not None
+    }
+    missing = [mesh_id for mesh_id in original_mesh_ids if mesh_id not in mesh_nodes_by_id]
+    if missing:
+        raise RuntimeError(f"Source material adoption is missing Mesh assets {missing}.")
+
+    return {
+        "version": SOURCE_MATERIAL_ADOPTION_VERSION,
+        "scope": spm_export_scope(manifest),
+        "material_name": material_name,
+        "material_id": existing_id,
+        "original_mesh_ids": original_mesh_ids,
+        "original_material_snapshot": encode_spm_node_snapshot(material),
+        "original_mesh_snapshots": [
+            {
+                "mesh_id": mesh_id,
+                "snapshot": encode_spm_node_snapshot(mesh_nodes_by_id[mesh_id]),
+            }
+            for mesh_id in original_mesh_ids
+        ],
+        "generated_mesh_ids": [],
+        "removed_original_mesh_ids": [],
+        "reused_original_snapshot": False,
+    }
+
+
+def finalize_source_material_adoption(spm_path, adoption, generated_mesh_ids):
+    """Remove replaced source Mesh assets only after every Generator has moved."""
+    generated_mesh_ids = [positive_int(value) for value in generated_mesh_ids]
+    if not generated_mesh_ids or any(value is None for value in generated_mesh_ids):
+        raise RuntimeError("Source-material adoption has invalid generated mesh IDs.")
+    original_mesh_ids = adoption_original_mesh_ids(adoption)
+    if set(original_mesh_ids).intersection(generated_mesh_ids):
+        raise RuntimeError("Adopted plans must use fresh Mesh IDs; source IDs cannot be reused.")
+
+    root = read_spm_xml(spm_path)
+    assets = root.find("Assets")
+    material = next(
+        (
+            node
+            for node in assets.findall("Material_v8")
+            if positive_int(node.attrib.get("ID")) == positive_int(adoption.get("material_id"))
+            and node.attrib.get("Name") == adoption.get("material_name")
+        ),
+        None,
+    )
+    if material is None or spm_material_mesh_ids(material) != generated_mesh_ids:
+        raise RuntimeError("Adopted source material does not own the expected generated plan meshes.")
+
+    material_references = set()
+    for node in assets.findall("Material_v8"):
+        material_references.update(spm_material_mesh_ids(node))
+    generator_references = spm_generator_referenced_mesh_ids(root)
+    blocked = sorted(
+        mesh_id
+        for mesh_id in original_mesh_ids
+        if mesh_id in material_references or mesh_id in generator_references
+    )
+    if blocked:
+        raise RuntimeError(
+            "Cannot delete adopted source Mesh assets that remain referenced: "
+            + ", ".join(str(value) for value in blocked)
+        )
+
+    removed = []
+    for node in list(assets.findall("Mesh")):
+        mesh_id = positive_int(node.attrib.get("ID"))
+        if mesh_id in original_mesh_ids:
+            assets.remove(node)
+            removed.append(mesh_id)
+    if removed:
+        write_spm_xml(spm_path, root)
+
+    validated_assets = read_spm_xml(spm_path).find("Assets")
+    remaining = {
+        positive_int(node.attrib.get("ID")) for node in validated_assets.findall("Mesh")
+    }
+    stale = sorted(set(original_mesh_ids).intersection(remaining))
+    if stale:
+        raise RuntimeError(f"Adopted source Mesh assets remain after deletion: {stale}")
+
+    record = copy.deepcopy(adoption)
+    record["generated_mesh_ids"] = generated_mesh_ids
+    record["removed_original_mesh_ids"] = original_mesh_ids
+    return record
+
+
+def migrate_previous_scope_material_for_adoption(
+    spm_path,
+    previous_manifest,
+    source_material_name,
+    source_material_id,
+):
+    """Detach one older separate generated material before adopting its source."""
+    if not previous_manifest or previous_manifest.get("source_material_adoption"):
+        return None
+    groups = [
+        group
+        for group in previous_manifest.get("speedtree_material_groups") or []
+        if isinstance(group, dict)
+    ]
+    if len(groups) != 1:
+        return None
+    legacy = groups[0]
+    legacy_name = str(legacy.get("material") or "")
+    legacy_id = positive_int(legacy.get("material_id"))
+    if not legacy_name or legacy_name == source_material_name or legacy_id is None:
+        return None
+
+    root = read_spm_xml(spm_path)
+    assets = root.find("Assets")
+    source_material = next(
+        (
+            node
+            for node in assets.findall("Material_v8")
+            if node.attrib.get("Name") == source_material_name
+            and positive_int(node.attrib.get("ID")) == positive_int(source_material_id)
+        ),
+        None,
+    )
+    legacy_material = next(
+        (
+            node
+            for node in assets.findall("Material_v8")
+            if node.attrib.get("Name") == legacy_name
+            and positive_int(node.attrib.get("ID")) == legacy_id
+        ),
+        None,
+    )
+    if source_material is None or legacy_material is None:
+        raise RuntimeError(
+            "Cannot migrate the previous Atlas material: source or managed material is missing."
+        )
+    marker = parse_atlas_leaf_spm_user_data(legacy_material.findtext("UserData"))
+    if not marker or marker.get("scope") != spm_export_scope(previous_manifest):
+        raise RuntimeError(
+            f"Cannot migrate '{legacy_name}': its Atlas ownership scope does not match the manifest."
+        )
+
+    pairs = {
+        (pair["generator_index"], pair["slot_prefix"]): pair
+        for pair in spm_generator_property_pairs(root, {"Leaf Mesh", "Frond"})
+    }
+    restored = []
+    created_bindings = []
+    for binding in (previous_manifest.get("generator_connection") or {}).get("bindings") or []:
+        if positive_int(binding.get("target_material_id")) != legacy_id:
+            continue
+        key = (binding.get("generator_index"), binding.get("slot_prefix"))
+        pair = pairs.get(key)
+        if pair is None or pair.get("mesh_property") is None:
+            raise RuntimeError("Cannot migrate previous Atlas Generator binding: slot disappeared.")
+        current = (
+            positive_int(pair["material_property"].findtext("Value")),
+            integer_value(pair["mesh_property"].findtext("Value")),
+        )
+        target = (
+            positive_int(binding.get("target_material_id")),
+            positive_int(binding.get("target_mesh_id")),
+        )
+        source = (
+            positive_int(binding.get("source_material_id")),
+            integer_value(binding.get("source_mesh_id")),
+        )
+        if source[0] != positive_int(source_material_id):
+            raise RuntimeError("Previous Atlas binding does not restore the requested source material.")
+        if source[1] != -10 and source[1] not in spm_material_mesh_ids(source_material):
+            raise RuntimeError("Previous Atlas binding references a source mesh outside the source material.")
+        if binding.get("created_slot"):
+            if current != target:
+                raise RuntimeError(
+                    f"Cannot migrate created Atlas variant slot for "
+                    f"'{pair['generator_name']}': current pair {current} has "
+                    f"drifted from target {target}."
+                )
+            created_bindings.append(binding)
+            continue
+        if current == target:
+            child_text(pair["material_property"], "Value", source[0])
+            child_text(pair["mesh_property"], "Value", source[1])
+            restored.append(
+                {
+                    "generator_index": pair["generator_index"],
+                    "generator_name": pair["generator_name"],
+                    "slot_prefix": pair["slot_prefix"],
+                    "material_id": source[0],
+                    "mesh_id": source[1],
+                }
+            )
+        elif current != source:
+            raise RuntimeError(
+                f"Cannot migrate previous Atlas binding for '{pair['generator_name']}': "
+                f"current pair {current} has drifted from target {target}."
+            )
+
+    restored.extend(
+        remove_created_generator_variant_slots(root, created_bindings)
+    )
+    remaining_legacy_refs = [
+        pair
+        for pair in spm_generator_property_pairs(root, {"Leaf Mesh", "Frond"})
+        if positive_int(pair["material_property"].findtext("Value")) == legacy_id
+    ]
+    if remaining_legacy_refs:
+        raise RuntimeError(
+            f"Cannot migrate '{legacy_name}': Generator references remain without rollback bindings."
+        )
+
+    reusable_mesh_ids = spm_material_mesh_ids(legacy_material)
+    assets.remove(legacy_material)
+    write_spm_xml(spm_path, root)
+    return {
+        "legacy_material_name": legacy_name,
+        "legacy_material_id": legacy_id,
+        "reusable_mesh_ids": reusable_mesh_ids,
+        "restored_generator_slots": restored,
+    }
+
+
+def target_scope_manifests_for_blend(spm_path, blend_path):
+    """Find exact per-scope manifests owned by one blend and target SPM."""
+    spm_path = Path(spm_path).expanduser().absolute()
+    blend_path = Path(blend_path).expanduser().absolute()
+    scope_dir = spm_path.parent / ".atlas_leaf_speedtree_scopes"
+    if not scope_dir.is_dir():
+        return []
+    manifests = []
+    for path in sorted(scope_dir.glob(f"*__{target_manifest_key(spm_path)}.json")):
+        payload = read_json_file(path, {})
+        if not isinstance(payload, dict):
+            continue
+        if not payload.get("blend_file") or not blend_paths_equal(
+            payload["blend_file"], blend_path
+        ):
+            continue
+        if payload.get("spm") and not blend_paths_equal(payload["spm"], spm_path):
+            continue
+        payload = dict(payload)
+        payload["_scope_manifest_path"] = str(path)
+        manifests.append(payload)
+    return manifests
+
+
+def manifest_mesh_ids(manifest):
+    ids = set()
+    for value in manifest.get("mesh_ids") or []:
+        mesh_id = positive_int(value)
+        if mesh_id is not None:
+            ids.add(mesh_id)
+    for group in manifest.get("speedtree_material_groups") or []:
+        if not isinstance(group, dict):
+            continue
+        for value in group.get("mesh_ids") or []:
+            mesh_id = positive_int(value)
+            if mesh_id is not None:
+                ids.add(mesh_id)
+    return ids
+
+
+def source_material_adoptions_from_manifests(manifests):
+    records = {}
+    for manifest in manifests:
+        adoption = manifest.get("source_material_adoption") or {}
+        if not adoption:
+            continue
+        material_id = positive_int(adoption.get("material_id"))
+        if (
+            adoption.get("version") != SOURCE_MATERIAL_ADOPTION_VERSION
+            or material_id is None
+            or not adoption.get("original_material_snapshot")
+            or not adoption.get("original_mesh_snapshots")
+        ):
+            raise RuntimeError("Cannot remove Atlas scope: adoption snapshot is incomplete.")
+        existing = records.get(material_id)
+        if existing is not None and (
+            existing.get("original_material_snapshot")
+            != adoption.get("original_material_snapshot")
+        ):
+            raise RuntimeError(
+                f"Cannot remove Atlas scope: conflicting adoption snapshots for Material {material_id}."
+            )
+        records[material_id] = adoption
+    return records
+
+
+def restore_adopted_source_nodes(assets, adoptions):
+    restored = []
+    for material_id, adoption in adoptions.items():
+        current = next(
+            (
+                node
+                for node in assets.findall("Material_v8")
+                if positive_int(node.attrib.get("ID")) == material_id
+            ),
+            None,
+        )
+        if current is None:
+            raise RuntimeError(
+                f"Cannot restore adopted source Material {material_id}: managed node is missing."
+            )
+        original_material = decode_spm_node_snapshot(
+            adoption["original_material_snapshot"]
+        )
+        if (
+            positive_int(original_material.attrib.get("ID")) != material_id
+            or original_material.attrib.get("Name") != adoption.get("material_name")
+        ):
+            raise RuntimeError(
+                f"Cannot restore adopted source Material {material_id}: snapshot identity mismatch."
+            )
+        insert_at = list(assets).index(current)
+        assets.remove(current)
+        assets.insert(insert_at, original_material)
+
+        restored_mesh_ids = []
+        for item in adoption.get("original_mesh_snapshots") or []:
+            mesh_id = positive_int(item.get("mesh_id"))
+            original_mesh = decode_spm_node_snapshot(item.get("snapshot"))
+            if mesh_id is None or positive_int(original_mesh.attrib.get("ID")) != mesh_id:
+                raise RuntimeError("Cannot restore adopted source Mesh: snapshot identity mismatch.")
+            existing_mesh = next(
+                (
+                    node
+                    for node in assets.findall("Mesh")
+                    if positive_int(node.attrib.get("ID")) == mesh_id
+                ),
+                None,
+            )
+            if existing_mesh is not None:
+                raise RuntimeError(
+                    f"Cannot restore adopted source Mesh {mesh_id}: the ID is already occupied."
+                )
+            assets.append(original_mesh)
+            restored_mesh_ids.append(mesh_id)
+        restored.append(
+            {
+                "material_id": material_id,
+                "material_name": adoption.get("material_name"),
+                "mesh_ids": restored_mesh_ids,
+            }
+        )
+    return restored
+
+
+def remove_atlas_scope_assets_from_spm(spm_path, manifests):
+    """Restore Generator slots and remove only assets proven to belong to scopes."""
+    spm_path = Path(spm_path).expanduser().absolute()
+    manifests = [manifest for manifest in manifests if isinstance(manifest, dict)]
+    if not manifests:
+        return {
+            "changed": False,
+            "restored_generator_slots": [],
+            "restored_generator_scales": [],
+            "restored_adopted_materials": [],
+            "removed_materials": [],
+            "removed_mesh_ids": [],
+            "removed_mesh_files": [],
+        }
+
+    root = read_spm_xml(spm_path)
+    assets = root.find("Assets")
+    if assets is None:
+        raise RuntimeError(f"Target SPM has no Assets node: {spm_path}")
+    adoptions = source_material_adoptions_from_manifests(manifests)
+    adopted_material_ids = set(adoptions)
+    material_nodes = list(assets.findall("Material_v8"))
+    mesh_nodes = list(assets.findall("Mesh"))
+    mesh_nodes_by_id = {
+        positive_int(node.attrib.get("ID")): node for node in mesh_nodes
+        if positive_int(node.attrib.get("ID")) is not None
+    }
+
+    owned_materials = []
+    for material in material_nodes:
+        if any(
+            material_is_atlas_leaf_owned(
+                material,
+                manifest,
+                manifest_material_names(manifest),
+                mesh_nodes_by_id,
+                spm_path,
+            )
+            for manifest in manifests
+        ):
+            owned_materials.append(material)
+    owned_material_ids = {
+        positive_int(node.attrib.get("ID")) for node in owned_materials
+        if positive_int(node.attrib.get("ID")) is not None
+    }
+    owned_mesh_ids = {
+        mesh_id
+        for material in owned_materials
+        for mesh_id in spm_material_mesh_ids(material)
+    }
+    manifest_paths = set().union(
+        *(manifest_mesh_asset_paths(manifest) for manifest in manifests)
+    )
+    manifest_ids = set().union(*(manifest_mesh_ids(manifest) for manifest in manifests))
+    scopes = {spm_export_scope(manifest) for manifest in manifests}
+    for mesh_id, node in mesh_nodes_by_id.items():
+        marker = parse_atlas_leaf_spm_user_data(node.findtext("UserData"))
+        path = spm_mesh_filename_path(spm_path, node)
+        if (
+            (marker and marker.get("scope") in scopes)
+            or (mesh_id in manifest_ids and path in manifest_paths)
+        ):
+            owned_mesh_ids.add(mesh_id)
+
+    pairs = {
+        (pair["generator_index"], pair["slot_prefix"]): pair
+        for pair in spm_generator_property_pairs(root, {"Leaf Mesh", "Frond"})
+    }
+    reversible = {}
+    for manifest in manifests:
+        connection = manifest.get("generator_connection") or {}
+        for binding in connection.get("bindings") or []:
+            if not isinstance(binding, dict):
+                continue
+            target_material_id = positive_int(binding.get("target_material_id"))
+            target_mesh_id = positive_int(binding.get("target_mesh_id"))
+            if (
+                target_material_id not in owned_material_ids
+                and target_mesh_id not in owned_mesh_ids
+            ):
+                continue
+            key = (binding.get("generator_index"), binding.get("slot_prefix"))
+            previous = reversible.get(key)
+            if previous is None or (
+                previous.get("source_material_id") in {None, ""}
+                and binding.get("source_material_id") not in {None, ""}
+            ):
+                reversible[key] = binding
+
+    restored = []
+    created_bindings = []
+    for key, pair in pairs.items():
+        material_id = positive_int(pair["material_property"].findtext("Value"))
+        mesh_property = pair.get("mesh_property")
+        mesh_id = integer_value(mesh_property.findtext("Value")) if mesh_property is not None else None
+        if material_id not in owned_material_ids and mesh_id not in owned_mesh_ids:
+            continue
+        binding = reversible.get(key)
+        if binding is None:
+            if material_id not in owned_material_ids:
+                raise RuntimeError(
+                    f"Cannot remove Atlas scope: Generator '{pair['generator_name']}' "
+                    f"slot '{pair['slot_prefix']}' references a managed mesh from an "
+                    "unrelated material, and no original binding is recorded."
+                )
+            child_text(pair["material_property"], "Value", -1)
+            if pair.get("mesh_property") is not None:
+                child_text(pair["mesh_property"], "Value", -10)
+            restored.append({
+                "generator_index": pair["generator_index"],
+                "generator_name": pair["generator_name"],
+                "slot_prefix": pair["slot_prefix"],
+                "material_id": -1,
+                "mesh_id": -10,
+                "mode": "detached_unassigned_missing_original_binding",
+            })
+            continue
+        target_pair = (
+            positive_int(binding.get("target_material_id")),
+            positive_int(binding.get("target_mesh_id")),
+        )
+        if binding.get("created_slot"):
+            if (material_id, mesh_id) != target_pair:
+                raise RuntimeError(
+                    f"Cannot remove Atlas-created Generator variant "
+                    f"'{pair['generator_name']}' slot '{pair['slot_prefix']}': "
+                    f"current pair {(material_id, mesh_id)} has drifted from "
+                    f"recorded target {target_pair}."
+                )
+            created_bindings.append(binding)
+            continue
+        if (material_id, mesh_id) != target_pair:
+            if material_id not in owned_material_ids:
+                raise RuntimeError(
+                    f"Cannot remove Atlas scope: Generator '{pair['generator_name']}' "
+                    f"slot '{pair['slot_prefix']}' no longer matches its recorded target binding."
+                )
+            child_text(pair["material_property"], "Value", -1)
+            if pair.get("mesh_property") is not None:
+                child_text(pair["mesh_property"], "Value", -10)
+            restored.append({
+                "generator_index": pair["generator_index"],
+                "generator_name": pair["generator_name"],
+                "slot_prefix": pair["slot_prefix"],
+                "material_id": -1,
+                "mesh_id": -10,
+                "mode": "detached_unassigned_binding_drift",
+            })
+            continue
+        source_material_id = positive_int(binding.get("source_material_id"))
+        source_mesh_id = integer_value(binding.get("source_mesh_id"))
+        source_material = next(
+            (
+                node for node in material_nodes
+                if positive_int(node.attrib.get("ID")) == source_material_id
+            ),
+            None,
+        )
+        if source_material is None or source_mesh_id is None:
+            if material_id not in owned_material_ids:
+                raise RuntimeError(
+                    f"Cannot remove Atlas scope: original Material/Mesh binding is incomplete for "
+                    f"Generator '{pair['generator_name']}' slot '{pair['slot_prefix']}'."
+                )
+            child_text(pair["material_property"], "Value", -1)
+            if pair.get("mesh_property") is not None:
+                child_text(pair["mesh_property"], "Value", -10)
+            restored.append({
+                "generator_index": pair["generator_index"],
+                "generator_name": pair["generator_name"],
+                "slot_prefix": pair["slot_prefix"],
+                "material_id": -1,
+                "mesh_id": -10,
+                "mode": "detached_unassigned_incomplete_original_binding",
+            })
+            continue
+        adoption_source_ids = set(
+            adoption_original_mesh_ids(adoptions.get(source_material_id, {}))
+        )
+        if (
+            source_mesh_id != -10
+            and source_mesh_id not in spm_material_mesh_ids(source_material)
+            and source_mesh_id not in adoption_source_ids
+        ):
+            raise RuntimeError(
+                f"Cannot remove Atlas scope: original mesh {source_mesh_id} is not owned by "
+                f"source material {source_material_id}."
+            )
+        child_text(pair["material_property"], "Value", source_material_id)
+        child_text(pair["mesh_property"], "Value", source_mesh_id)
+        restored.append({
+            "generator_index": pair["generator_index"],
+            "generator_name": pair["generator_name"],
+            "slot_prefix": pair["slot_prefix"],
+            "material_id": source_material_id,
+            "mesh_id": source_mesh_id,
+            "mode": "restored_original_binding",
+        })
+
+    expected_created_keys = {
+        key for key, binding in reversible.items()
+        if binding.get("created_slot")
+    }
+    scheduled_created_keys = {
+        (binding.get("generator_index"), binding.get("slot_prefix"))
+        for binding in created_bindings
+    }
+    if scheduled_created_keys != expected_created_keys:
+        raise RuntimeError(
+            "Cannot remove Atlas-created Generator variants: a recorded slot "
+            "disappeared."
+        )
+    restored.extend(
+        remove_created_generator_variant_slots(root, created_bindings)
+    )
+    restored_generator_scales = restore_frond_generator_geometry_scale(
+        root,
+        manifests,
+    )
+    restored_adoptions = restore_adopted_source_nodes(assets, adoptions)
+    removable_owned_materials = [
+        node
+        for node in owned_materials
+        if positive_int(node.attrib.get("ID")) not in adopted_material_ids
+    ]
+    referenced_material_ids = spm_generator_referenced_material_ids(root)
+    blocked_materials = [
+        node.attrib.get("Name", "") for node in removable_owned_materials
+        if positive_int(node.attrib.get("ID")) in referenced_material_ids
+    ]
+    if blocked_materials:
+        raise RuntimeError(
+            "Cannot remove Atlas scope because managed materials remain Generator-referenced: "
+            + ", ".join(blocked_materials)
+        )
+    removed_material_names = [node.attrib.get("Name", "") for node in removable_owned_materials]
+    for material in removable_owned_materials:
+        assets.remove(material)
+
+    remaining_mesh_ids = set()
+    for material in assets.findall("Material_v8"):
+        remaining_mesh_ids.update(spm_material_mesh_ids(material))
+    remaining_mesh_ids.update(spm_generator_referenced_mesh_ids(root))
+    removed_mesh_nodes = []
+    removed_mesh_ids = []
+    for mesh_id in sorted(owned_mesh_ids):
+        node = mesh_nodes_by_id.get(mesh_id)
+        if node is None or mesh_id in remaining_mesh_ids:
+            continue
+        assets.remove(node)
+        removed_mesh_nodes.append(node)
+        removed_mesh_ids.append(mesh_id)
+
+    changed = bool(
+        restored
+        or restored_generator_scales
+        or restored_adoptions
+        or removed_material_names
+        or removed_mesh_ids
+    )
+    if changed:
+        write_spm_xml(spm_path, root)
+        validated_root = read_spm_xml(spm_path)
+        validated_assets = validated_root.find("Assets")
+        if validated_assets is None:
+            raise RuntimeError("Atlas scope removal validation failed: Assets node disappeared.")
+        remaining_material_ids = {
+            positive_int(node.attrib.get("ID"))
+            for node in validated_assets.findall("Material_v8")
+        }
+        remaining_mesh_node_ids = {
+            positive_int(node.attrib.get("ID"))
+            for node in validated_assets.findall("Mesh")
+        }
+        removable_owned_material_ids = owned_material_ids - adopted_material_ids
+        if removable_owned_material_ids.intersection(remaining_material_ids):
+            raise RuntimeError("Atlas scope removal validation failed: managed material remains.")
+        if set(removed_mesh_ids).intersection(remaining_mesh_node_ids):
+            raise RuntimeError("Atlas scope removal validation failed: deleted mesh remains.")
+        for material_id, adoption in adoptions.items():
+            restored_material = next(
+                (
+                    node
+                    for node in validated_assets.findall("Material_v8")
+                    if positive_int(node.attrib.get("ID")) == material_id
+                ),
+                None,
+            )
+            if (
+                restored_material is None
+                or spm_material_mesh_ids(restored_material)
+                != adoption_original_mesh_ids(adoption)
+            ):
+                raise RuntimeError(
+                    f"Atlas scope removal failed to restore adopted Material {material_id}."
+                )
+
+    # Keep exported FBX/XML files recoverable. The SPM no longer references
+    # them, and a later rebuild can reuse or safely reconcile those files.
+    removed_files = []
+    return {
+        "changed": changed,
+        "restored_generator_slots": restored,
+        "restored_generator_scales": restored_generator_scales,
+        "restored_adopted_materials": restored_adoptions,
+        "removed_materials": removed_material_names,
+        "removed_mesh_ids": removed_mesh_ids,
+        "removed_mesh_files": removed_files,
+    }
+
+
+def remove_blend_target_from_spm(blend_path, spm_path):
+    """Transactionally detach one blend's managed Atlas data from one SPM."""
+    blend_path = Path(blend_path).expanduser().absolute()
+    spm_path = Path(spm_path).expanduser().absolute()
+    if not spm_path.is_file():
+        return {"status": "target_missing", "spm": str(spm_path), "backup": None}
+    manifests = target_scope_manifests_for_blend(spm_path, blend_path)
+    if not manifests:
+        root = read_spm_xml(spm_path)
+        assets = root.find("Assets")
+        candidate_names = {
+            blend_path.stem.casefold(),
+            canonical_new_atlas_asset_name(blend_path.stem).casefold(),
+        }
+        suspicious = []
+        if assets is not None:
+            mesh_nodes_by_id = {
+                positive_int(node.attrib.get("ID")): node
+                for node in assets.findall("Mesh")
+                if positive_int(node.attrib.get("ID")) is not None
+            }
+            export_mesh_dir = spm_path.parent / "meshes"
+            for material in assets.findall("Material_v8"):
+                if str(material.attrib.get("Name") or "").casefold() not in candidate_names:
+                    continue
+                marker = parse_atlas_leaf_spm_user_data(material.findtext("UserData"))
+                legacy_mesh_match = any(
+                    (
+                        spm_mesh_filename_path(spm_path, mesh_nodes_by_id.get(mesh_id))
+                        if mesh_nodes_by_id.get(mesh_id) is not None else None
+                    ) is not None
+                    and path_is_relative_to(
+                        spm_mesh_filename_path(spm_path, mesh_nodes_by_id[mesh_id]),
+                        export_mesh_dir,
+                    )
+                    for mesh_id in spm_material_mesh_ids(material)
+                    if mesh_id in mesh_nodes_by_id
+                )
+                if marker or legacy_mesh_match:
+                    suspicious.append(material.attrib.get("Name", ""))
+        if suspicious:
+            raise RuntimeError(
+                "Cannot remove Atlas target safely: managed-looking materials exist but "
+                "the exact per-scope manifest is missing: " + ", ".join(suspicious)
+            )
+        return {"status": "no_managed_manifest", "spm": str(spm_path), "backup": None}
+
+    backup_dir = spm_path.parent / "_spm_backups"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    backup = backup_dir / f"{spm_path.stem}.atlas_target_remove_{stamp}.spm"
+    shutil.copy2(spm_path, backup)
+    try:
+        cleanup = remove_atlas_scope_assets_from_spm(spm_path, manifests)
+    except Exception:
+        shutil.copy2(backup, spm_path)
+        raise
+    return {
+        "status": "cleaned" if cleanup["changed"] else "already_clean",
+        "spm": str(spm_path),
+        "backup": str(backup),
+        "cleanup": cleanup,
     }
 
 
@@ -1166,7 +3087,14 @@ def make_spm_mesh(mesh_template, mesh_id, fbx_path, spm_path, manifest=None):
     child_text(mesh, "Embedded", "false")
     child_text(mesh, "Orient", "6")
     child_text(mesh, "PivotStyle", "0")
-    child_text(mesh, "Scale", "1")
+    mesh_asset_scale = (
+        float(manifest.get("mesh_asset_scale", 1.0))
+        if manifest is not None
+        else 1.0
+    )
+    if mesh_asset_scale <= 0.0:
+        raise ValueError("SpeedTree mesh asset scale must be greater than zero.")
+    child_text(mesh, "Scale", speedtree_float(mesh_asset_scale))
     for child in list(mesh):
         if child.tag.startswith("Lod_") or child.tag == "EmbeddedData_v7" or child.tag == "Cutout":
             mesh.remove(child)
@@ -1230,7 +3158,14 @@ def max_asset_id(assets, tag):
     return maximum
 
 
-def upsert_speedtree_assets_in_spm(spm_path, manifest, material_name, allow_create=False):
+def upsert_speedtree_assets_in_spm(
+    spm_path,
+    manifest,
+    material_name,
+    allow_create=False,
+    adopt_source_material_id=None,
+    adopt_reusable_mesh_ids=None,
+):
     spm_path = Path(spm_path)
     if not spm_path.exists():
         if not allow_create:
@@ -1254,8 +3189,14 @@ def upsert_speedtree_assets_in_spm(spm_path, manifest, material_name, allow_crea
     mesh_nodes_by_id = {node.attrib.get("ID"): node for node in assets.findall("Mesh")}
     mesh_ids_by_key, mesh_key_counts = build_spm_mesh_lookup(spm_path, mesh_nodes_by_id)
 
+    adoption_material_id = positive_int(adopt_source_material_id)
     named_material = find_material_by_name(assets, material_name)
     scoped_material = find_scope_group_material(assets, manifest)
+    adoption_name_match = (
+        adoption_material_id is not None
+        and named_material is not None
+        and positive_int(named_material.attrib.get("ID")) == adoption_material_id
+    )
     untagged_legacy_match = (
         named_material is not None
         and material_untagged_legacy_meshes_match(
@@ -1272,6 +3213,7 @@ def upsert_speedtree_assets_in_spm(spm_path, manifest, material_name, allow_crea
         and not material_scope_matches(named_material, manifest)
         and not material_legacy_scope_matches(named_material, manifest, material_name)
         and not untagged_legacy_match
+        and not adoption_name_match
     ):
         raise RuntimeError(
             f"Material name conflict in {spm_path.name}: '{material_name}' belongs to another atlas/source. "
@@ -1282,6 +3224,13 @@ def upsert_speedtree_assets_in_spm(spm_path, manifest, material_name, allow_crea
             f"Atlas export scope already owns a different material while '{material_name}' is also present."
         )
     material = scoped_material or named_material
+    if adoption_material_id is not None and material is None:
+        raise RuntimeError(
+            f"Cannot adopt missing source material '{material_name}' (ID {adoption_material_id})."
+        )
+    first_adoption = bool(
+        adoption_name_match and not material_scope_matches(named_material, manifest)
+    )
     action = "updated"
     old_mesh_ids = []
     if material is None:
@@ -1303,26 +3252,56 @@ def upsert_speedtree_assets_in_spm(spm_path, manifest, material_name, allow_crea
         material_id = int(material.attrib.get("ID", max_asset_id(assets, "Material_v8") + 1))
         old_mesh_ids = spm_material_mesh_ids(material)
         old_mesh_id_set = set(old_mesh_ids)
-        mesh_ids = []
-        used_mesh_ids = set()
-        for mesh_path in mesh_paths:
-            existing_id = existing_spm_mesh_id_for_path(spm_path, mesh_path, mesh_ids_by_key, mesh_key_counts)
-            if existing_id in old_mesh_id_set and existing_id not in used_mesh_ids:
-                mesh_ids.append(existing_id)
-                used_mesh_ids.add(existing_id)
+        if first_adoption:
+            reusable = [
+                positive_int(value) for value in adopt_reusable_mesh_ids or []
+            ]
+            if reusable:
+                if (
+                    len(reusable) != len(mesh_paths)
+                    or any(value is None for value in reusable)
+                    or set(reusable).intersection(old_mesh_id_set)
+                    or any(str(value) not in mesh_nodes_by_id for value in reusable)
+                ):
+                    raise RuntimeError(
+                        "Previous Atlas plan Mesh IDs cannot be reused for source-material adoption."
+                    )
+                mesh_ids = reusable
             else:
-                mesh_ids.append(None)
-        reusable_old_ids = [mesh_id for mesh_id in old_mesh_ids if mesh_id not in used_mesh_ids]
-        next_mesh_id = max_asset_id(assets, "Mesh") + 1
-        for index, mesh_id in enumerate(mesh_ids):
-            if mesh_id is not None:
-                continue
-            if reusable_old_ids:
-                mesh_ids[index] = reusable_old_ids.pop(0)
-            else:
-                mesh_ids[index] = next_mesh_id
-                next_mesh_id += 1
-        update_spm_material(material, spm_path, manifest["textures"], mesh_ids)
+                first_mesh_id = max_asset_id(assets, "Mesh") + 1
+                mesh_ids = list(range(first_mesh_id, first_mesh_id + len(mesh_paths)))
+            action = "adopted"
+        else:
+            mesh_ids = []
+            used_mesh_ids = set()
+            for mesh_path in mesh_paths:
+                existing_id = existing_spm_mesh_id_for_path(spm_path, mesh_path, mesh_ids_by_key, mesh_key_counts)
+                if existing_id in old_mesh_id_set and existing_id not in used_mesh_ids:
+                    mesh_ids.append(existing_id)
+                    used_mesh_ids.add(existing_id)
+                else:
+                    mesh_ids.append(None)
+            reusable_old_ids = [mesh_id for mesh_id in old_mesh_ids if mesh_id not in used_mesh_ids]
+            next_mesh_id = max_asset_id(assets, "Mesh") + 1
+            for index, mesh_id in enumerate(mesh_ids):
+                if mesh_id is not None:
+                    continue
+                if reusable_old_ids:
+                    mesh_ids[index] = reusable_old_ids.pop(0)
+                else:
+                    mesh_ids[index] = next_mesh_id
+                    next_mesh_id += 1
+        if adoption_material_id is not None:
+            # Preserve authored shading properties while synchronizing the
+            # production texture files and their exact pixel metadata.
+            update_spm_material_mesh_ids(material, mesh_ids)
+            update_spm_material_texture_maps(
+                material,
+                spm_path,
+                manifest["textures"],
+            )
+        else:
+            update_spm_material(material, spm_path, manifest["textures"], mesh_ids)
         tag_spm_asset(material, manifest, "material")
 
     for mesh_id, mesh_path in zip(mesh_ids, mesh_paths):
@@ -1337,7 +3316,9 @@ def upsert_speedtree_assets_in_spm(spm_path, manifest, material_name, allow_crea
 
     unused_old_ids = set(old_mesh_ids) - set(mesh_ids)
     generator_referenced_mesh_ids = spm_generator_referenced_mesh_ids(root)
-    removable_unused_old_ids = unused_old_ids - generator_referenced_mesh_ids
+    removable_unused_old_ids = (
+        set() if first_adoption else unused_old_ids - generator_referenced_mesh_ids
+    )
     if removable_unused_old_ids:
         for node in list(assets.findall("Mesh")):
             try:
@@ -1537,6 +3518,149 @@ def apply_source_mesh_transforms(source_groups):
     return applied
 
 
+def _checked_normalized_bounds(value, label):
+    if not isinstance(value, dict):
+        raise RuntimeError(f"{label} normalized bounds are missing.")
+    size = value.get("size")
+    if not isinstance(size, (list, tuple)) or len(size) != 3:
+        raise RuntimeError(f"{label} normalized bounds size is invalid.")
+    try:
+        checked_size = [float(component) for component in size]
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"{label} normalized bounds size is not numeric."
+        ) from exc
+    if any(
+        not math.isfinite(component) or component < 0.0
+        for component in checked_size
+    ) or max(checked_size) <= 0.0:
+        raise RuntimeError(
+            f"{label} normalized bounds size is not finite and non-negative."
+        )
+    result = copy.deepcopy(value)
+    result["size"] = checked_size
+    return result
+
+
+def physical_normalization_receipt_from_scene(scene):
+    """Return the compact direct-capture receipt persisted by the normalizer."""
+    raw = scene.get("speedtree_cluster_normalizer_last_report")
+    if not raw:
+        return None
+    try:
+        report = json.loads(str(raw)) if not isinstance(raw, dict) else raw
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            "SpeedTree cluster normalizer report is invalid JSON."
+        ) from exc
+    if report.get("workflow_mode") != "PHYSICAL_DIRECT_CAPTURE":
+        return None
+    capture = report.get("physical_capture_contract")
+    capture_hash = str(
+        report.get("physical_capture_contract_sha256") or ""
+    )
+    if (
+        not isinstance(capture, dict)
+        or not capture_hash
+        or str(capture.get("contract_sha256") or "") != capture_hash
+    ):
+        raise RuntimeError(
+            "Physical direct-capture report has no matching capture contract."
+        )
+
+    prototypes = []
+    seen_assets = set()
+    for raw_prototype in report.get("prototypes") or []:
+        asset_name = str(
+            raw_prototype.get("skeletal_asset")
+            or raw_prototype.get("prototype_asset")
+            or ""
+        ).strip()
+        if not asset_name or asset_name.casefold() in seen_assets:
+            raise RuntimeError(
+                "Physical normalization prototype assets are missing or duplicated."
+            )
+        seen_assets.add(asset_name.casefold())
+        prototypes.append({
+            "prototype_index": int(
+                raw_prototype.get("prototype_index") or 0
+            ),
+            "skeletal_asset": asset_name,
+            "normalized_bounds": _checked_normalized_bounds(
+                raw_prototype.get("normalized_bounds"),
+                f"physical prototype {asset_name}",
+            ),
+        })
+    if not prototypes or any(
+        row["prototype_index"] <= 0 for row in prototypes
+    ):
+        raise RuntimeError(
+            "Physical normalization report has no indexed prototypes."
+        )
+
+    variants = []
+    for raw_variant in report.get("variants") or []:
+        card_index = int(
+            raw_variant.get("card_index")
+            or raw_variant.get("index")
+            or 0
+        )
+        asset_name = str(
+            raw_variant.get("skeletal_asset")
+            or raw_variant.get("prototype_asset")
+            or ""
+        ).strip()
+        plan_name = str(raw_variant.get("plan") or "").strip()
+        if (
+            card_index <= 0
+            or not asset_name
+            or not plan_name
+            or raw_variant.get("object_transforms_identity") is not True
+            or raw_variant.get("plan_covers_projection") is not True
+        ):
+            raise RuntimeError(
+                "Physical normalization variant evidence is incomplete."
+            )
+        variants.append({
+            "index": card_index,
+            "card_index": card_index,
+            "skeletal_asset": asset_name,
+            "plan": plan_name,
+            "normalized_bounds": _checked_normalized_bounds(
+                raw_variant.get("normalized_bounds"),
+                f"physical variant {plan_name}",
+            ),
+            "object_transforms_identity": True,
+            "plan_covers_projection": True,
+            "plan_uv_transfer": copy.deepcopy(
+                raw_variant.get("plan_uv_transfer") or {}
+            ),
+        })
+    variants.sort(key=lambda row: row["card_index"])
+    if (
+        not variants
+        or [row["card_index"] for row in variants]
+        != list(range(1, len(variants) + 1))
+    ):
+        raise RuntimeError(
+            "Physical normalization variant indices are not consecutive."
+        )
+
+    return {
+        "workflow_mode": "PHYSICAL_DIRECT_CAPTURE",
+        "size_policy": str(report.get("size_policy") or ""),
+        "plan_uv_policy": str(report.get("plan_uv_policy") or ""),
+        "direct_uv_source": str(report.get("direct_uv_source") or ""),
+        "generator_size_policy": str(
+            report.get("generator_size_policy") or ""
+        ),
+        "physical_capture_contract": copy.deepcopy(capture),
+        "physical_capture_contract_sha256": capture_hash,
+        "prototypes": prototypes,
+        "variants": variants,
+    }
+
+
 def export_speedtree_assets(props, export_dir, atlas_asset_name=None):
     collection = bpy.data.collections.get(props.collection_name)
     if not collection:
@@ -1546,12 +3670,40 @@ def export_speedtree_assets(props, export_dir, atlas_asset_name=None):
         for key, path in atlas_texture_paths(bpy.path.abspath(props.albedo_path)).items()
         if path.exists()
     }
+    texture_dimensions = common_texture_dimensions(texture_exports)
     texture_signature = texture_path_signature(texture_exports)
     export_scope_id = resolve_export_scope_id(collection, export_dir, texture_signature)
 
     source_groups = grouped_source_objects(collection, atlas_asset_name)
     if not any(group["objects"] for group in source_groups):
         raise RuntimeError(f"No mesh objects in collection: {props.collection_name}")
+    physical_hashes = {
+        str(obj.get("speedtree_cluster_physical_capture_contract_sha256"))
+        for group in source_groups
+        for obj in group["objects"]
+        if obj.get("speedtree_cluster_physical_capture_contract_sha256")
+    }
+    normalization_receipt = physical_normalization_receipt_from_scene(
+        bpy.context.scene
+    )
+    if physical_hashes:
+        if (
+            len(physical_hashes) != 1
+            or normalization_receipt is None
+            or normalization_receipt[
+                "physical_capture_contract_sha256"
+            ] not in physical_hashes
+        ):
+            raise RuntimeError(
+                "Atlas source objects and physical normalization receipt disagree."
+            )
+    else:
+        # A stale scene-level report must not change a legacy export contract.
+        normalization_receipt = None
+    prototype_bounds = {
+        row["skeletal_asset"].casefold(): row["normalized_bounds"]
+        for row in (normalization_receipt or {}).get("prototypes") or []
+    }
 
     # SpeedTree misplaces external meshes whose FBX pivot is not at the origin,
     # so bake every source mesh's transform before export. Anchor empties keep
@@ -1576,6 +3728,26 @@ def export_speedtree_assets(props, export_dir, atlas_asset_name=None):
         if group["objects"]
     }
     mesh_geometry_scale = max(float(props.speedtree_mesh_scale), 0.000001)
+    mesh_asset_scale = max(
+        float(getattr(props, "speedtree_mesh_asset_scale", 1.0)),
+        0.000001,
+    )
+    from .unit_contract import unit_probe_contract_from_json
+
+    verified_unit_contract = unit_probe_contract_from_json(
+        getattr(props, "speedtree_unit_probe_contract_json", "")
+    )
+    if verified_unit_contract is not None:
+        if not _same_float(
+            mesh_geometry_scale,
+            verified_unit_contract["mesh_geometry_scale"],
+        ) or not _same_float(
+            mesh_asset_scale,
+            verified_unit_contract["mesh_asset_scale"],
+        ):
+            raise RuntimeError(
+                "Atlas scale fields drifted from the verified SpeedTree unit probe."
+            )
 
     temp_collection_name = "_AtlasLeaf_SpeedTree_Export_Temp"
     temp_collection = bpy.data.collections.get(temp_collection_name)
@@ -1600,6 +3772,36 @@ def export_speedtree_assets(props, export_dir, atlas_asset_name=None):
             if material is None:
                 continue
             for source in sorted(group["objects"], key=speedtree_mesh_sort_key):
+                composite_parts = []
+                composite_raw = source.get("speedtree_cluster_composite_parts")
+                if composite_raw:
+                    try:
+                        composite_parts = json.loads(str(composite_raw))
+                    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                        raise ValueError(
+                            f"Invalid normalized composite-part contract on {source.name}: {exc}"
+                        ) from exc
+                    if not isinstance(composite_parts, list) or not composite_parts:
+                        raise ValueError(
+                            f"Normalized composite-part contract is empty on {source.name}."
+                        )
+                if normalization_receipt is not None:
+                    if composite_parts:
+                        for composite_part in composite_parts:
+                            asset_name = str(
+                                composite_part.get("skeletal_asset_name") or ""
+                            ).strip()
+                            bounds = prototype_bounds.get(
+                                asset_name.casefold()
+                            )
+                            if bounds is None:
+                                raise RuntimeError(
+                                    "Physical composite prototype has no normalized "
+                                    f"bounds: {asset_name or '<unnamed>'}"
+                                )
+                            composite_part["normalized_bounds"] = copy.deepcopy(
+                                bounds
+                            )
                 anchor_records = []
                 if anchor_export_mode != "OFF":
                     anchor_records = collect_source_anchors(source, props, mesh_geometry_scale)
@@ -1609,10 +3811,6 @@ def export_speedtree_assets(props, export_dir, atlas_asset_name=None):
                 mesh.materials.append(material)
                 for poly in mesh.polygons:
                     poly.material_index = 0
-                if mesh_geometry_scale != 1.0:
-                    for vertex in mesh.vertices:
-                        vertex.co *= mesh_geometry_scale
-                    mesh.update()
                 export_name = speedtree_mesh_export_name(
                     source,
                     used_mesh_filenames,
@@ -1623,6 +3821,29 @@ def export_speedtree_assets(props, export_dir, atlas_asset_name=None):
                 temp_obj = bpy.data.objects.new(export_stem, mesh)
                 temp_obj.matrix_world = source.matrix_world.copy()
                 temp_collection.objects.link(temp_obj)
+                fbx_path = mesh_dir / export_name
+                assembly_plan_fbx = fbx_path
+                if mesh_geometry_scale != 1.0:
+                    assembly_plan_dir = mesh_dir / "assembly_plan_references"
+                    assembly_plan_dir.mkdir(parents=True, exist_ok=True)
+                    assembly_plan_fbx = assembly_plan_dir / export_name
+                    for obj in bpy.context.selected_objects:
+                        obj.select_set(False)
+                    temp_obj.select_set(True)
+                    bpy.context.view_layer.objects.active = temp_obj
+                    bpy.ops.export_scene.fbx(
+                        filepath=str(assembly_plan_fbx),
+                        use_selection=True,
+                        object_types={"MESH"},
+                        apply_unit_scale=True,
+                        bake_space_transform=False,
+                        add_leaf_bones=False,
+                        path_mode="RELATIVE",
+                        embed_textures=False,
+                    )
+                    for vertex in mesh.vertices:
+                        vertex.co *= mesh_geometry_scale
+                    mesh.update()
                 temp_anchor_objects = []
                 if anchor_export_mode == "FBX_EMPTY":
                     for index, anchor in enumerate(anchor_records):
@@ -1641,7 +3862,6 @@ def export_speedtree_assets(props, export_dir, atlas_asset_name=None):
                     temp_anchor.select_set(True)
                 bpy.context.view_layer.objects.active = temp_obj
 
-                fbx_path = mesh_dir / export_name
                 bpy.ops.export_scene.fbx(
                     filepath=str(fbx_path),
                     use_selection=True,
@@ -1661,14 +3881,53 @@ def export_speedtree_assets(props, export_dir, atlas_asset_name=None):
                 item = {
                     "name": export_stem,
                     "fbx": str(fbx_path),
+                    "assembly_plan_fbx": str(assembly_plan_fbx),
                     "xml": str(xml_path) if xml_path else None,
                     "asset": str(asset_path),
                     "anchor_count": len(anchor_records),
                     "anchor_names": [anchor["name"] for anchor in anchor_records],
                     "source_object": source.name,
+                    "skeletal_asset_name": str(
+                        source.get("speedtree_cluster_prototype_asset")
+                        or source.get("speedtree_cluster_skeletal_counterpart")
+                        or ""
+                    ).strip() or None,
+                    "source_prototype_index": positive_int(
+                        source.get("speedtree_cluster_prototype_index")
+                    ),
+                    "source_partition_mode": str(
+                        source.get("speedtree_cluster_source_partition_mode") or ""
+                    ).strip() or None,
+                    "composite_parts": copy.deepcopy(composite_parts),
+                    "source_ordinal": (
+                        positive_int(source.get("speedtree_cluster_variant_index"))
+                        or positive_int(source.get("atlas_leaf_cluster_variant_index"))
+                    ),
                     "source_collection": group["collection"],
                     "material": material.name,
                 }
+                if normalization_receipt is not None:
+                    skeletal_asset_name = str(
+                        item.get("skeletal_asset_name") or ""
+                    ).strip()
+                    bounds = prototype_bounds.get(
+                        skeletal_asset_name.casefold()
+                    )
+                    if bounds is None and not composite_parts:
+                        raise RuntimeError(
+                            "Physical normalized prototype has no bounds: "
+                            + (skeletal_asset_name or "<unnamed>")
+                        )
+                    if bounds is not None:
+                        item["normalized_bounds"] = copy.deepcopy(bounds)
+                    item["normalization_workflow_mode"] = (
+                        "PHYSICAL_DIRECT_CAPTURE"
+                    )
+                    item["physical_capture_contract_sha256"] = (
+                        normalization_receipt[
+                            "physical_capture_contract_sha256"
+                        ]
+                    )
                 exported_meshes.append(item)
                 group_meshes.append(item)
                 for temp_anchor in temp_anchor_objects:
@@ -1709,6 +3968,22 @@ def export_speedtree_assets(props, export_dir, atlas_asset_name=None):
         "material_groups": material_groups,
         "single_material_per_mesh": True,
         "mesh_geometry_scale": mesh_geometry_scale,
+        "mesh_asset_scale": mesh_asset_scale,
+        "unit_probe_contract": (
+            verified_unit_contract["contract"]
+            if verified_unit_contract is not None
+            else None
+        ),
+        "unit_probe_contract_sha256": (
+            verified_unit_contract["contract_sha256"]
+            if verified_unit_contract is not None
+            else None
+        ),
+        "unit_scale_location": (
+            verified_unit_contract["scale_location"]
+            if verified_unit_contract is not None
+            else None
+        ),
         "applied_transform_objects": applied_transform_objects,
         "anchor_export_mode": anchor_export_mode,
         "anchor_count": sum(item.get("anchor_count", 0) for item in exported_meshes),
@@ -1716,16 +3991,22 @@ def export_speedtree_assets(props, export_dir, atlas_asset_name=None):
         "meshes": exported_meshes,
         "removed_stale_mesh_exports": removed_stale_mesh_exports,
         "textures": texture_exports,
+        "texture_dimensions": (
+            list(texture_dimensions) if texture_dimensions is not None else None
+        ),
         "notes": [
             "Use each mesh item's asset path as the SpeedTree mesh asset source.",
             "Use one atlas material for all leaf mesh variants.",
             "The SPM material mesh list is synchronized to the current Blender collection when rebuilt.",
             "Texture maps reference the original source files and are not copied into the SPM folder.",
-            "The original roughness map is connected to the SpeedTree gloss slot when present.",
+            "The original gloss map is preferred for the SpeedTree gloss slot; roughness remains the fallback.",
+            "The original AO map is connected to the SpeedTree AO slot when present.",
             "SpeedTree XML anchor assets store child empties as LeafReferences.",
             "Source mesh transforms are applied on build so FBX pivots sit at the origin; anchor empties keep their transforms.",
         ],
     }
+    if normalization_receipt is not None:
+        manifest["normalized_prototype_receipt"] = normalization_receipt
     manifest_path = export_dir / "speedtree_import_manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     readme_path = write_speedtree_readme(export_dir, manifest)
@@ -1755,9 +4036,17 @@ def speedtree_source_material_mapping(props):
         if isinstance(value, dict):
             names = value.get("source_material_names") or value.get("materials") or []
             ids = value.get("source_material_ids")
+            adopt_source_material = bool(value.get("adopt_source_material", False))
+            generator_variant_policy = normalize_generator_variant_policy(
+                value.get("generator_variant_policy")
+            )
         else:
             names = value
             ids = None
+            adopt_source_material = False
+            generator_variant_policy = (
+                GENERATOR_VARIANT_POLICY_PRESERVE_EXISTING
+            )
         if isinstance(names, str):
             names = [names]
         if not isinstance(names, list):
@@ -1765,8 +4054,191 @@ def speedtree_source_material_mapping(props):
         mapping[normalized_target_key(target)] = {
             "source_material_names": [str(name) for name in names if str(name).strip()],
             "source_material_ids": ids,
+            "adopt_source_material": adopt_source_material,
+            "generator_variant_policy": generator_variant_policy,
         }
     return mapping
+
+
+def extend_source_material_adoptions_for_targets(
+    props,
+    target_spms,
+    *,
+    blend_path=None,
+):
+    """Add exact per-target adoption rows for a Cluster relationship ON.
+
+    Normalized Cluster blends already contain one authoritative mapping row.
+    When Generator Sync expands that relationship to sibling tree SPMs, each
+    sibling can use the same material name with a different local Material ID.
+    Copying the first ID is therefore unsafe; inspect every target and add only
+    an exact, untagged same-name Material_v8 adoption row.
+
+    Existing explicit rows are preserved.  Materials already tagged to an
+    Atlas scope are not claimed here, so a genuinely different source keeps
+    the normal ownership-conflict protection.
+    """
+    raw_text = str(
+        getattr(props, "speedtree_source_materials_json", "") or ""
+    ).strip()
+    try:
+        raw_mapping = json.loads(raw_text) if raw_text else {}
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"Source material mapping JSON is invalid: {exc}"
+        ) from exc
+    if not isinstance(raw_mapping, dict):
+        raise RuntimeError(
+            "Source material mapping JSON must be an object keyed by target SPM path."
+        )
+
+    mapping = speedtree_source_material_mapping(props)
+    material_name = str(
+        getattr(props, "speedtree_atlas_asset_name", "") or ""
+    ).strip()
+    if not material_name:
+        raise RuntimeError(
+            "Cluster relationship ON requires an exact atlas material name."
+        )
+    templates = [
+        row for row in mapping.values()
+        if row.get("source_material_names") == [material_name]
+        and row.get("adopt_source_material") is True
+    ]
+    if not templates:
+        raise RuntimeError(
+            f"Cluster relationship ON has no source-material adoption template "
+            f"for '{material_name}'."
+        )
+    policies = {
+        normalize_generator_variant_policy(
+            row.get("generator_variant_policy")
+        )
+        for row in templates
+    }
+    if len(policies) != 1:
+        raise RuntimeError(
+            f"Cluster relationship ON has conflicting Generator variant "
+            f"policies for '{material_name}'."
+        )
+    generator_variant_policy = next(iter(policies))
+
+    added = []
+    preserved = []
+    for target_value in target_spms:
+        target = Path(target_value).expanduser().absolute()
+        target_key = normalized_target_key(target)
+        if target_key in mapping:
+            preserved.append(str(target))
+            continue
+        if not target.is_file():
+            raise RuntimeError(
+                f"Cluster relationship target does not exist: {target}"
+            )
+        root = read_spm_xml(target)
+        assets = root.find("Assets")
+        matches = (
+            [
+                node for node in assets.findall("Material_v8")
+                if node.attrib.get("Name") == material_name
+            ]
+            if assets is not None
+            else []
+        )
+        if len(matches) != 1:
+            raise RuntimeError(
+                f"Cluster relationship ON requires exactly one Material_v8 "
+                f"named '{material_name}' in {target.name}; found {len(matches)}."
+            )
+        material = matches[0]
+        material_id = positive_int(material.attrib.get("ID"))
+        if material_id is None:
+            raise RuntimeError(
+                f"Cluster relationship material '{material_name}' has an "
+                f"invalid ID in {target.name}."
+            )
+        marker = parse_atlas_leaf_spm_user_data(material.findtext("UserData"))
+        reused_existing_scope = False
+        if marker:
+            matching_manifests = []
+            if blend_path:
+                for previous in target_scope_manifests_for_blend(
+                    target,
+                    blend_path,
+                ):
+                    adoption = previous.get("source_material_adoption") or {}
+                    if (
+                        adoption.get("version")
+                        == SOURCE_MATERIAL_ADOPTION_VERSION
+                        and adoption.get("material_name") == material_name
+                        and positive_int(adoption.get("material_id"))
+                        == material_id
+                        and adoption.get("original_material_snapshot")
+                        and adoption.get("original_mesh_snapshots")
+                        and marker.get("scope")
+                        == spm_export_scope(previous)
+                    ):
+                        matching_manifests.append(previous)
+            if not matching_manifests:
+                raise RuntimeError(
+                    f"Cannot extend Cluster relationship to {target.name}: "
+                    f"'{material_name}' is already managed by Atlas scope "
+                    f"{marker.get('scope')!r} without a matching same-blend "
+                    "adoption receipt."
+                )
+            snapshots = {
+                (
+                    previous["source_material_adoption"][
+                        "original_material_snapshot"
+                    ],
+                    json.dumps(
+                        previous["source_material_adoption"][
+                            "original_mesh_snapshots"
+                        ],
+                        sort_keys=True,
+                    ),
+                )
+                for previous in matching_manifests
+            }
+            if len(snapshots) != 1:
+                raise RuntimeError(
+                    f"Cannot extend Cluster relationship to {target.name}: "
+                    "same-blend adoption receipts disagree."
+                )
+            reused_existing_scope = True
+        mesh_ids = spm_material_mesh_ids(material)
+        if not mesh_ids:
+            raise RuntimeError(
+                f"Cluster relationship material '{material_name}' has no "
+                f"cutout meshes in {target.name}."
+            )
+        raw_mapping[str(target)] = {
+            "source_material_names": [material_name],
+            "source_material_ids": [material_id],
+            "adopt_source_material": True,
+            "generator_variant_policy": generator_variant_policy,
+        }
+        added.append(
+            {
+                "target_spm": str(target),
+                "material_name": material_name,
+                "material_id": material_id,
+                "source_mesh_ids": mesh_ids,
+                "reused_existing_scope": reused_existing_scope,
+            }
+        )
+
+    props.speedtree_source_materials_json = json.dumps(
+        raw_mapping,
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    return {
+        "material_name": material_name,
+        "generator_variant_policy": generator_variant_policy,
+        "added": added,
+        "preserved": preserved,
+    }
 
 
 def _export_or_update_speedtree_spm_path_impl(
@@ -1776,8 +4248,13 @@ def _export_or_update_speedtree_spm_path_impl(
     atlas_asset_name=None,
     source_material_names=None,
     source_material_ids=None,
+    adopt_source_material=False,
+    generator_variant_policy=None,
     allow_create=False,
 ):
+    generator_variant_policy = normalize_generator_variant_policy(
+        generator_variant_policy
+    )
     target_spm = Path(target_spm)
     if not target_spm.name:
         raise RuntimeError("Target SPM is not set.")
@@ -1807,6 +4284,37 @@ def _export_or_update_speedtree_spm_path_impl(
         fallback_manifest,
         target_spm,
     )
+    unit_scale_migration = {
+        "mode": "legacy",
+        "restored_generator_properties": [],
+    }
+    if manifest.get("unit_probe_contract"):
+        migration_manifests = [
+            value
+            for value in (
+                previous_manifest,
+                previous_target_manifest,
+                previous_global_manifest,
+            )
+            if isinstance(value, dict) and value
+        ]
+        if target_spm.exists() and migration_manifests:
+            root = read_spm_xml(target_spm)
+            restored = restore_frond_generator_geometry_scale(
+                root,
+                migration_manifests,
+            )
+            if restored:
+                write_spm_xml(target_spm, root)
+            unit_scale_migration = {
+                "mode": "restore_legacy_frond_baseline",
+                "restored_generator_properties": restored,
+            }
+        else:
+            unit_scale_migration = {
+                "mode": "verified_contract_no_legacy_frond_state",
+                "restored_generator_properties": [],
+            }
     material_groups = manifest.get("material_groups") or [
         {
             "collection": manifest.get("source_collection", props.collection_name),
@@ -1814,6 +4322,44 @@ def _export_or_update_speedtree_spm_path_impl(
             "meshes": manifest.get("meshes", []),
         }
     ]
+
+    adoption = None
+    adoption_migration = None
+    if adopt_source_material:
+        if allow_create:
+            raise RuntimeError("Source-material adoption requires an existing target SPM.")
+        if len(source_material_names or []) != 1 or len(material_groups) != 1:
+            raise RuntimeError(
+                "Source-material adoption requires one source material and one generated material group."
+            )
+        source_name = str(source_material_names[0])
+        generated_name = str(material_groups[0].get("material") or "")
+        if generated_name != source_name:
+            raise RuntimeError(
+                "In-place source-material adoption requires generated and source material names to match."
+            )
+        requested_source_id = None
+        if isinstance(source_material_ids, dict):
+            requested_source_id = source_material_ids.get(source_name)
+        elif source_material_ids:
+            if len(source_material_ids) != 1:
+                raise RuntimeError("Source-material adoption requires exactly one source material ID.")
+            requested_source_id = source_material_ids[0]
+        adoption_migration = migrate_previous_scope_material_for_adoption(
+            target_spm,
+            previous_manifest,
+            source_name,
+            requested_source_id,
+        )
+        adoption = prepare_source_material_adoption(
+            target_spm,
+            manifest,
+            source_name,
+            requested_source_id,
+            previous_manifest,
+        )
+        if adoption_migration is not None:
+            adoption["migrated_previous_scope"] = adoption_migration
 
     group_results = []
     for group in material_groups:
@@ -1828,6 +4374,14 @@ def _export_or_update_speedtree_spm_path_impl(
             group_manifest,
             material_name,
             allow_create=allow_create,
+            adopt_source_material_id=(
+                adoption.get("material_id") if adoption is not None else None
+            ),
+            adopt_reusable_mesh_ids=(
+                (adoption_migration or {}).get("reusable_mesh_ids")
+                if adoption is not None
+                else None
+            ),
         )
         group["material_id"] = material_id
         group["mesh_ids"] = mesh_ids
@@ -1850,17 +4404,62 @@ def _export_or_update_speedtree_spm_path_impl(
             source_material_names,
             material_groups,
             source_material_ids,
+            previous_bindings=(
+                (previous_manifest.get("generator_connection") or {}).get("bindings")
+                or []
+            ),
+            source_mesh_ids_by_name=(
+                {adoption["material_name"]: adoption_original_mesh_ids(adoption)}
+                if adoption is not None
+                else None
+            ),
+            generator_variant_policy=generator_variant_policy,
         )
     else:
         generator_connection = {
             "requested": False,
             "complete": False,
+            "generator_variant_policy": generator_variant_policy,
             "source_material_names": [],
             "matched_generators": 0,
             "changed_slot_pairs": 0,
             "already_connected_slot_pairs": 0,
+            "created_slot_pairs": 0,
+            "repaired_variant_slot_schemas": [],
             "bindings": [],
         }
+    if manifest.get("unit_probe_contract"):
+        generator_scale_normalization = {
+            "mode": "verified_common_unit_contract_no_generator_scaling",
+            "geometry_scale": float(manifest.get("mesh_geometry_scale", 1.0)),
+            "mesh_asset_scale": float(manifest.get("mesh_asset_scale", 1.0)),
+            "generator_scale": 1.0,
+            "changed": False,
+            "generators": [],
+            "production_generator_size_policy": (
+                "preserve_user_authored_leaf_size_and_frond_width_height"
+            ),
+            "manual_art_direction_adjustment_required": True,
+        }
+    else:
+        generator_scale_normalization = (
+            normalize_connected_frond_generator_geometry_scale(
+                target_spm,
+                generator_connection,
+                previous_manifest,
+                manifest.get("mesh_geometry_scale", 1.0),
+            )
+        )
+
+    if adoption is not None:
+        generated_ids = [
+            mesh_id for group in group_results for mesh_id in group["mesh_ids"]
+        ]
+        adoption = finalize_source_material_adoption(
+            target_spm,
+            adoption,
+            generated_ids,
+        )
 
     cleanup = cleanup_stale_spm_assets(
         target_spm,
@@ -1879,7 +4478,16 @@ def _export_or_update_speedtree_spm_path_impl(
     manifest["speedtree_material_groups"] = group_results
     manifest["material_id"] = material_id
     manifest["mesh_ids"] = mesh_ids
+    manifest["generator_variant_policy"] = generator_variant_policy
     manifest["generator_connection"] = generator_connection
+    manifest["generator_scale_normalization"] = generator_scale_normalization
+    manifest["unit_scale_migration"] = unit_scale_migration
+    if manifest.get("unit_probe_contract"):
+        manifest["production_generator_size_policy"] = (
+            "preserve_user_authored_leaf_size_and_frond_width_height"
+        )
+        manifest["manual_art_direction_adjustment_required"] = True
+    manifest["source_material_adoption"] = adoption
     manifest["removed_stale_spm_assets"] = cleanup
     manifest["target_manifest"] = str(target_manifest_path(target_spm))
     Path(manifest_path).write_text(json.dumps(manifest, indent=2), encoding="utf-8")
@@ -1909,6 +4517,8 @@ def export_or_update_speedtree_spm_path(
     atlas_asset_name=None,
     source_material_names=None,
     source_material_ids=None,
+    adopt_source_material=False,
+    generator_variant_policy=None,
     allow_create=False,
 ):
     """Export/update one target SPM as an all-or-nothing SPM transaction."""
@@ -1922,6 +4532,8 @@ def export_or_update_speedtree_spm_path(
             atlas_asset_name=atlas_asset_name,
             source_material_names=source_material_names,
             source_material_ids=source_material_ids,
+            adopt_source_material=adopt_source_material,
+            generator_variant_policy=generator_variant_policy,
             allow_create=allow_create,
         )
     except Exception:
@@ -1954,6 +4566,10 @@ def export_or_update_speedtree_spm_targets(props):
             atlas_asset_name=atlas_asset_name,
             source_material_names=source_request.get("source_material_names"),
             source_material_ids=source_request.get("source_material_ids"),
+            adopt_source_material=bool(source_request.get("adopt_source_material")),
+            generator_variant_policy=source_request.get(
+                "generator_variant_policy"
+            ),
             allow_create=allow_create,
         )
         manifest = read_json_file(manifest_path, {})

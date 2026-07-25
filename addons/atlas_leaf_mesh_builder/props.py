@@ -6,6 +6,7 @@ from bpy.props import BoolProperty, CollectionProperty, EnumProperty, FloatPrope
 from bpy.types import PropertyGroup
 
 from .constants import DEFAULT_ALBEDO, DEFAULT_ALPHA, DEFAULT_PAIRS, default_output_dir, default_speedtree_spm_path
+from .target_registry import load_target_registry, save_target_registry
 from .texture_paths import matching_alpha_path
 
 
@@ -58,6 +59,46 @@ def ensure_spm_target_items(props):
     if path and Path(path).suffix.lower() == ".spm":
         item = props.speedtree_spm_items.add()
         item.path = path
+
+
+def save_spm_target_registry(props):
+    blend_path = bpy.data.filepath
+    if not blend_path or Path(blend_path).suffix.lower() != ".blend":
+        return None
+    targets = [
+        str(Path(bpy.path.abspath(item.path)).absolute())
+        for item in props.speedtree_spm_items
+        if item.path
+    ]
+    return save_target_registry(blend_path, targets)
+
+
+def sync_spm_target_registry(props, initialize_missing=False):
+    """Make the scene list follow its per-blend JSON sidecar when present."""
+    blend_path = bpy.data.filepath
+    if not blend_path or Path(blend_path).suffix.lower() != ".blend":
+        ensure_spm_target_items(props)
+        return None
+
+    registry = load_target_registry(blend_path)
+    if registry is None:
+        ensure_spm_target_items(props)
+        if initialize_missing and len(props.speedtree_spm_items):
+            return save_spm_target_registry(props)
+        return None
+
+    current = [
+        normalized_path_text(item.path)
+        for item in props.speedtree_spm_items
+        if item.path
+    ]
+    target_keys = [normalized_path_text(path) for path in registry["target_spms"]]
+    if current != target_keys:
+        props.speedtree_spm_items.clear()
+        for path in registry["target_spms"]:
+            item = props.speedtree_spm_items.add()
+            item.path = path
+    return registry
 
 
 def add_spm_target_item(props, path_text):
@@ -264,6 +305,26 @@ class ATLASLEAF_Properties(PropertyGroup):
         soft_max=1.0,
         precision=6,
         description="Multiplier applied to exported FBX mesh geometry; SpeedTree Mesh Scale stays 1",
+    )
+    speedtree_mesh_asset_scale: FloatProperty(
+        name="SpeedTree Mesh Asset Scale",
+        default=1.0,
+        min=0.000001,
+        soft_max=1.0,
+        precision=6,
+        description=(
+            "Value written to each generated SpeedTree Mesh asset Scale field; "
+            "keep separate from FBX geometry scaling to avoid applying the conversion twice"
+        ),
+    )
+    speedtree_unit_probe_contract_json: StringProperty(
+        name="Verified Unit Probe Contract",
+        default="",
+        description=(
+            "Verified role-independent Blender FBX to SpeedTree unit contract. "
+            "Production physical-capture builds require this receipt and reject "
+            "duplicate geometry, Mesh asset, or generator scaling."
+        ),
     )
     speedtree_anchor_export_mode: EnumProperty(
         name="Anchor Export",

@@ -8,7 +8,9 @@ ROLE_TOKENS = {
     "alpha": ("opacity", "alpha", "cutout", "mask"),
     "height": ("height", "displacement", "disp"),
     "normal": ("normal", "norm", "nrm"),
+    "gloss": ("gloss", "glossiness", "smoothness"),
     "roughness": ("roughness", "rough"),
+    "ao": ("ambient_occlusion", "ambientocclusion", "ao", "occlusion"),
     "translucency": (
         "translucency",
         "translucent",
