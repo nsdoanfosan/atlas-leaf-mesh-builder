@@ -134,6 +134,7 @@ def configure_external_plan_target(
     mesh_asset_scale=1.0,
     generator_variant_policy=None,
     unit_probe_contract=None,
+    connect_generators=True,
 ):
     """Configure Atlas' existing public scene contract for an external plan collection.
 
@@ -150,12 +151,21 @@ def configure_external_plan_target(
     if not source_material_name:
         raise ValueError("Source SpeedTree material name cannot be empty.")
     adopt_source_material = bool(adopt_source_material)
-    if generated_material_name == source_material_name and not adopt_source_material:
+    connect_generators = bool(connect_generators)
+    if (
+        connect_generators
+        and generated_material_name == source_material_name
+        and not adopt_source_material
+    ):
         raise ValueError(
             "Generated Atlas material must differ from the unmanaged source material "
             "unless explicit in-place adoption is enabled."
         )
-    if adopt_source_material and generated_material_name != source_material_name:
+    if (
+        connect_generators
+        and adopt_source_material
+        and generated_material_name != source_material_name
+    ):
         raise ValueError(
             "In-place adoption requires generated and source material names to match."
         )
@@ -245,15 +255,16 @@ def configure_external_plan_target(
             raise ValueError(f"Generator Source Mapping is not valid JSON: {exc}") from exc
         if not isinstance(mapping, dict):
             raise ValueError("Generator Source Mapping must be a JSON object.")
-        request = {
-            "source_material_names": [source_material_name],
-            "generator_variant_policy": generator_variant_policy,
-        }
-        if source_material_id is not None:
-            request["source_material_ids"] = [int(source_material_id)]
-        if adopt_source_material:
-            request["adopt_source_material"] = True
-        mapping[str(target)] = request
+        if connect_generators:
+            request = {
+                "source_material_names": [source_material_name],
+                "generator_variant_policy": generator_variant_policy,
+            }
+            if source_material_id is not None:
+                request["source_material_ids"] = [int(source_material_id)]
+            if adopt_source_material:
+                request["adopt_source_material"] = True
+            mapping[str(target)] = request
         props.speedtree_source_materials_json = json.dumps(mapping, ensure_ascii=False)
         save_spm_target_registry(props)
 
@@ -282,6 +293,7 @@ def configure_external_plan_target(
             else None
         ),
         "adopt_source_material": adopt_source_material,
+        "connect_generators": connect_generators,
         "generator_variant_policy": generator_variant_policy,
         "export_scope_id": export_scope_id,
         "build_operator": "atlas_leaf.build_speedtree_spm",

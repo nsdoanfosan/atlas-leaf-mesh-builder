@@ -745,6 +745,254 @@ def generator_variant_slot_descriptor(pair):
     return parent_name, int(match.group(1))
 
 
+def generator_guid(generator):
+    return str(
+        generator.findtext("GUID")
+        or generator.attrib.get("GUID")
+        or ""
+    ).strip()
+
+
+def generator_type_name(generator):
+    return str(
+        generator.attrib.get("Type")
+        or generator.findtext("Type")
+        or ""
+    ).strip()
+
+
+def binding_variant_parent_name(binding):
+    parent_name = str(
+        binding.get("variant_parent_property") or ""
+    ).strip()
+    if parent_name:
+        return parent_name
+    match = re.fullmatch(
+        r"(?P<parent>.+):\d+",
+        str(binding.get("slot_prefix") or "").strip(),
+    )
+    return match.group("parent") if match else ""
+
+
+def _generator_slot_property_names(generator):
+    properties = generator.find("Properties")
+    if properties is None:
+        return set()
+    return {
+        str(prop.findtext("Name") or "").strip()
+        for prop in list(properties)
+        if str(prop.findtext("Name") or "").strip()
+    }
+
+
+def _generator_slot_pair(generator, slot_prefix):
+    properties = generator.find("Properties")
+    if properties is None:
+        return None
+    values = {
+        str(prop.findtext("Name") or "").strip(): integer_value(
+            prop.findtext("Value")
+        )
+        for prop in list(properties)
+    }
+    material_name = f"{slot_prefix}:Material"
+    mesh_name = f"{slot_prefix}:Mesh"
+    if material_name not in values or mesh_name not in values:
+        return None
+    return values[material_name], values[mesh_name]
+
+
+def resolve_generator_binding(
+    root,
+    binding,
+    *,
+    context="Generator binding",
+    allow_missing=False,
+):
+    """Resolve one persisted binding to the current Generator identity.
+
+    Generator order is not stable when an SPM is regenerated. New manifests
+    use GUID. Legacy manifests without GUID first use one unique
+    name+type+slot-schema match, then a unique current Material/Mesh slot-value
+    match. The recorded index is diagnostic evidence and is never sufficient
+    by itself. A missing persisted Generator may be treated as a tombstone by
+    cleanup/update callers; it is never guessed from another same-type node.
+    """
+    if not isinstance(binding, dict):
+        raise RuntimeError(f"{context} is not an object.")
+    generators = list(root.iter("Generator"))
+    recorded_guid = str(binding.get("generator_guid") or "").strip()
+    recorded_name = str(binding.get("generator_name") or "").strip()
+    recorded_type = str(binding.get("generator_type") or "").strip()
+    recorded_type_key = normalized_generator_type(recorded_type)
+    slot_prefix = str(binding.get("slot_prefix") or "").strip()
+    parent_name = binding_variant_parent_name(binding)
+
+    if recorded_guid:
+        matches = [
+            (index, generator)
+            for index, generator in enumerate(generators)
+            if generator_guid(generator) == recorded_guid
+        ]
+        resolution = "guid"
+    else:
+        if not recorded_name or not (recorded_type_key or slot_prefix):
+            raise RuntimeError(
+                f"{context} has no GUID and its legacy name plus type/slot "
+                "identity is incomplete."
+            )
+        matches = []
+        for index, generator in enumerate(generators):
+            if str(generator.findtext("Name") or "").strip() != recorded_name:
+                continue
+            actual_type = generator_type_name(generator)
+            if (
+                recorded_type_key
+                and normalized_generator_type(actual_type)
+                != recorded_type_key
+            ):
+                continue
+            names = _generator_slot_property_names(generator)
+            if slot_prefix and (
+                f"{slot_prefix}:Material" not in names
+                or f"{slot_prefix}:Mesh" not in names
+            ):
+                continue
+            matches.append((index, generator))
+        resolution = "legacy_name_type_slot"
+
+        if not matches and slot_prefix:
+            expected_pairs = {
+                pair
+                for pair in (
+                    (
+                        integer_value(binding.get("target_material_id")),
+                        integer_value(binding.get("target_mesh_id")),
+                    ),
+                    (
+                        integer_value(binding.get("source_material_id")),
+                        integer_value(binding.get("source_mesh_id")),
+                    ),
+                )
+                if pair[0] is not None and pair[1] is not None
+            }
+            property_matches = []
+            if expected_pairs:
+                for index, generator in enumerate(generators):
+                    actual_type = generator_type_name(generator)
+                    if (
+                        recorded_type_key
+                        and normalized_generator_type(actual_type)
+                        != recorded_type_key
+                    ):
+                        continue
+                    expected_parent = generator_variant_parent_name(actual_type)
+                    if parent_name and expected_parent != parent_name:
+                        continue
+                    if (
+                        _generator_slot_pair(generator, slot_prefix)
+                        in expected_pairs
+                    ):
+                        property_matches.append((index, generator))
+            if len(property_matches) == 1:
+                matches = property_matches
+                resolution = "legacy_type_slot_values"
+
+    if len(matches) != 1:
+        if (
+            len(matches) == 0
+            and allow_missing
+            and not binding.get("created_slot")
+        ):
+            return None
+        identity = (
+            f"GUID {recorded_guid!r}"
+            if recorded_guid
+            else (
+                f"name={recorded_name!r}, type={recorded_type or '?'}"
+                f", slot={slot_prefix or '?'}"
+            )
+        )
+        raise RuntimeError(
+            f"{context} could not resolve exactly one current Generator by "
+            f"{identity}; found {len(matches)}."
+        )
+
+    generator_index, generator = matches[0]
+    actual_name = str(generator.findtext("Name") or "").strip()
+    actual_type = generator_type_name(generator)
+    actual_type_key = normalized_generator_type(actual_type)
+    if recorded_type_key and actual_type_key != recorded_type_key:
+        raise RuntimeError(
+            f"{context} resolved to Generator '{actual_name}' type "
+            f"{actual_type!r}, expected {recorded_type!r}."
+        )
+    expected_parent = generator_variant_parent_name(actual_type)
+    if parent_name and expected_parent != parent_name:
+        raise RuntimeError(
+            f"{context} parent {parent_name!r} is incompatible with current "
+            f"Generator '{actual_name}' type {actual_type!r} "
+            f"(expected {expected_parent!r})."
+        )
+    names = _generator_slot_property_names(generator)
+    if slot_prefix and (
+        f"{slot_prefix}:Material" not in names
+        or f"{slot_prefix}:Mesh" not in names
+    ):
+        raise RuntimeError(
+            f"{context} resolved Generator '{actual_name}', but slot "
+            f"{slot_prefix!r} is missing its Material/Mesh pair."
+        )
+    return {
+        "generator": generator,
+        "generator_index": generator_index,
+        "generator_name": actual_name,
+        "generator_guid": generator_guid(generator),
+        "generator_type": actual_type,
+        "resolution": resolution,
+    }
+
+
+def normalize_generator_bindings(
+    root,
+    bindings,
+    *,
+    context="Generator binding",
+    allow_missing=False,
+):
+    """Return bindings rewritten to stable current Generator identities."""
+    normalized = []
+    for ordinal, binding in enumerate(bindings or []):
+        if not isinstance(binding, dict):
+            raise RuntimeError(f"{context} #{ordinal + 1} is not an object.")
+        identity = resolve_generator_binding(
+            root,
+            binding,
+            context=f"{context} #{ordinal + 1}",
+            allow_missing=allow_missing,
+        )
+        if identity is None:
+            continue
+        row = copy.deepcopy(binding)
+        row["generator_index"] = identity["generator_index"]
+        row["generator_name"] = identity["generator_name"]
+        row["generator_type"] = identity["generator_type"]
+        if identity["generator_guid"]:
+            row["generator_guid"] = identity["generator_guid"]
+        normalized.append(row)
+    return normalized
+
+
+def generator_binding_slot_key(binding):
+    guid = str(binding.get("generator_guid") or "").strip()
+    identity = (
+        ("guid", guid)
+        if guid
+        else ("index", integer_value(binding.get("generator_index")))
+    )
+    return identity, str(binding.get("slot_prefix") or "")
+
+
 def generator_variant_parent_state(generator, parent_name):
     properties = generator.find("Properties")
     if properties is None:
@@ -925,6 +1173,12 @@ def append_generator_variant_slots(
 
 def repair_created_generator_variant_slots(root, bindings):
     """Repair old Atlas-created tail slots from their authored source schema."""
+    bindings = normalize_generator_bindings(
+        root,
+        bindings,
+        context="Created Generator variant repair binding",
+        allow_missing=True,
+    )
     generators = list(root.iter("Generator"))
     groups = {}
     for binding in bindings or []:
@@ -1046,6 +1300,8 @@ def repair_created_generator_variant_slots(root, bindings):
                 {
                     "generator_index": generator_index,
                     "generator_name": str(generator.findtext("Name") or ""),
+                    "generator_guid": generator_guid(generator),
+                    "generator_type": generator_type_name(generator),
                     "slot_prefix": slot_prefix,
                     "created_property_names": [
                         item["name"]
@@ -1064,6 +1320,12 @@ def repair_created_generator_variant_slots(root, bindings):
 
 def remove_created_generator_variant_slots(root, bindings):
     """Remove only tail slots whose creation provenance is fully recorded."""
+    bindings = normalize_generator_bindings(
+        root,
+        bindings,
+        context="Created Generator variant removal binding",
+        allow_missing=True,
+    )
     generators = list(root.iter("Generator"))
     groups = {}
     for binding in bindings or []:
@@ -1177,6 +1439,8 @@ def remove_created_generator_variant_slots(root, bindings):
                 {
                     "generator_index": generator_index,
                     "generator_name": str(generator.findtext("Name") or ""),
+                    "generator_guid": generator_guid(generator),
+                    "generator_type": generator_type_name(generator),
                     "slot_prefix": slot_prefix,
                     "material_id": positive_int(
                         binding.get("source_material_id")
@@ -1218,6 +1482,7 @@ def spm_generator_property_pairs(root, allowed_types=None):
                     "generator": generator,
                     "generator_index": generator_index,
                     "generator_name": str(generator.findtext("Name") or ""),
+                    "generator_guid": generator_guid(generator),
                     "generator_type": generator_type,
                     "slot_prefix": prefix,
                     "material_property": material_property,
@@ -1368,10 +1633,12 @@ def connect_atlas_generators_in_spm(
     The source material's CutoutMeshID/SupplementalCutoutMeshIDs order is the
     stable leaf ordinal. Exported Blender source objects named leaf_NN select
     the generated material/mesh pair for that ordinal. The opt-in
-    ``ensure_all_material_cutouts`` policy creates only missing tail slots on
-    one existing supported multi-property parent. Coverage is evaluated across
-    all matching Generators so authored duplicate slots and their weights stay
-    intact.
+    ``ensure_all_material_cutouts`` policy ensures that every *generated*
+    ordinal has a real Generator slot; source cutouts with no normalized output
+    remain authored source variants. Missing generated ordinals create only
+    tail slots on one existing supported multi-property parent. Coverage is
+    evaluated across all matching Generators so authored duplicate slots and
+    their weights stay intact.
     """
     variant_policy = normalize_generator_variant_policy(
         generator_variant_policy
@@ -1394,9 +1661,15 @@ def connect_atlas_generators_in_spm(
         (item["target_material_id"], item["target_mesh_id"]): item
         for item in output_bindings.values()
     }
+    normalized_previous_bindings = normalize_generator_bindings(
+        root,
+        previous_bindings,
+        context="Previous Atlas Generator binding",
+        allow_missing=True,
+    )
     previous_by_slot = {
         (integer_value(item.get("generator_index")), item.get("slot_prefix")): item
-        for item in previous_bindings or []
+        for item in normalized_previous_bindings
         if isinstance(item, dict)
     }
     variant_schema_repairs = []
@@ -1407,7 +1680,7 @@ def connect_atlas_generators_in_spm(
     ):
         variant_schema_repairs = repair_created_generator_variant_slots(
             root,
-            previous_bindings,
+            normalized_previous_bindings,
         )
         repair_by_slot = {
             (item["generator_index"], item["slot_prefix"]): item
@@ -1425,13 +1698,17 @@ def connect_atlas_generators_in_spm(
                 "material per target request."
             )
         source_material_id, source = next(iter(source_records.items()))
-        expected_ordinals = set(range(1, len(source["mesh_ids"]) + 1))
-        missing_outputs = sorted(expected_ordinals - set(output_bindings))
-        if missing_outputs:
+        expected_ordinals = set(output_bindings)
+        invalid_output_ordinals = sorted(
+            ordinal
+            for ordinal in expected_ordinals
+            if ordinal > len(source["mesh_ids"])
+        )
+        if invalid_output_ordinals:
             raise RuntimeError(
-                "Generator variant coverage cannot map source cutout ordinal(s) "
-                + ", ".join(str(value) for value in missing_outputs)
-                + " because no generated atlas output exists."
+                "Generated atlas output ordinal(s) exceed the source material "
+                "cutout registry: "
+                + ", ".join(str(value) for value in invalid_output_ordinals)
             )
 
         generator_groups = {}
@@ -1558,8 +1835,18 @@ def connect_atlas_generators_in_spm(
                 ordinal = source["mesh_ids"].index(mesh_id) + 1
             target = output_bindings.get(ordinal)
             if target is None:
+                if (
+                    variant_policy
+                    == GENERATOR_VARIANT_POLICY_ENSURE_ALL_MATERIAL_CUTOUTS
+                ):
+                    # This authored source variant has no normalized output in
+                    # the current blend. Preserve it; the opt-in coverage
+                    # policy is output-complete, not a demand to replace every
+                    # source cutout.
+                    continue
                 raise RuntimeError(
-                    f"Generator '{pair['generator_name']}' needs leaf_{ordinal:02d}, but that atlas mesh was not exported."
+                    f"Generator '{pair['generator_name']}' needs "
+                    f"leaf_{ordinal:02d}, but that atlas mesh was not exported."
                 )
             staged.append((pair, source, mesh_id, target, sentinel_policy))
             continue
@@ -1586,6 +1873,7 @@ def connect_atlas_generators_in_spm(
             "state": "changed",
             "generator_index": pair["generator_index"],
             "generator_name": pair["generator_name"],
+            "generator_guid": pair["generator_guid"],
             "generator_type": pair["generator_type"],
             "slot_prefix": pair["slot_prefix"],
             "source_material_id": positive_int(
@@ -1617,6 +1905,7 @@ def connect_atlas_generators_in_spm(
             "state": "already_connected",
             "generator_index": pair["generator_index"],
             "generator_name": pair["generator_name"],
+            "generator_guid": pair["generator_guid"],
             "generator_type": pair["generator_type"],
             "slot_prefix": pair["slot_prefix"],
             "source_material_id": (
@@ -1658,11 +1947,11 @@ def connect_atlas_generators_in_spm(
         write_spm_xml(spm_path, root)
     validated_root = read_spm_xml(spm_path)
     validated_pairs = {
-        (pair["generator_index"], pair["slot_prefix"]): pair
+        generator_binding_slot_key(pair): pair
         for pair in spm_generator_property_pairs(validated_root, {"Leaf Mesh", "Frond"})
     }
     for binding in bindings:
-        pair = validated_pairs.get((binding["generator_index"], binding["slot_prefix"]))
+        pair = validated_pairs.get(generator_binding_slot_key(binding))
         if pair is None or pair["mesh_property"] is None:
             raise RuntimeError("Generator connection validation failed: slot pair disappeared after write.")
         material_id = positive_int(pair["material_property"].findtext("Value"))
@@ -1676,8 +1965,7 @@ def connect_atlas_generators_in_spm(
         variant_policy
         == GENERATOR_VARIANT_POLICY_ENSURE_ALL_MATERIAL_CUTOUTS
     ):
-        source = next(iter(source_records.values()))
-        expected_ordinals = set(range(1, len(source["mesh_ids"]) + 1))
+        expected_ordinals = set(output_bindings)
         connected_ordinals = {
             positive_int(binding.get("leaf_ordinal"))
             for binding in bindings
@@ -1797,12 +2085,12 @@ def normalize_connected_frond_generator_geometry_scale(
     factor = float(mesh_geometry_scale)
     if factor <= 0.0:
         raise RuntimeError("Frond generator geometry scale must be greater than zero.")
-    bindings = [
+    raw_bindings = [
         binding
         for binding in (generator_connection or {}).get("bindings") or []
         if str(binding.get("generator_type") or "").casefold() == "frond"
     ]
-    if not bindings:
+    if not raw_bindings:
         return {
             "mode": "bake_external_geometry_scale_into_frond_shape",
             "geometry_scale": factor,
@@ -1811,6 +2099,12 @@ def normalize_connected_frond_generator_geometry_scale(
         }
 
     root = read_spm_xml(spm_path)
+    bindings = normalize_generator_bindings(
+        root,
+        raw_bindings,
+        context="Connected Frond scale binding",
+        allow_missing=True,
+    )
     generators = list(root.iter("Generator"))
     previous_rows = {
         str(row.get("generator_guid") or ""): row
@@ -2081,14 +2375,75 @@ def prepare_source_material_adoption(
     }
 
 
-def finalize_source_material_adoption(spm_path, adoption, generated_mesh_ids):
-    """Remove replaced source Mesh assets only after every Generator has moved."""
+def finalize_source_material_adoption(
+    spm_path,
+    adoption,
+    generated_mesh_ids,
+    generator_connection=None,
+):
+    """Replace only source ordinals that have generated atlas outputs.
+
+    A normalized blend may intentionally export fewer variants than the source
+    Material owns. The final adopted Material therefore keeps its original
+    ordinal registry, substitutes generated IDs only at bound ordinals, and
+    deletes only the source Mesh assets that were actually replaced.
+    """
     generated_mesh_ids = [positive_int(value) for value in generated_mesh_ids]
     if not generated_mesh_ids or any(value is None for value in generated_mesh_ids):
         raise RuntimeError("Source-material adoption has invalid generated mesh IDs.")
     original_mesh_ids = adoption_original_mesh_ids(adoption)
     if set(original_mesh_ids).intersection(generated_mesh_ids):
         raise RuntimeError("Adopted plans must use fresh Mesh IDs; source IDs cannot be reused.")
+
+    generated_set = set(generated_mesh_ids)
+    generated_by_ordinal = {}
+    for binding in (generator_connection or {}).get("bindings") or []:
+        ordinal = positive_int(binding.get("leaf_ordinal"))
+        target_mesh_id = positive_int(binding.get("target_mesh_id"))
+        if ordinal is None or target_mesh_id not in generated_set:
+            continue
+        previous = generated_by_ordinal.get(ordinal)
+        if previous is not None and previous != target_mesh_id:
+            raise RuntimeError(
+                "Generator bindings disagree about the generated Mesh for "
+                f"source ordinal {ordinal}: {previous} vs {target_mesh_id}."
+            )
+        generated_by_ordinal[ordinal] = target_mesh_id
+    if not generated_by_ordinal:
+        generated_by_ordinal = {
+            ordinal: mesh_id
+            for ordinal, mesh_id in enumerate(generated_mesh_ids, 1)
+        }
+    invalid_ordinals = sorted(
+        ordinal
+        for ordinal in generated_by_ordinal
+        if ordinal > len(original_mesh_ids)
+    )
+    if invalid_ordinals:
+        raise RuntimeError(
+            "Generated adoption ordinal exceeds the original source cutout "
+            "registry: " + ", ".join(str(value) for value in invalid_ordinals)
+        )
+    if set(generated_by_ordinal.values()) != generated_set:
+        missing = sorted(generated_set - set(generated_by_ordinal.values()))
+        raise RuntimeError(
+            "Generator connection does not cover every generated adoption Mesh: "
+            + ", ".join(str(value) for value in missing)
+        )
+    final_material_mesh_ids = [
+        generated_by_ordinal.get(ordinal, source_mesh_id)
+        for ordinal, source_mesh_id in enumerate(original_mesh_ids, 1)
+    ]
+    replaced_original_mesh_ids = [
+        source_mesh_id
+        for ordinal, source_mesh_id in enumerate(original_mesh_ids, 1)
+        if ordinal in generated_by_ordinal
+    ]
+    preserved_original_mesh_ids = [
+        source_mesh_id
+        for ordinal, source_mesh_id in enumerate(original_mesh_ids, 1)
+        if ordinal not in generated_by_ordinal
+    ]
 
     root = read_spm_xml(spm_path)
     assets = root.find("Assets")
@@ -2103,14 +2458,18 @@ def finalize_source_material_adoption(spm_path, adoption, generated_mesh_ids):
     )
     if material is None or spm_material_mesh_ids(material) != generated_mesh_ids:
         raise RuntimeError("Adopted source material does not own the expected generated plan meshes.")
+    update_spm_material_mesh_ids(material, final_material_mesh_ids)
+    write_spm_xml(spm_path, root)
 
+    root = read_spm_xml(spm_path)
+    assets = root.find("Assets")
     material_references = set()
     for node in assets.findall("Material_v8"):
         material_references.update(spm_material_mesh_ids(node))
     generator_references = spm_generator_referenced_mesh_ids(root)
     blocked = sorted(
         mesh_id
-        for mesh_id in original_mesh_ids
+        for mesh_id in replaced_original_mesh_ids
         if mesh_id in material_references or mesh_id in generator_references
     )
     if blocked:
@@ -2122,23 +2481,50 @@ def finalize_source_material_adoption(spm_path, adoption, generated_mesh_ids):
     removed = []
     for node in list(assets.findall("Mesh")):
         mesh_id = positive_int(node.attrib.get("ID"))
-        if mesh_id in original_mesh_ids:
+        if mesh_id in replaced_original_mesh_ids:
             assets.remove(node)
             removed.append(mesh_id)
     if removed:
         write_spm_xml(spm_path, root)
 
-    validated_assets = read_spm_xml(spm_path).find("Assets")
+    validated_root = read_spm_xml(spm_path)
+    validated_assets = validated_root.find("Assets")
+    validated_material = next(
+        (
+            node
+            for node in validated_assets.findall("Material_v8")
+            if positive_int(node.attrib.get("ID"))
+            == positive_int(adoption.get("material_id"))
+            and node.attrib.get("Name") == adoption.get("material_name")
+        ),
+        None,
+    )
+    if (
+        validated_material is None
+        or spm_material_mesh_ids(validated_material)
+        != final_material_mesh_ids
+    ):
+        raise RuntimeError(
+            "Adopted source material lost its mixed generated/source ordinal registry."
+        )
     remaining = {
         positive_int(node.attrib.get("ID")) for node in validated_assets.findall("Mesh")
     }
-    stale = sorted(set(original_mesh_ids).intersection(remaining))
+    stale = sorted(set(replaced_original_mesh_ids).intersection(remaining))
     if stale:
         raise RuntimeError(f"Adopted source Mesh assets remain after deletion: {stale}")
+    missing_preserved = sorted(set(preserved_original_mesh_ids) - remaining)
+    if missing_preserved:
+        raise RuntimeError(
+            "Unreplaced source Mesh assets were lost during adoption: "
+            + ", ".join(str(value) for value in missing_preserved)
+        )
 
     record = copy.deepcopy(adoption)
     record["generated_mesh_ids"] = generated_mesh_ids
-    record["removed_original_mesh_ids"] = original_mesh_ids
+    record["removed_original_mesh_ids"] = replaced_original_mesh_ids
+    record["preserved_original_mesh_ids"] = preserved_original_mesh_ids
+    record["final_material_mesh_ids"] = final_material_mesh_ids
     return record
 
 
@@ -2200,7 +2586,15 @@ def migrate_previous_scope_material_for_adoption(
     }
     restored = []
     created_bindings = []
-    for binding in (previous_manifest.get("generator_connection") or {}).get("bindings") or []:
+    previous_bindings = normalize_generator_bindings(
+        root,
+        (previous_manifest.get("generator_connection") or {}).get(
+            "bindings"
+        ) or [],
+        context="Previous Atlas scope migration binding",
+        allow_missing=True,
+    )
+    for binding in previous_bindings:
         if positive_int(binding.get("target_material_id")) != legacy_id:
             continue
         key = (binding.get("generator_index"), binding.get("slot_prefix"))
@@ -2468,9 +2862,17 @@ def remove_atlas_scope_assets_from_spm(spm_path, manifests):
         for pair in spm_generator_property_pairs(root, {"Leaf Mesh", "Frond"})
     }
     reversible = {}
-    for manifest in manifests:
+    for manifest_index, manifest in enumerate(manifests):
         connection = manifest.get("generator_connection") or {}
-        for binding in connection.get("bindings") or []:
+        normalized_bindings = normalize_generator_bindings(
+            root,
+            connection.get("bindings") or [],
+            context=(
+                f"Atlas scope removal manifest #{manifest_index + 1} binding"
+            ),
+            allow_missing=True,
+        )
+        for binding in normalized_bindings:
             if not isinstance(binding, dict):
                 continue
             target_material_id = positive_int(binding.get("target_material_id"))
@@ -3382,26 +3784,48 @@ def canonical_new_atlas_asset_name(value):
     return name
 
 
-def blender_material_base_name(root_collection, atlas_asset_name=None):
+def blender_material_base_name(
+    root_collection,
+    atlas_asset_name=None,
+    *,
+    preserve_explicit_material_name=False,
+):
     if atlas_asset_name:
         # Canonicalization is intentionally limited to an explicit new output
         # request. Opening a legacy M_cluster blend does not silently rename its
         # already-authored SpeedTree material.
+        if preserve_explicit_material_name:
+            return sanitize_filename_component(atlas_asset_name, "AtlasLeaf")
         return canonical_new_atlas_asset_name(atlas_asset_name)
     if bpy.data.filepath:
         return Path(bpy.data.filepath).stem
     return sanitize_filename_component(root_collection.name.strip(), "AtlasLeaf")
 
 
-def material_name_from_collection(root_collection, collection=None, atlas_asset_name=None):
-    base_name = blender_material_base_name(root_collection, atlas_asset_name)
+def material_name_from_collection(
+    root_collection,
+    collection=None,
+    atlas_asset_name=None,
+    *,
+    preserve_explicit_material_name=False,
+):
+    base_name = blender_material_base_name(
+        root_collection,
+        atlas_asset_name,
+        preserve_explicit_material_name=preserve_explicit_material_name,
+    )
     if collection is None or collection == root_collection:
         return base_name
     suffix = material_suffix_from_collection_name(collection.name)
     return f"{base_name}_{suffix}"
 
 
-def grouped_source_objects(root_collection, atlas_asset_name=None):
+def grouped_source_objects(
+    root_collection,
+    atlas_asset_name=None,
+    *,
+    preserve_explicit_material_name=False,
+):
     def is_export_source(obj):
         return obj.type == "MESH" and not obj.name.lower().startswith("codex_")
 
@@ -3422,7 +3846,14 @@ def grouped_source_objects(root_collection, atlas_asset_name=None):
             child_groups.append(
                 {
                     "collection": child.name,
-                    "material": material_name_from_collection(root_collection, child, atlas_asset_name),
+                    "material": material_name_from_collection(
+                        root_collection,
+                        child,
+                        atlas_asset_name,
+                        preserve_explicit_material_name=(
+                            preserve_explicit_material_name
+                        ),
+                    ),
                     "objects": objects,
                 }
             )
@@ -3431,7 +3862,13 @@ def grouped_source_objects(root_collection, atlas_asset_name=None):
         return [
             {
                 "collection": root_collection.name,
-                "material": material_name_from_collection(root_collection, atlas_asset_name=atlas_asset_name),
+                "material": material_name_from_collection(
+                    root_collection,
+                    atlas_asset_name=atlas_asset_name,
+                    preserve_explicit_material_name=(
+                        preserve_explicit_material_name
+                    ),
+                ),
                 "objects": direct_objects,
             }
         ]
@@ -3441,7 +3878,13 @@ def grouped_source_objects(root_collection, atlas_asset_name=None):
         groups.append(
             {
                 "collection": root_collection.name,
-                "material": material_name_from_collection(root_collection, atlas_asset_name=atlas_asset_name),
+                "material": material_name_from_collection(
+                    root_collection,
+                    atlas_asset_name=atlas_asset_name,
+                    preserve_explicit_material_name=(
+                        preserve_explicit_material_name
+                    ),
+                ),
                 "objects": direct_objects,
             }
         )
@@ -3661,7 +4104,13 @@ def physical_normalization_receipt_from_scene(scene):
     }
 
 
-def export_speedtree_assets(props, export_dir, atlas_asset_name=None):
+def export_speedtree_assets(
+    props,
+    export_dir,
+    atlas_asset_name=None,
+    *,
+    preserve_explicit_material_name=False,
+):
     collection = bpy.data.collections.get(props.collection_name)
     if not collection:
         raise RuntimeError(f"Collection not found: {props.collection_name}")
@@ -3674,7 +4123,11 @@ def export_speedtree_assets(props, export_dir, atlas_asset_name=None):
     texture_signature = texture_path_signature(texture_exports)
     export_scope_id = resolve_export_scope_id(collection, export_dir, texture_signature)
 
-    source_groups = grouped_source_objects(collection, atlas_asset_name)
+    source_groups = grouped_source_objects(
+        collection,
+        atlas_asset_name,
+        preserve_explicit_material_name=preserve_explicit_material_name,
+    )
     if not any(group["objects"] for group in source_groups):
         raise RuntimeError(f"No mesh objects in collection: {props.collection_name}")
     physical_hashes = {
@@ -3962,7 +4415,11 @@ def export_speedtree_assets(props, export_dir, atlas_asset_name=None):
         "blend_file": bpy.data.filepath,
         "texture_signature": texture_signature,
         "requested_atlas_asset_name": str(atlas_asset_name or ""),
-        "atlas_asset_name": blender_material_base_name(collection, atlas_asset_name),
+        "atlas_asset_name": blender_material_base_name(
+            collection,
+            atlas_asset_name,
+            preserve_explicit_material_name=preserve_explicit_material_name,
+        ),
         "speedtree_version_target": "10.1.0",
         "material": material_groups[0]["material"] if len(material_groups) == 1 else None,
         "material_groups": material_groups,
@@ -4251,6 +4708,7 @@ def _export_or_update_speedtree_spm_path_impl(
     adopt_source_material=False,
     generator_variant_policy=None,
     allow_create=False,
+    preserve_explicit_material_name=False,
 ):
     generator_variant_policy = normalize_generator_variant_policy(
         generator_variant_policy
@@ -4275,6 +4733,7 @@ def _export_or_update_speedtree_spm_path_impl(
         props,
         target_spm.parent,
         atlas_asset_name,
+        preserve_explicit_material_name=preserve_explicit_material_name,
     )
     manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
     fallback_manifest = previous_target_manifest or previous_global_manifest
@@ -4459,6 +4918,7 @@ def _export_or_update_speedtree_spm_path_impl(
             target_spm,
             adoption,
             generated_ids,
+            generator_connection,
         )
 
     cleanup = cleanup_stale_spm_assets(
@@ -4520,6 +4980,7 @@ def export_or_update_speedtree_spm_path(
     adopt_source_material=False,
     generator_variant_policy=None,
     allow_create=False,
+    preserve_explicit_material_name=False,
 ):
     """Export/update one target SPM as an all-or-nothing SPM transaction."""
     target_spm = Path(target_spm)
@@ -4535,6 +4996,7 @@ def export_or_update_speedtree_spm_path(
             adopt_source_material=adopt_source_material,
             generator_variant_policy=generator_variant_policy,
             allow_create=allow_create,
+            preserve_explicit_material_name=preserve_explicit_material_name,
         )
     except Exception:
         try:
@@ -4549,7 +5011,11 @@ def export_or_update_speedtree_spm_path(
         raise
 
 
-def export_or_update_speedtree_spm_targets(props):
+def export_or_update_speedtree_spm_targets(
+    props,
+    *,
+    preserve_explicit_material_name=False,
+):
     targets = speedtree_spm_targets(props)
     if not targets:
         raise RuntimeError("Add at least one target SPM.")
@@ -4571,6 +5037,7 @@ def export_or_update_speedtree_spm_targets(props):
                 "generator_variant_policy"
             ),
             allow_create=allow_create,
+            preserve_explicit_material_name=preserve_explicit_material_name,
         )
         manifest = read_json_file(manifest_path, {})
         results.append(

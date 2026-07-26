@@ -122,6 +122,19 @@ Removing a listed target is transactional. The add-on first writes an `_spm_back
 
 `Generator Source Mapping` is a JSON object keyed by absolute target SPM path. Each value is a list of exact source `Material_v8` names (or an object with `source_material_names` and optional same-order `source_material_ids`). After asset upsert, matching `Leaf Mesh`/`LeafMesh` and `Frond` Generator `:Material`/`:Mesh` slot pairs are replaced together. An exported mesh can provide an explicit `source_ordinal`; otherwise the `leaf_NN` suffix is used. SpeedTree's `Mesh=-10` sentinel maps deterministically to ordinal 1. The optional per-target `generator_variant_policy` accepts `preserve_existing_slots` (default) or `ensure_all_material_cutouts`. The opt-in policy checks coverage across all matching Generators, preserves authored duplicate/weight slots, and creates only missing tail slots on an existing `Leaves:Type` or `Material:Frond` multi-property parent; creation provenance is stored for idempotent rebuild and exact target removal. Setting `adopt_source_material` replaces the source material's cutout list in place while preserving its other authored fields: the original material and embedded meshes are stored in the managed manifest, Generator slots move before the now-unreferenced embedded meshes are removed, and target removal restores the captured source state. The target SPM is restored byte-for-byte if any group or connection validation fails.
 
+Persisted Generator bindings use the Generator `GUID` as their stable identity.
+`generator_index` is current-run diagnostic data only because SpeedTree may reorder
+Generators when an SPM is regenerated. A legacy binding without `generator_guid`
+first uses an exact name/type/slot-schema match. If the Generator was renamed, its
+current Material/Mesh slot values may migrate it only when they resolve to exactly
+one compatible Generator. A legacy non-created slot whose Generator no longer
+exists is treated as a deleted binding and is not reassigned to another same-type
+node. Missing Atlas-created slot provenance and ambiguous property matches remain
+fail-closed. Every resolved binding is rewritten with GUID.
+The schema matrix is strict: `Frond` uses `Material:Frond`, while
+`Leaf Mesh`/`LeafMesh` uses `Leaves:Type`. A binding may never carry provenance
+from one Generator type into the other.
+
 `FBX Geometry Scale` and `SpeedTree Mesh Asset Scale` are independent. The first changes exported FBX vertex coordinates; the second writes the external Mesh asset's `<Scale>` field in the SPM. Cluster Normalizer deliberately sends geometry scale `1.0` plus Mesh asset scale `0.01`, so the Blender 3D/plan relationship stays unchanged and the SpeedTree unit conversion happens exactly once. Do not set both fields to `0.01` for normalized clusters; that would apply a `0.0001` double conversion.
 
 Texture identity includes file contents, not only the path. Overwriting a camera atlas at the same path changes the Atlas manifest signature, and viewport Color/Opacity images are explicitly reloaded so the newly exported pixels are visible without renaming the maps.
