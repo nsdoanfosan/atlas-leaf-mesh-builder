@@ -184,6 +184,14 @@ class MeshAssetScaleTests(unittest.TestCase):
                         "generator_variant_policy": (
                             "ensure_all_material_cutouts"
                         ),
+                        "source_binding_repairs": [
+                            {
+                                "generator_guid": "stable-guid",
+                                "slot_prefix": "Material:Frond:0",
+                                "from_mesh_id": -9,
+                                "to_mesh_id": -10,
+                            }
+                        ],
                     }
                 }
             )
@@ -195,6 +203,10 @@ class MeshAssetScaleTests(unittest.TestCase):
         self.assertEqual(
             request["generator_variant_policy"],
             "ensure_all_material_cutouts",
+        )
+        self.assertEqual(
+            request["source_binding_repairs"][0]["generator_guid"],
+            "stable-guid",
         )
 
 
@@ -415,6 +427,81 @@ class GeneratorConnectionTests(unittest.TestCase):
         )
         self.assertTrue(result["complete"])
 
+    def test_minus9_source_binding_requires_hashed_exact_backup_evidence(self):
+        live_root = ET.Element("SpeedTreeModel")
+        live_assets = ET.SubElement(live_root, "Assets")
+        add_material(live_assets, 4, "M_branch", [6])
+        add_material(live_assets, 7, "M_branch_atlas", [63])
+        add_mesh(live_assets, 6)
+        add_mesh(live_assets, 63)
+        add_generator(live_root, "Frond", "Frond 4", [(4, -9)])
+        write_spm(self.spm_path, live_root)
+
+        evidence_path = Path(self.temp_dir.name) / "evidence.spm"
+        evidence_root = ET.Element("SpeedTreeModel")
+        evidence_assets = ET.SubElement(evidence_root, "Assets")
+        add_material(evidence_assets, 19, "M_branch", [132])
+        add_mesh(evidence_assets, 132)
+        add_generator(
+            evidence_root,
+            "Frond",
+            "Frond 4",
+            [(19, -10)],
+        )
+        write_spm(evidence_path, evidence_root)
+        repair = {
+            "generator_name": "Frond 4",
+            "generator_guid": "Frond:Frond 4",
+            "generator_type": "Frond",
+            "slot_prefix": "Material:Frond:0",
+            "source_material_name": "M_branch",
+            "source_material_id": 4,
+            "from_mesh_id": -9,
+            "to_mesh_id": -10,
+            "evidence": [
+                {
+                    "path": str(evidence_path),
+                    "sha256": speedtree.file_sha256(evidence_path),
+                }
+            ],
+        }
+        groups = [
+            {
+                "material": "M_branch_atlas",
+                "material_id": 7,
+                "mesh_ids": [63],
+                "meshes": [
+                    {
+                        "source_object": "branch_01",
+                        "source_ordinal": 1,
+                    }
+                ],
+            }
+        ]
+
+        result = speedtree.connect_atlas_generators_in_spm(
+            self.spm_path,
+            ["M_branch"],
+            groups,
+            [4],
+            source_binding_repairs=[repair],
+        )
+
+        self.assertEqual(
+            generator_values(self.spm_path)[
+                ("Frond 4", "Material:Frond:0")
+            ],
+            (7, 63),
+        )
+        self.assertEqual(
+            result["applied_source_binding_repairs"][0]["from_mesh_id"],
+            -9,
+        )
+        self.assertEqual(
+            result["bindings"][0]["source_mesh_id"],
+            -10,
+        )
+
     def test_explicit_source_ordinals_support_non_leaf_plan_names(self):
         groups = json.loads(json.dumps(self.groups))
         ordinal = 1
@@ -472,6 +559,106 @@ class GeneratorConnectionTests(unittest.TestCase):
             [binding["source_mesh_id"] for binding in second["bindings"]],
             [6, 7, 9, 10],
         )
+
+    def test_previous_generated_bindings_retarget_after_adopted_mesh_ids_change(self):
+        target = Path(self.temp_dir.name) / "SK_cluster_refresh.spm"
+        root = ET.Element("SpeedTreeModel")
+        assets = ET.SubElement(root, "Assets")
+        add_material(
+            assets,
+            1,
+            "M_cluster_Silky_Dogwood_01",
+            [20, 23],
+        )
+        for mesh_id in (10, 13, 20, 23):
+            add_mesh(assets, mesh_id)
+        leaf = add_variant_generator(
+            root,
+            "Leaf Mesh",
+            "Leaf 4",
+            [(1, 10)],
+        )
+        frond = add_variant_generator(
+            root,
+            "Frond",
+            "Frond 2",
+            [(1, 13)],
+        )
+        write_spm(target, root)
+        groups = [{
+            "material": "M_cluster_Silky_Dogwood_01",
+            "material_id": 1,
+            "mesh_ids": [20, 23],
+            "meshes": [
+                {
+                    "source_object": "cluster_Silky_Dogwood_01_01",
+                    "source_ordinal": 1,
+                },
+                {
+                    "source_object": "cluster_Silky_Dogwood_01_04",
+                    "source_ordinal": 4,
+                },
+            ],
+        }]
+        previous_bindings = [
+            {
+                "generator_index": 0,
+                "generator_name": "Leaf 4",
+                "generator_guid": speedtree.generator_guid(leaf),
+                "generator_type": "Leaf Mesh",
+                "slot_prefix": "Leaves:Type:0",
+                "source_material_id": 1,
+                "source_material_name": "M_cluster_Silky_Dogwood_01",
+                "source_mesh_id": -10,
+                "sentinel_policy": "mesh_-10_to_first_generated_leaf",
+                "target_material_id": 1,
+                "target_mesh_id": 10,
+                "leaf_ordinal": 1,
+                "created_slot": False,
+            },
+            {
+                "generator_index": 1,
+                "generator_name": "Frond 2",
+                "generator_guid": speedtree.generator_guid(frond),
+                "generator_type": "Frond",
+                "slot_prefix": "Material:Frond:0",
+                "source_material_id": 1,
+                "source_material_name": "M_cluster_Silky_Dogwood_01",
+                "source_mesh_id": 5,
+                "sentinel_policy": None,
+                "target_material_id": 1,
+                "target_mesh_id": 13,
+                "leaf_ordinal": 4,
+                "created_slot": False,
+            },
+        ]
+
+        result = speedtree.connect_atlas_generators_in_spm(
+            target,
+            ["M_cluster_Silky_Dogwood_01"],
+            groups,
+            [1],
+            previous_bindings=previous_bindings,
+            source_mesh_ids_by_name={
+                "M_cluster_Silky_Dogwood_01": [2, 3, 4, 5, 6],
+            },
+            generator_variant_policy="ensure_all_material_cutouts",
+        )
+
+        self.assertEqual(
+            generator_values(target),
+            {
+                ("Leaf 4", "Leaves:Type:0"): (1, 20),
+                ("Frond 2", "Material:Frond:0"): (1, 23),
+            },
+        )
+        by_name = {
+            binding["generator_name"]: binding
+            for binding in result["bindings"]
+        }
+        self.assertEqual(by_name["Leaf 4"]["source_mesh_id"], -10)
+        self.assertEqual(by_name["Frond 2"]["source_mesh_id"], 5)
+        self.assertEqual(result["changed_slot_pairs"], 2)
 
     def test_target_removal_restores_generators_and_removes_owned_assets(self):
         manifest = {
@@ -641,7 +828,7 @@ class GeneratorConnectionTests(unittest.TestCase):
             1,
         )
 
-    def test_variant_coverage_preserves_source_ordinals_without_generated_outputs(self):
+    def test_variant_coverage_rebinds_extra_source_ordinals_to_generated_output(self):
         target = Path(self.temp_dir.name) / "partial_outputs.spm"
         root = ET.Element("SpeedTreeModel")
         assets = ET.SubElement(root, "Assets")
@@ -679,17 +866,71 @@ class GeneratorConnectionTests(unittest.TestCase):
         )
 
         self.assertEqual(result["created_slot_pairs"], 0)
-        self.assertEqual(len(result["bindings"]), 1)
+        self.assertEqual(len(result["bindings"]), 3)
         self.assertEqual(
             generator_values(target),
             {
                 ("Frond 36", "Material:Frond:0"): (8, 10),
-                ("Frond 36", "Material:Frond:1"): (4, 2),
-                ("Frond 36", "Material:Frond:2"): (4, 3),
+                ("Frond 36", "Material:Frond:1"): (8, 10),
+                ("Frond 36", "Material:Frond:2"): (8, 10),
+            },
+        )
+        fallback_bindings = [
+            binding
+            for binding in result["bindings"]
+            if binding.get("sentinel_policy")
+            == "source_ordinal_without_output_to_first_generated"
+        ]
+        self.assertEqual(len(fallback_bindings), 2)
+
+    def test_leaf_mesh_extra_source_ordinals_rebind_to_generated_output(self):
+        target = Path(self.temp_dir.name) / "leaf_partial_outputs.spm"
+        root = ET.Element("SpeedTreeModel")
+        assets = ET.SubElement(root, "Assets")
+        add_material(assets, 4, "M_leaf", [1, 2, 3])
+        add_material(assets, 8, "M_leaf_generated", [10])
+        for mesh_id in (1, 2, 3, 10):
+            add_mesh(assets, mesh_id)
+        add_variant_generator(
+            root,
+            "Leaf Mesh",
+            "Leaf 63",
+            [(4, 1), (4, 2), (4, 3)],
+        )
+        write_spm(target, root)
+        groups = [
+            {
+                "material": "M_leaf_generated",
+                "material_id": 8,
+                "mesh_ids": [10],
+                "meshes": [
+                    {
+                        "source_object": "leaf_elm_01_01",
+                        "source_ordinal": 1,
+                    }
+                ],
+            }
+        ]
+
+        result = speedtree.connect_atlas_generators_in_spm(
+            target,
+            ["M_leaf"],
+            groups,
+            [4],
+            generator_variant_policy="ensure_all_material_cutouts",
+        )
+
+        self.assertTrue(result["complete"])
+        self.assertEqual(
+            generator_values(target),
+            {
+                ("Leaf 63", "Leaves:Type:0"): (8, 10),
+                ("Leaf 63", "Leaves:Type:1"): (8, 10),
+                ("Leaf 63", "Leaves:Type:2"): (8, 10),
             },
         )
 
-    def test_partial_source_adoption_deletes_only_replaced_ordinal(self):
+    def test_partial_source_adoption_rebinds_slots_and_deletes_all_source_cutouts(self):
         target = Path(self.temp_dir.name) / "partial_adoption.spm"
         root = ET.Element("SpeedTreeModel")
         assets = ET.SubElement(root, "Assets")
@@ -747,22 +988,102 @@ class GeneratorConnectionTests(unittest.TestCase):
         final_material = final_assets.find("Material_v8[@ID='4']")
         self.assertEqual(
             speedtree.spm_material_mesh_ids(final_material),
-            [10, 2, 3],
+            [10],
         )
         self.assertIsNone(final_assets.find("Mesh[@ID='1']"))
-        self.assertIsNotNone(final_assets.find("Mesh[@ID='2']"))
-        self.assertIsNotNone(final_assets.find("Mesh[@ID='3']"))
+        self.assertIsNone(final_assets.find("Mesh[@ID='2']"))
+        self.assertIsNone(final_assets.find("Mesh[@ID='3']"))
         self.assertIsNotNone(final_assets.find("Mesh[@ID='10']"))
-        self.assertEqual(adoption["removed_original_mesh_ids"], [1])
-        self.assertEqual(adoption["preserved_original_mesh_ids"], [2, 3])
-        self.assertEqual(adoption["final_material_mesh_ids"], [10, 2, 3])
+        self.assertEqual(adoption["removed_original_mesh_ids"], [1, 2, 3])
+        self.assertEqual(adoption["preserved_original_mesh_ids"], [])
+        self.assertEqual(adoption["final_material_mesh_ids"], [10])
         self.assertEqual(
             generator_values(target),
             {
                 ("Frond 36", "Material:Frond:0"): (4, 10),
-                ("Frond 36", "Material:Frond:1"): (4, 2),
-                ("Frond 36", "Material:Frond:2"): (4, 3),
+                ("Frond 36", "Material:Frond:1"): (4, 10),
+                ("Frond 36", "Material:Frond:2"): (4, 10),
             },
+        )
+
+    def test_shared_original_mesh_asset_is_detached_without_breaking_other_material(self):
+        target = Path(self.temp_dir.name) / "shared_source_mesh_adoption.spm"
+        root = ET.Element("SpeedTreeModel")
+        assets = ET.SubElement(root, "Assets")
+        add_material(assets, 4, "M_branch", [1, 2, 3])
+        add_material(assets, 9, "M_other", [2])
+        for mesh_id in (1, 2, 3, 10):
+            add_mesh(assets, mesh_id)
+        add_variant_generator(
+            root,
+            "Frond",
+            "Frond source",
+            [(4, 1), (4, 2), (4, 3)],
+        )
+        add_variant_generator(
+            root,
+            "Frond",
+            "Frond other",
+            [(9, 2)],
+        )
+        write_spm(target, root)
+
+        adoption = speedtree.prepare_source_material_adoption(
+            target,
+            {"export_scope_id": "scope-shared-source-mesh"},
+            "M_branch",
+            4,
+        )
+        staged_root = speedtree.read_spm_xml(target)
+        staged_material = staged_root.find("Assets/Material_v8[@ID='4']")
+        speedtree.update_spm_material_mesh_ids(staged_material, [10])
+        speedtree.write_spm_xml(target, staged_root)
+        connection = speedtree.connect_atlas_generators_in_spm(
+            target,
+            ["M_branch"],
+            [
+                {
+                    "material": "M_branch",
+                    "material_id": 4,
+                    "mesh_ids": [10],
+                    "meshes": [
+                        {
+                            "source_object": "branch_01_01",
+                            "source_ordinal": 1,
+                        }
+                    ],
+                }
+            ],
+            [4],
+            source_mesh_ids_by_name={"M_branch": [1, 2, 3]},
+            generator_variant_policy="ensure_all_material_cutouts",
+        )
+        adoption = speedtree.finalize_source_material_adoption(
+            target,
+            adoption,
+            [10],
+            connection,
+        )
+
+        final_root = speedtree.read_spm_xml(target)
+        final_assets = final_root.find("Assets")
+        source_material = final_assets.find("Material_v8[@ID='4']")
+        other_material = final_assets.find("Material_v8[@ID='9']")
+        self.assertEqual(
+            speedtree.spm_material_mesh_ids(source_material),
+            [10],
+        )
+        self.assertEqual(
+            speedtree.spm_material_mesh_ids(other_material),
+            [2],
+        )
+        self.assertIsNone(final_assets.find("Mesh[@ID='1']"))
+        self.assertIsNotNone(final_assets.find("Mesh[@ID='2']"))
+        self.assertIsNone(final_assets.find("Mesh[@ID='3']"))
+        self.assertEqual(adoption["removed_original_mesh_ids"], [1, 3])
+        self.assertEqual(
+            adoption["retained_shared_original_mesh_ids"],
+            [2],
         )
 
     def test_frond_variant_creation_clones_and_groups_every_slot_property(self):
@@ -852,6 +1173,214 @@ class GeneratorConnectionTests(unittest.TestCase):
                 ],
             ],
         )
+
+    def test_generated_output_beyond_source_cutouts_creates_a_tail_slot(self):
+        target = Path(self.temp_dir.name) / "frond_four_outputs_three_cutouts.spm"
+        root = ET.Element("SpeedTreeModel")
+        assets = ET.SubElement(root, "Assets")
+        add_material(assets, 4, "M_branch", [1, 2, 3])
+        add_material(assets, 8, "M_branch_generated", [10, 11, 12, 13])
+        for mesh_id in (1, 2, 3, 10, 11, 12, 13):
+            add_mesh(assets, mesh_id)
+        add_variant_generator(
+            root, "Frond", "Frond 36", [(4, 1), (4, 2), (4, 3)]
+        )
+        write_spm(target, root)
+        groups = [
+            {
+                "material": "M_branch_generated",
+                "material_id": 8,
+                "mesh_ids": [10, 11, 12, 13],
+                "meshes": [
+                    {
+                        "source_object": f"branch_densiflora_01_{ordinal:02d}",
+                        "source_ordinal": ordinal,
+                    }
+                    for ordinal in range(1, 5)
+                ],
+            }
+        ]
+
+        result = speedtree.connect_atlas_generators_in_spm(
+            target,
+            ["M_branch"],
+            groups,
+            [4],
+            generator_variant_policy="ensure_all_material_cutouts",
+        )
+
+        self.assertTrue(result["complete"])
+        self.assertEqual(result["created_slot_pairs"], 1)
+        self.assertEqual(
+            generator_values(target),
+            {
+                ("Frond 36", "Material:Frond:0"): (8, 10),
+                ("Frond 36", "Material:Frond:1"): (8, 11),
+                ("Frond 36", "Material:Frond:2"): (8, 12),
+                ("Frond 36", "Material:Frond:3"): (8, 13),
+            },
+        )
+        created = [
+            binding
+            for binding in result["bindings"]
+            if binding["created_slot"]
+        ]
+        self.assertEqual(len(created), 1)
+        self.assertEqual(created[0]["leaf_ordinal"], 4)
+        self.assertIsNone(created[0]["source_mesh_id"])
+        self.assertEqual(
+            created[0]["sentinel_policy"],
+            "created_variant_without_source_cutout",
+        )
+
+    def test_existing_created_tail_slots_expand_from_three_to_four_outputs(self):
+        target = Path(self.temp_dir.name) / "frond_incremental_fourth_output.spm"
+        root = ET.Element("SpeedTreeModel")
+        assets = ET.SubElement(root, "Assets")
+        add_material(assets, 4, "M_branch", [1, 2, 3])
+        add_material(assets, 8, "M_branch_generated", [10, 11, 12, 13])
+        for mesh_id in (1, 2, 3, 10, 11, 12, 13):
+            add_mesh(assets, mesh_id)
+        add_variant_generator(root, "Frond", "Frond 36", [(4, 1)])
+        write_spm(target, root)
+
+        def groups(count):
+            return [
+                {
+                    "material": "M_branch_generated",
+                    "material_id": 8,
+                    "mesh_ids": [10, 11, 12, 13][:count],
+                    "meshes": [
+                        {
+                            "source_object": (
+                                f"branch_densiflora_01_{ordinal:02d}"
+                            ),
+                            "source_ordinal": ordinal,
+                        }
+                        for ordinal in range(1, count + 1)
+                    ],
+                }
+            ]
+
+        first = speedtree.connect_atlas_generators_in_spm(
+            target,
+            ["M_branch"],
+            groups(3),
+            [4],
+            generator_variant_policy="ensure_all_material_cutouts",
+        )
+        second = speedtree.connect_atlas_generators_in_spm(
+            target,
+            ["M_branch"],
+            groups(4),
+            [4],
+            previous_bindings=first["bindings"],
+            source_mesh_ids_by_name={"M_branch": [1, 2, 3]},
+            generator_variant_policy="ensure_all_material_cutouts",
+        )
+
+        self.assertTrue(second["complete"])
+        self.assertEqual(second["created_slot_pairs"], 1)
+        self.assertEqual(
+            generator_values(target),
+            {
+                ("Frond 36", "Material:Frond:0"): (8, 10),
+                ("Frond 36", "Material:Frond:1"): (8, 11),
+                ("Frond 36", "Material:Frond:2"): (8, 12),
+                ("Frond 36", "Material:Frond:3"): (8, 13),
+            },
+        )
+        created = [
+            binding
+            for binding in second["bindings"]
+            if binding["created_slot"]
+        ]
+        self.assertEqual(len(created), 3)
+        self.assertEqual(
+            {
+                (
+                    binding["variant_parent_children_before"],
+                    binding["variant_parent_children_after"],
+                )
+                for binding in created
+            },
+            {(1, 4)},
+        )
+
+    def test_source_adoption_appends_generated_outputs_beyond_cutout_count(self):
+        target = Path(self.temp_dir.name) / "frond_adoption_four_outputs.spm"
+        root = ET.Element("SpeedTreeModel")
+        assets = ET.SubElement(root, "Assets")
+        add_material(assets, 4, "M_branch", [1, 2, 3])
+        for mesh_id in (1, 2, 3, 10, 11, 12, 13):
+            add_mesh(assets, mesh_id)
+        add_variant_generator(
+            root, "Frond", "Frond 36", [(4, 1), (4, 2), (4, 3)]
+        )
+        write_spm(target, root)
+
+        adoption = speedtree.prepare_source_material_adoption(
+            target,
+            {"export_scope_id": "scope-four-output-adoption"},
+            "M_branch",
+            4,
+        )
+        staged_root = speedtree.read_spm_xml(target)
+        staged_material = staged_root.find("Assets/Material_v8[@ID='4']")
+        speedtree.update_spm_material_mesh_ids(
+            staged_material, [10, 11, 12, 13]
+        )
+        speedtree.write_spm_xml(target, staged_root)
+        groups = [
+            {
+                "material": "M_branch",
+                "material_id": 4,
+                "mesh_ids": [10, 11, 12, 13],
+                "meshes": [
+                    {
+                        "source_object": f"branch_densiflora_01_{ordinal:02d}",
+                        "source_ordinal": ordinal,
+                    }
+                    for ordinal in range(1, 5)
+                ],
+            }
+        ]
+        connection = speedtree.connect_atlas_generators_in_spm(
+            target,
+            ["M_branch"],
+            groups,
+            [4],
+            source_mesh_ids_by_name={"M_branch": [1, 2, 3]},
+            generator_variant_policy="ensure_all_material_cutouts",
+        )
+        adoption = speedtree.finalize_source_material_adoption(
+            target,
+            adoption,
+            [10, 11, 12, 13],
+            connection,
+        )
+
+        final_root = speedtree.read_spm_xml(target)
+        final_assets = final_root.find("Assets")
+        final_material = final_assets.find("Material_v8[@ID='4']")
+        self.assertEqual(
+            speedtree.spm_material_mesh_ids(final_material),
+            [10, 11, 12, 13],
+        )
+        self.assertEqual(
+            generator_values(target),
+            {
+                ("Frond 36", "Material:Frond:0"): (4, 10),
+                ("Frond 36", "Material:Frond:1"): (4, 11),
+                ("Frond 36", "Material:Frond:2"): (4, 12),
+                ("Frond 36", "Material:Frond:3"): (4, 13),
+            },
+        )
+        self.assertEqual(
+            adoption["final_material_mesh_ids"],
+            [10, 11, 12, 13],
+        )
+        self.assertEqual(adoption["removed_original_mesh_ids"], [1, 2, 3])
 
     def test_broken_frond_variant_schema_migrates_idempotently_and_removes(self):
         target = Path(self.temp_dir.name) / "frond_broken_generated.spm"
@@ -1024,6 +1553,105 @@ class GeneratorConnectionTests(unittest.TestCase):
                 "Material:Frond:0:Weight",
                 "Shape:Scale:Width",
             ],
+        )
+
+    def test_owned_variant_interval_preserves_later_scope_slots(self):
+        root = ET.Element("SpeedTreeModel")
+        generator = add_variant_generator(
+            root,
+            "Frond",
+            "Frond 36",
+            [
+                (4, 1),
+                (8, 11),
+                (8, 12),
+                (9, 21),
+                (9, 22),
+            ],
+        )
+        properties = generator.find("Properties")
+        for slot_index, value in ((0, "1.0"), (3, "later-a"), (4, "later-b")):
+            prop = ET.SubElement(properties, "Property")
+            ET.SubElement(prop, "Name").text = (
+                f"Material:Frond:{slot_index}:Weight"
+            )
+            ET.SubElement(prop, "Value").text = value
+        bindings = []
+        for slot_index, source_mesh_id, target_mesh_id in (
+            (1, 2, 11),
+            (2, 3, 12),
+        ):
+            slot_prefix = f"Material:Frond:{slot_index}"
+            bindings.append({
+                "generator_index": 0,
+                "generator_name": "Frond 36",
+                "generator_guid": speedtree.generator_guid(generator),
+                "generator_type": "Frond",
+                "slot_prefix": slot_prefix,
+                "source_material_id": 4,
+                "source_material_name": "M_branch",
+                "source_mesh_id": source_mesh_id,
+                "target_material_id": 8,
+                "target_mesh_id": target_mesh_id,
+                "leaf_ordinal": slot_index + 1,
+                "created_slot": True,
+                "variant_parent_property": "Material:Frond",
+                "variant_parent_children_before": 1,
+                "variant_parent_children_after": 3,
+                "created_material_property": f"{slot_prefix}:Material",
+                "created_mesh_property": f"{slot_prefix}:Mesh",
+            })
+
+        def later_scope_signature():
+            return [
+                ET.tostring(prop, encoding="unicode")
+                for prop in generator.find("Properties")
+                if str(prop.findtext("Name") or "").startswith(
+                    ("Material:Frond:3:", "Material:Frond:4:")
+                )
+            ]
+
+        later_before = later_scope_signature()
+        repaired = speedtree.repair_created_generator_variant_slots(
+            root,
+            bindings,
+        )
+        state = speedtree.generator_variant_parent_state(
+            generator,
+            "Material:Frond",
+        )
+
+        self.assertEqual(state["child_count"], 5)
+        self.assertEqual(len(repaired), 2)
+        self.assertEqual(later_scope_signature(), later_before)
+
+        restored = speedtree.remove_created_generator_variant_slots(
+            root,
+            bindings,
+        )
+        state = speedtree.generator_variant_parent_state(
+            generator,
+            "Material:Frond",
+        )
+        self.assertEqual(state["child_count"], 5)
+        self.assertEqual(
+            (
+                int(state["slots"][1]["material"].findtext("Value")),
+                int(state["slots"][1]["mesh"].findtext("Value")),
+                int(state["slots"][2]["material"].findtext("Value")),
+                int(state["slots"][2]["mesh"].findtext("Value")),
+            ),
+            (4, 2, 4, 3),
+        )
+        self.assertEqual(later_scope_signature(), later_before)
+        self.assertEqual(
+            {
+                item["mode"] for item in restored
+            },
+            {
+                "restored_created_variant_slot_"
+                "preserving_later_scope_interval"
+            },
         )
 
     def test_legacy_created_variant_binding_follows_generator_after_reorder(self):
@@ -1199,12 +1827,14 @@ class GeneratorConnectionTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(RuntimeError, "found 0"):
             speedtree.normalize_generator_bindings(root, [stale])
-        with self.assertRaisesRegex(RuntimeError, "found 0"):
+        self.assertEqual(
             speedtree.normalize_generator_bindings(
                 root,
                 [{**stale, "created_slot": True}],
                 allow_missing=True,
-            )
+            ),
+            [],
+        )
 
     def test_legacy_renamed_generator_migrates_by_unique_slot_values(self):
         root = ET.Element("SpeedTreeModel")
@@ -1241,7 +1871,78 @@ class GeneratorConnectionTests(unittest.TestCase):
         self.assertEqual(identity["generator_guid"], "Frond:Renamed Frond")
         self.assertEqual(identity["resolution"], "legacy_type_slot_values")
 
-    def test_variant_coverage_malformed_parent_fails_without_write(self):
+    def test_duplicate_legacy_names_resolve_by_unique_slot_values(self):
+        root = ET.Element("SpeedTreeModel")
+        add_variant_generator(
+            root,
+            "Frond",
+            "Frond 6",
+            [(8, 12)],
+        )
+        add_variant_generator(
+            root,
+            "Frond",
+            "Frond 6",
+            [(8, 13)],
+        )
+        legacy = {
+            "generator_index": 26,
+            "generator_name": "Frond 6",
+            "generator_type": "Frond",
+            "slot_prefix": "Material:Frond:0",
+            "source_material_id": 4,
+            "source_mesh_id": 2,
+            "target_material_id": 8,
+            "target_mesh_id": 12,
+        }
+
+        identity = speedtree.resolve_generator_binding(
+            root,
+            legacy,
+            context="Previous Atlas Generator binding",
+        )
+
+        self.assertEqual(identity["generator_index"], 0)
+        self.assertEqual(identity["resolution"], "legacy_type_slot_values")
+
+    def test_duplicate_legacy_slot_values_use_matching_recorded_index_once(self):
+        root = ET.Element("SpeedTreeModel")
+        add_variant_generator(
+            root,
+            "Frond",
+            "Frond 6",
+            [(8, 12)],
+        )
+        add_variant_generator(
+            root,
+            "Frond",
+            "Frond 6",
+            [(8, 12)],
+        )
+        legacy = {
+            "generator_index": 1,
+            "generator_name": "Frond 6",
+            "generator_type": "Frond",
+            "slot_prefix": "Material:Frond:0",
+            "source_material_id": 4,
+            "source_mesh_id": 2,
+            "target_material_id": 8,
+            "target_mesh_id": 12,
+        }
+
+        identity = speedtree.resolve_generator_binding(
+            root,
+            legacy,
+            context="Previous Atlas Generator binding",
+        )
+
+        self.assertEqual(identity["generator_index"], 1)
+        self.assertEqual(
+            identity["resolution"],
+            "legacy_index_type_slot_values",
+        )
+
+    def test_variant_coverage_repairs_declared_missing_tail_from_slot_zero_schema(self):
         target = Path(self.temp_dir.name) / "malformed.spm"
         root = ET.Element("SpeedTreeModel")
         assets = ET.SubElement(root, "Assets")
@@ -1256,6 +1957,95 @@ class GeneratorConnectionTests(unittest.TestCase):
             [(4, 1)],
             child_count=3,
         )
+        write_spm(target, root)
+        groups = [
+            {
+                "material": "M_branch_generated",
+                "material_id": 8,
+                "mesh_ids": [10, 11, 12],
+                "meshes": [
+                    {
+                        "source_object": f"branch_elm_01_{ordinal:02d}",
+                        "source_ordinal": ordinal,
+                    }
+                    for ordinal in range(1, 4)
+                ],
+            }
+        ]
+        result = speedtree.connect_atlas_generators_in_spm(
+            target,
+            ["M_branch"],
+            groups,
+            [4],
+            generator_variant_policy="ensure_all_material_cutouts",
+        )
+
+        self.assertTrue(result["complete"])
+        self.assertEqual(result["created_slot_pairs"], 2)
+        self.assertEqual(
+            generator_values(target),
+            {
+                ("Frond 36", "Material:Frond:0"): (8, 10),
+                ("Frond 36", "Material:Frond:1"): (8, 11),
+                ("Frond 36", "Material:Frond:2"): (8, 12),
+            },
+        )
+        declared_repairs = [
+            row
+            for row in result["repaired_variant_slot_schemas"]
+            if row.get("mode") == "normalized_declared_missing_tail"
+        ]
+        self.assertEqual(len(declared_repairs), 1)
+        self.assertEqual(
+            (
+                declared_repairs[0]["declared_children_before"],
+                declared_repairs[0]["declared_children_after"],
+            ),
+            (3, 1),
+        )
+        second = speedtree.connect_atlas_generators_in_spm(
+            target,
+            ["M_branch"],
+            groups,
+            [4],
+            previous_bindings=result["bindings"],
+            source_mesh_ids_by_name={"M_branch": [1, 2, 3]},
+            generator_variant_policy="ensure_all_material_cutouts",
+        )
+        self.assertEqual(second["created_slot_pairs"], 0)
+        self.assertEqual(second["changed_slot_pairs"], 0)
+        self.assertEqual(second["already_connected_slot_pairs"], 3)
+        self.assertEqual(
+            generator_values(target),
+            {
+                ("Frond 36", "Material:Frond:0"): (8, 10),
+                ("Frond 36", "Material:Frond:1"): (8, 11),
+                ("Frond 36", "Material:Frond:2"): (8, 12),
+            },
+        )
+
+    def test_variant_coverage_interior_child_gap_still_fails_without_write(self):
+        target = Path(self.temp_dir.name) / "interior_gap.spm"
+        root = ET.Element("SpeedTreeModel")
+        assets = ET.SubElement(root, "Assets")
+        add_material(assets, 4, "M_branch", [1, 2, 3])
+        add_material(assets, 8, "M_branch_generated", [10, 11, 12])
+        for mesh_id in (1, 2, 3, 10, 11, 12):
+            add_mesh(assets, mesh_id)
+        generator = add_variant_generator(
+            root,
+            "Frond",
+            "Frond 36",
+            [(4, 1), (4, 2)],
+            child_count=3,
+        )
+        for prop in generator.findall("./Properties/Property"):
+            name = str(prop.findtext("Name") or "")
+            if name.startswith("Material:Frond:1:"):
+                prop.find("Name").text = name.replace(
+                    "Material:Frond:1:",
+                    "Material:Frond:2:",
+                )
         write_spm(target, root)
         groups = [
             {
@@ -1457,6 +2247,46 @@ class SafetyTests(unittest.TestCase):
                 "ensure_all_material_cutouts",
             )
 
+    def test_cluster_relation_reconciles_stale_existing_local_material_id(self):
+        with tempfile.TemporaryDirectory() as folder:
+            folder = Path(folder)
+            target = folder / "SK_tree_01.spm"
+            root = ET.Element("SpeedTreeModel")
+            assets = ET.SubElement(root, "Assets")
+            add_material(assets, 19, "M_branch_elm_01", [23])
+            add_mesh(assets, 23)
+            write_spm(target, root)
+            props = types.SimpleNamespace(
+                speedtree_atlas_asset_name="M_branch_elm_01",
+                speedtree_source_materials_json=json.dumps({
+                    str(target): {
+                        "source_material_names": ["M_branch_elm_01"],
+                        # Stale sibling/local ID from an older target mapping.
+                        "source_material_ids": [7],
+                        "adopt_source_material": True,
+                        "generator_variant_policy": (
+                            "ensure_all_material_cutouts"
+                        ),
+                    },
+                }),
+            )
+
+            report = speedtree.extend_source_material_adoptions_for_targets(
+                props,
+                [target],
+            )
+            mapping = speedtree.speedtree_source_material_mapping(props)
+
+            self.assertEqual(report["added"], [])
+            self.assertEqual(len(report["reconciled"]), 1)
+            self.assertEqual(report["reconciled"][0]["material_id"], 19)
+            self.assertEqual(
+                mapping[speedtree.normalized_target_key(target)][
+                    "source_material_ids"
+                ],
+                [19],
+            )
+
     def test_cluster_relation_expansion_does_not_claim_another_atlas_scope(self):
         with tempfile.TemporaryDirectory() as folder:
             folder = Path(folder)
@@ -1567,6 +2397,421 @@ class SafetyTests(unittest.TestCase):
             )
 
             self.assertTrue(report["added"][0]["reused_existing_scope"])
+
+    def test_cluster_relation_reuses_adoption_final_mesh_registry(self):
+        with tempfile.TemporaryDirectory() as folder:
+            folder = Path(folder)
+            blend = folder / "Cluster" / "SK_cluster_01.blend"
+            blend.parent.mkdir()
+            blend.touch()
+            target = folder / "SK_tree_01.spm"
+            material_name = "M_cluster_01"
+            scope_name = "same-scope"
+            marker = json.dumps({
+                "generator": speedtree.ATLAS_LEAF_SPM_GENERATOR,
+                "scope": scope_name,
+                "kind": "material",
+            })
+            root = ET.Element("SpeedTreeModel")
+            assets = ET.SubElement(root, "Assets")
+            add_material(
+                assets,
+                8,
+                material_name,
+                [81, 82, 29],
+                marker,
+            )
+            for mesh_id in (81, 82, 29):
+                add_mesh(
+                    assets,
+                    mesh_id,
+                    marker.replace('"material"', '"mesh"'),
+                )
+            write_spm(target, root)
+            scope_dir = folder / ".atlas_leaf_speedtree_scopes"
+            scope_dir.mkdir()
+            (
+                scope_dir / f"{scope_name}__SK_tree_01.json"
+            ).write_text(
+                json.dumps({
+                    "blend_file": str(blend),
+                    "spm": str(target),
+                    "export_scope_id": scope_name,
+                    "source_material_adoption": {
+                        "version": (
+                            speedtree.SOURCE_MATERIAL_ADOPTION_VERSION
+                        ),
+                        "material_name": material_name,
+                        "material_id": 8,
+                        "original_material_snapshot": "material-snapshot",
+                        "original_mesh_snapshots": [
+                            {"mesh_id": 12, "snapshot": "old-generated"},
+                            {"mesh_id": 29, "snapshot": "preserved-source"},
+                        ],
+                        "generated_mesh_ids": [81, 82],
+                        "preserved_original_mesh_ids": [29],
+                        "final_material_mesh_ids": [81, 82, 29],
+                    },
+                }),
+                encoding="utf-8",
+            )
+            props = types.SimpleNamespace(
+                speedtree_atlas_asset_name=material_name,
+                speedtree_source_materials_json=json.dumps({
+                    str(target): {
+                        "source_material_names": [material_name],
+                        # Deliberately stale local mapping; the live material
+                        # and exact same-scope final registry are authoritative.
+                        "source_material_ids": [7],
+                        "adopt_source_material": True,
+                        "generator_variant_policy": (
+                            "ensure_all_material_cutouts"
+                        ),
+                    },
+                }),
+            )
+
+            report = speedtree.extend_source_material_adoptions_for_targets(
+                props,
+                [target],
+                blend_path=blend,
+            )
+
+            self.assertTrue(
+                report["reconciled"][0]["reused_existing_scope"]
+            )
+            mapping = speedtree.speedtree_source_material_mapping(props)
+            self.assertEqual(
+                mapping[speedtree.normalized_target_key(target)][
+                    "source_material_ids"
+                ],
+                [8],
+            )
+
+    def test_cluster_relation_reuses_same_blend_legacy_group_with_untagged_mesh(self):
+        with tempfile.TemporaryDirectory() as folder:
+            folder = Path(folder)
+            blend = folder / "Cluster" / "SK_branch_elm_01.blend"
+            blend.parent.mkdir()
+            blend.touch()
+            first = folder / "SK_tree_01.spm"
+            second = folder / "SK_tree_02.spm"
+            marker = json.dumps({
+                "generator": speedtree.ATLAS_LEAF_SPM_GENERATOR,
+                "scope": "same-scope",
+                "kind": "material",
+            })
+            for target, user_data in ((first, ""), (second, marker)):
+                root = ET.Element("SpeedTreeModel")
+                assets = ET.SubElement(root, "Assets")
+                add_material(
+                    assets,
+                    8,
+                    "M_branch_elm_01",
+                    [1],
+                    user_data,
+                )
+                # Legacy Atlas writers tagged the material but not its Mesh.
+                add_mesh(assets, 1)
+                write_spm(target, root)
+            scope = folder / ".atlas_leaf_speedtree_scopes"
+            scope.mkdir()
+            (scope / "same-scope__SK_tree_02.json").write_text(
+                json.dumps({
+                    "blend_file": str(blend),
+                    "spm": str(second),
+                    "export_scope_id": "same-scope",
+                    "source_collection": "Atlas_Branch_Plans",
+                    "speedtree_material_groups": [{
+                        "material": "M_branch_elm_01",
+                        "material_id": 8,
+                        "mesh_ids": [1],
+                    }],
+                }),
+                encoding="utf-8",
+            )
+            props = types.SimpleNamespace(
+                speedtree_atlas_asset_name="M_branch_elm_01",
+                speedtree_source_materials_json=json.dumps({
+                    str(first): {
+                        "source_material_names": ["M_branch_elm_01"],
+                        "source_material_ids": [8],
+                        "adopt_source_material": True,
+                        "generator_variant_policy": (
+                            "ensure_all_material_cutouts"
+                        ),
+                    },
+                }),
+            )
+
+            report = speedtree.extend_source_material_adoptions_for_targets(
+                props,
+                [first, second],
+                blend_path=blend,
+            )
+
+            self.assertTrue(report["added"][0]["reused_existing_scope"])
+            conflicting_root = speedtree.read_spm_xml(second)
+            conflicting_mesh = conflicting_root.find("./Assets/Mesh[@ID='1']")
+            conflicting_mesh.find("UserData").text = json.dumps({
+                "generator": speedtree.ATLAS_LEAF_SPM_GENERATOR,
+                "scope": "different-scope",
+                "kind": "mesh",
+            })
+            write_spm(second, conflicting_root)
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "already managed by Atlas scope",
+            ):
+                speedtree.extend_source_material_adoptions_for_targets(
+                    props,
+                    [second],
+                    blend_path=blend,
+                )
+
+    def test_random_scope_owner_manifest_is_reclaimed_by_canonical_source_identity(self):
+        with tempfile.TemporaryDirectory() as folder:
+            folder = Path(folder)
+            target = folder / "SK_tree_01.spm"
+            blend = folder / "Cluster" / "SK_branch_elm_01.blend"
+            blend.parent.mkdir()
+            blend.touch()
+            material_name = "M_branch_elm_01"
+            marker = json.dumps({
+                "generator": speedtree.ATLAS_LEAF_SPM_GENERATOR,
+                "scope": "old-random-scope",
+                "kind": "material",
+            })
+            root = ET.Element("SpeedTreeModel")
+            assets = ET.SubElement(root, "Assets")
+            material = add_material(
+                assets,
+                19,
+                material_name,
+                [23],
+                marker,
+            )
+            add_mesh(
+                assets,
+                23,
+                marker.replace('"material"', '"mesh"'),
+            )
+            write_spm(target, root)
+            scope_dir = folder / ".atlas_leaf_speedtree_scopes"
+            scope_dir.mkdir()
+            previous = {
+                "export_scope_id": "old-random-scope",
+                "blend_file": str(blend),
+                "source_collection": "Atlas_Cluster_Cards",
+                "spm": str(target),
+                "speedtree_material_groups": [
+                    {
+                        "material": material_name,
+                        "material_id": 19,
+                        "mesh_ids": [23],
+                    }
+                ],
+            }
+            (scope_dir / "old-random-scope__SK_tree_01.json").write_text(
+                json.dumps(previous),
+                encoding="utf-8",
+            )
+            current = {
+                "export_scope_id": "new-random-scope",
+                "blend_file": str(blend),
+                "source_collection": "Atlas_Cluster_Cards",
+                "material_groups": [{"material": material_name}],
+            }
+
+            owner = speedtree.material_owner_manifest_for_source(
+                target,
+                material,
+                current,
+                material_name,
+            )
+
+            self.assertEqual(
+                owner.get("export_scope_id"),
+                "old-random-scope",
+            )
+            other_source = {
+                **current,
+                "blend_file": str(folder / "Cluster" / "other.blend"),
+            }
+            self.assertEqual(
+                speedtree.material_owner_manifest_for_source(
+                    target,
+                    material,
+                    other_source,
+                    material_name,
+                ),
+                {},
+            )
+
+    def test_legacy_untagged_managed_meshes_require_exact_manifest_ordinals(self):
+        with tempfile.TemporaryDirectory() as folder:
+            folder = Path(folder)
+            target = folder / "SK_tree_01.spm"
+            blend = folder / "Cluster" / "SK_branch_01.blend"
+            blend.parent.mkdir()
+            blend.touch()
+            mesh_dir = folder / "meshes"
+            mesh_dir.mkdir()
+            mesh_paths = [
+                mesh_dir / "m_branch__01_branch_01.fbx",
+                mesh_dir / "m_branch__02_branch_02.fbx",
+            ]
+            for path in mesh_paths:
+                path.touch()
+            marker = json.dumps({
+                "generator": speedtree.ATLAS_LEAF_SPM_GENERATOR,
+                "scope": "legacy-scope",
+                "kind": "material",
+                "group": "Plans",
+            })
+            root = ET.Element("SpeedTreeModel")
+            assets = ET.SubElement(root, "Assets")
+            material = add_material(
+                assets,
+                1,
+                "M_branch",
+                [106, 107],
+                marker,
+            )
+            for mesh_id, path in zip((106, 107), mesh_paths):
+                mesh = add_mesh(assets, mesh_id)
+                mesh.find("Filename").text = str(
+                    path.relative_to(folder)
+                ).replace("\\", "/")
+            write_spm(target, root)
+            previous = {
+                "export_scope_id": "legacy-scope",
+                "blend_file": str(blend),
+                "source_collection": "Plans",
+                "spm": str(target),
+                "material_groups": [{
+                    "collection": "Plans",
+                    "material": "M_branch",
+                    "meshes": [
+                        {
+                            "asset": str(path),
+                            "source_ordinal": ordinal,
+                        }
+                        for ordinal, path in enumerate(mesh_paths, 1)
+                    ],
+                }],
+                "speedtree_material_groups": [{
+                    "collection": "Plans",
+                    "material": "M_branch",
+                    "material_id": 1,
+                    "mesh_ids": [106, 107],
+                }],
+            }
+            scope_dir = folder / ".atlas_leaf_speedtree_scopes"
+            scope_dir.mkdir()
+            (
+                scope_dir / "legacy-scope__SK_tree_01.json"
+            ).write_text(json.dumps(previous), encoding="utf-8")
+            current = {
+                "export_scope_id": "new-scope",
+                "blend_file": str(blend),
+                "source_collection": "Plans",
+            }
+
+            owner = speedtree.material_owner_manifest_for_source(
+                target,
+                material,
+                current,
+                "M_branch",
+            )
+
+            self.assertEqual(owner.get("export_scope_id"), "legacy-scope")
+
+            changed = speedtree.read_spm_xml(target)
+            changed.find("./Assets/Mesh[@ID='107']/Filename").text = (
+                "meshes/unrelated.fbx"
+            )
+            write_spm(target, changed)
+            changed_material = speedtree.read_spm_xml(target).find(
+                "./Assets/Material_v8[@ID='1']"
+            )
+            self.assertEqual(
+                speedtree.material_owner_manifest_for_source(
+                    target,
+                    changed_material,
+                    current,
+                    "M_branch",
+                ),
+                {},
+            )
+
+    def test_same_source_managed_slot_without_old_adoption_snapshot_is_replaceable(self):
+        with tempfile.TemporaryDirectory() as folder:
+            folder = Path(folder)
+            target = folder / "SK_tree_01.spm"
+            blend = folder / "Cluster" / "SK_branch_elm_01.blend"
+            blend.parent.mkdir()
+            blend.touch()
+            marker = json.dumps({
+                "generator": speedtree.ATLAS_LEAF_SPM_GENERATOR,
+                "scope": "old-random-scope",
+                "kind": "material",
+            })
+            root = ET.Element("SpeedTreeModel")
+            assets = ET.SubElement(root, "Assets")
+            add_material(
+                assets,
+                19,
+                "M_branch_elm_01",
+                [23],
+                marker,
+            )
+            add_mesh(
+                assets,
+                23,
+                marker.replace('"material"', '"mesh"'),
+            )
+            write_spm(target, root)
+            current = {
+                "export_scope_id": "new-random-scope",
+                "blend_file": str(blend),
+                "source_collection": "Atlas_Cluster_Cards",
+            }
+            previous = {
+                "export_scope_id": "old-random-scope",
+                "blend_file": str(blend),
+                "source_collection": "Atlas_Cluster_Cards",
+            }
+
+            adoption = speedtree.prepare_source_material_adoption(
+                target,
+                current,
+                "M_branch_elm_01",
+                19,
+                previous,
+            )
+
+            self.assertEqual(
+                adoption["baseline_kind"],
+                "same_source_managed_takeover",
+            )
+            self.assertEqual(adoption["scope"], "new-random-scope")
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "already managed by Atlas scope",
+            ):
+                speedtree.prepare_source_material_adoption(
+                    target,
+                    {
+                        **current,
+                        "blend_file": str(
+                            folder / "Cluster" / "different_source.blend"
+                        ),
+                    },
+                    "M_branch_elm_01",
+                    19,
+                    previous,
+                )
 
     def test_untagged_legacy_mesh_paths_are_migrated_to_uuid(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -1812,6 +3057,116 @@ class SafetyTests(unittest.TestCase):
             self.assertEqual(removed["removed_materials"], [])
             self.assertEqual(removed["restored_adopted_materials"][0]["material_id"], 8)
 
+    def test_adoption_retry_never_reuses_original_mesh_ids(self):
+        with tempfile.TemporaryDirectory() as folder:
+            folder = Path(folder)
+            target = folder / "SK_tree.spm"
+            root = ET.Element("SpeedTreeModel")
+            assets = ET.SubElement(root, "Assets")
+            source = add_material(assets, 8, "M_branch", [3])
+            source_mesh = add_mesh(assets, 3)
+            add_generator(root, "Frond", "Frond 1", [(8, 3)])
+            write_spm(target, root)
+
+            sample = folder / "external_mesh_sample.spm"
+            sample_root = ET.Element("SpeedTreeModel")
+            sample_assets = ET.SubElement(sample_root, "Assets")
+            sample_mesh = add_mesh(sample_assets, 100)
+            ET.SubElement(sample_mesh, "Embedded").text = "false"
+            write_spm(sample, sample_root)
+
+            color = folder / "branch.tga"
+            tga_header = bytearray(18)
+            tga_header[2] = 2
+            tga_header[12:14] = (1024).to_bytes(2, "little")
+            tga_header[14:16] = (1024).to_bytes(2, "little")
+            tga_header[16] = 24
+            color.write_bytes(tga_header)
+            mesh_items = [{
+                "asset": str(folder / "meshes" / "branch_01.fbx"),
+                "source_object": "branch_01",
+                "source_ordinal": 1,
+            }]
+            manifest = {
+                "export_scope_id": "scope-adopt-retry",
+                "source_collection": "Plans",
+                "material_collection": "Plans",
+                "blend_file": str(folder / "normalized.blend"),
+                "textures": {"albedo": str(color)},
+                "meshes": mesh_items,
+            }
+            adoption = speedtree.prepare_source_material_adoption(
+                target,
+                manifest,
+                "M_branch",
+                8,
+            )
+
+            # Reproduce a retry boundary where the source material carries the
+            # current scope marker but its authored Mesh ID is still live.
+            speedtree.tag_spm_asset(source, manifest, "material")
+            speedtree.tag_spm_asset(source_mesh, manifest, "mesh")
+            write_spm(target, root)
+            adoption = speedtree.prepare_source_material_adoption(
+                target,
+                manifest,
+                "M_branch",
+                8,
+                {
+                    **manifest,
+                    "source_material_adoption": adoption,
+                },
+            )
+
+            original_material_sample = speedtree.SPEEDTREE_101_MATERIAL_SAMPLE
+            original_mesh_sample = speedtree.SPEEDTREE_101_EXTERNAL_MESH_SAMPLE
+            speedtree.SPEEDTREE_101_MATERIAL_SAMPLE = sample
+            speedtree.SPEEDTREE_101_EXTERNAL_MESH_SAMPLE = sample
+            try:
+                _, action, material_id, mesh_ids = (
+                    speedtree.upsert_speedtree_assets_in_spm(
+                        target,
+                        manifest,
+                        "M_branch",
+                        adopt_source_material_id=8,
+                        adopt_reserved_mesh_ids=(
+                            speedtree.adoption_original_mesh_ids(adoption)
+                        ),
+                    )
+                )
+                groups = [{
+                    "material": "M_branch",
+                    "material_id": material_id,
+                    "mesh_ids": mesh_ids,
+                    "meshes": mesh_items,
+                }]
+                connection = speedtree.connect_atlas_generators_in_spm(
+                    target,
+                    ["M_branch"],
+                    groups,
+                    [8],
+                    source_mesh_ids_by_name={"M_branch": [3]},
+                    generator_variant_policy="ensure_all_material_cutouts",
+                )
+                finalized = speedtree.finalize_source_material_adoption(
+                    target,
+                    adoption,
+                    mesh_ids,
+                    connection,
+                )
+            finally:
+                speedtree.SPEEDTREE_101_MATERIAL_SAMPLE = (
+                    original_material_sample
+                )
+                speedtree.SPEEDTREE_101_EXTERNAL_MESH_SAMPLE = (
+                    original_mesh_sample
+                )
+
+            self.assertEqual(action, "updated")
+            self.assertEqual(mesh_ids, [4])
+            self.assertEqual(finalized["original_mesh_ids"], [3])
+            self.assertEqual(finalized["generated_mesh_ids"], [4])
+
     def test_adoption_migrates_previous_separate_material_in_the_same_scope(self):
         with tempfile.TemporaryDirectory() as folder:
             folder = Path(folder)
@@ -1878,10 +3233,53 @@ class SafetyTests(unittest.TestCase):
                 {("Frond 36", "Material:Frond:0"): (8, 1)},
             )
 
-    def test_untagged_same_name_with_different_mesh_paths_still_conflicts(self):
+    def test_untagged_unused_same_name_with_different_mesh_paths_is_reclaimed(self):
         with tempfile.TemporaryDirectory() as folder:
             target, sample, manifest, material_name = self._write_upsert_fixture(folder, None)
             manifest["meshes"] = [{"asset": str(Path(folder) / "meshes" / "different.fbx")}]
+            original_material_sample = speedtree.SPEEDTREE_101_MATERIAL_SAMPLE
+            original_mesh_sample = speedtree.SPEEDTREE_101_EXTERNAL_MESH_SAMPLE
+            speedtree.SPEEDTREE_101_MATERIAL_SAMPLE = sample
+            speedtree.SPEEDTREE_101_EXTERNAL_MESH_SAMPLE = sample
+            try:
+                _, action, material_id, mesh_ids = (
+                    speedtree.upsert_speedtree_assets_in_spm(
+                        target,
+                        manifest,
+                        material_name,
+                    )
+                )
+            finally:
+                speedtree.SPEEDTREE_101_MATERIAL_SAMPLE = original_material_sample
+                speedtree.SPEEDTREE_101_EXTERNAL_MESH_SAMPLE = original_mesh_sample
+
+            assets = speedtree.read_spm_xml(target).find("Assets")
+            material = assets.find("Material_v8[@ID='8']")
+            self.assertEqual(action, "reclaimed")
+            self.assertEqual(material_id, 8)
+            self.assertEqual(mesh_ids, [19])
+            self.assertEqual(speedtree.spm_material_mesh_ids(material), [19])
+            self.assertIsNone(assets.find("Mesh[@ID='18']"))
+            self.assertIsNotNone(assets.find("Mesh[@ID='19']"))
+            self.assertEqual(
+                speedtree.parse_atlas_leaf_spm_user_data(
+                    material.findtext("UserData")
+                )["scope"],
+                "new-uuid-scope",
+            )
+
+    def test_untagged_used_same_name_with_different_mesh_paths_still_conflicts(self):
+        with tempfile.TemporaryDirectory() as folder:
+            target, sample, manifest, material_name = self._write_upsert_fixture(
+                folder,
+                None,
+            )
+            root = speedtree.read_spm_xml(target)
+            add_generator(root, "Leaf Mesh", "Leaf 5", [(8, 18)])
+            write_spm(target, root)
+            manifest["meshes"] = [
+                {"asset": str(Path(folder) / "meshes" / "different.fbx")}
+            ]
             before = target.read_bytes()
             original_material_sample = speedtree.SPEEDTREE_101_MATERIAL_SAMPLE
             original_mesh_sample = speedtree.SPEEDTREE_101_EXTERNAL_MESH_SAMPLE
@@ -1889,11 +3287,71 @@ class SafetyTests(unittest.TestCase):
             speedtree.SPEEDTREE_101_EXTERNAL_MESH_SAMPLE = sample
             try:
                 with self.assertRaisesRegex(RuntimeError, "Material name conflict"):
-                    speedtree.upsert_speedtree_assets_in_spm(target, manifest, material_name)
+                    speedtree.upsert_speedtree_assets_in_spm(
+                        target,
+                        manifest,
+                        material_name,
+                    )
             finally:
                 speedtree.SPEEDTREE_101_MATERIAL_SAMPLE = original_material_sample
                 speedtree.SPEEDTREE_101_EXTERNAL_MESH_SAMPLE = original_mesh_sample
             self.assertEqual(target.read_bytes(), before)
+
+    def test_untagged_hidden_generator_same_name_is_reclaimed_as_assets_only(self):
+        with tempfile.TemporaryDirectory() as folder:
+            target, sample, manifest, material_name = self._write_upsert_fixture(
+                folder,
+                None,
+            )
+            root = speedtree.read_spm_xml(target)
+            hidden = add_generator(
+                root,
+                "Frond",
+                "Hidden stale Frond",
+                [(8, 18)],
+            )
+            ET.SubElement(hidden, "Hidden").text = "true"
+            write_spm(target, root)
+            manifest["meshes"] = [
+                {"asset": str(Path(folder) / "meshes" / "replacement.fbx")}
+            ]
+            original_material_sample = speedtree.SPEEDTREE_101_MATERIAL_SAMPLE
+            original_mesh_sample = speedtree.SPEEDTREE_101_EXTERNAL_MESH_SAMPLE
+            speedtree.SPEEDTREE_101_MATERIAL_SAMPLE = sample
+            speedtree.SPEEDTREE_101_EXTERNAL_MESH_SAMPLE = sample
+            try:
+                _, action, material_id, mesh_ids = (
+                    speedtree.upsert_speedtree_assets_in_spm(
+                        target,
+                        manifest,
+                        material_name,
+                    )
+                )
+            finally:
+                speedtree.SPEEDTREE_101_MATERIAL_SAMPLE = original_material_sample
+                speedtree.SPEEDTREE_101_EXTERNAL_MESH_SAMPLE = original_mesh_sample
+
+            parsed = speedtree.read_spm_xml(target)
+            assets = parsed.find("Assets")
+            material = assets.find("Material_v8[@ID='8']")
+            self.assertEqual(
+                speedtree.spm_generator_referenced_material_ids(parsed),
+                {8},
+            )
+            self.assertEqual(
+                speedtree.spm_visible_generator_referenced_material_ids(parsed),
+                set(),
+            )
+            self.assertEqual(action, "reclaimed")
+            self.assertEqual(material_id, 8)
+            self.assertEqual(mesh_ids, [19])
+            self.assertEqual(
+                speedtree.spm_material_mesh_ids(material),
+                [19],
+            )
+            # Destructive cleanup still protects the stale hidden slot's mesh.
+            self.assertIsNotNone(assets.find("Mesh[@ID='18']"))
+            self.assertIsNotNone(assets.find("Mesh[@ID='19']"))
 
     def test_legacy_name_scope_is_updated_and_retagged_with_uuid(self):
         with tempfile.TemporaryDirectory() as folder:
