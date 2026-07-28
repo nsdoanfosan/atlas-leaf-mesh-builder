@@ -18,7 +18,16 @@ from mathutils import Matrix, Vector
 from .constants import SPEEDTREE_101_BLANK_SPM, SPEEDTREE_101_EXTERNAL_MESH_SAMPLE, SPEEDTREE_101_MATERIAL_SAMPLE
 from .materials import make_speedtree_material
 from .props import speedtree_spm_targets
-from .texture_paths import atlas_texture_paths
+from .texture_paths import (
+    CANONICAL_OUTPUT_KIND,
+    CANONICAL_TEXTURE_STATUS,
+    SOURCE_FALLBACK_REMEDIATION,
+    SOURCE_FALLBACK_STATUS,
+    atlas_texture_paths,
+    canonical_texture_base_for_material,
+    expected_canonical_role_paths,
+    resolve_production_texture_contract,
+)
 
 
 ATLAS_LEAF_SPM_GENERATOR = "Atlas Leaf Mesh Builder"
@@ -30,6 +39,10 @@ GENERATOR_VARIANT_POLICY_ENSURE_ALL_MATERIAL_CUTOUTS = (
 FROND_BAKED_GEOMETRY_SCALE_PROPERTIES = (
     "Shape:Scale:Width",
     "Shape:Scale:Height",
+)
+BLENDER_CLUSTER_BAKE_ORIGIN = "blender_cluster_bake"
+TEXTURE_PROVISIONAL_RECEIPT_KIND = (
+    "speedtree_texture_provisional_receipt"
 )
 
 
@@ -50,6 +63,8 @@ def normalize_generator_variant_policy(value):
 def write_speedtree_readme(export_dir, manifest):
     path = Path(export_dir) / "README_SPEEDTREE_IMPORT.md"
     mesh_count = len(manifest["meshes"])
+    texture_status = manifest.get("texture_contract_status")
+    provisional = texture_status == SOURCE_FALLBACK_STATUS
     lines = [
         "# SpeedTree Import Notes",
         "",
@@ -59,7 +74,17 @@ def write_speedtree_readme(export_dir, manifest):
         "",
         "- The target `.spm` is a SpeedTree Modeler 10.1 asset file with one named material linked to all generated leaf meshes.",
         f"- Mesh asset files: `{mesh_count}` FBX/XML entries",
-        "- Materials reference the original source textures directly; no texture copies are generated.",
+        (
+            "- WARNING: canonical T_* output is absent; the production "
+            "handoff provisionally references original Atlas source files "
+            "directly and still requires PCG ST9 generation."
+            if provisional
+            else (
+                "- Atlas mesh construction keeps its original source images; "
+                "production SpeedTree materials use only the canonical "
+                "asset-local T_* outputs declared by PCG ST9 Texture."
+            )
+        ),
         "- Meshes are closed shells with the stem pivot at object origin.",
         "- FBX export uses a single material per mesh; XML assets are written when anchors are present.",
         f"- FBX mesh geometry scale: `{manifest.get('mesh_geometry_scale', 1)}`.",
@@ -69,15 +94,54 @@ def write_speedtree_readme(export_dir, manifest):
         "## Suggested SpeedTree Setup",
         "",
         "1. Open the target `.spm` in SpeedTree Modeler 10.1.",
-        "2. The atlas material should already reference the original texture maps.",
+        (
+            "2. The atlas material currently uses a provisional original-source "
+            "fallback; run PCG ST9 Texture to promote it to canonical T_* maps."
+            if provisional
+            else "2. The atlas material should reference the canonical T_* texture maps."
+        ),
         "3. The material's cutout mesh list should reference the generated asset files in `meshes/`.",
         "4. Use that material/mesh set in a Leaf Mesh generator as leaf variants.",
-        "5. If SpeedTree asks to relink files, select the original source texture folder.",
+        "5. If canonical T_* files are missing, generate them in PCG ST9 Texture instead of relinking an original or cache copy.",
         "",
-        "## Texture Map Hints",
+        "## Canonical Production Texture Maps",
         "",
     ]
-    for key, value in manifest["textures"].items():
+    for output in manifest.get("canonical_texture_outputs") or []:
+        lines.append(
+            f"- {output.get('material_name')}: "
+            f"`{output.get('texture_base')}`"
+        )
+        for key, value in sorted((output.get("files") or {}).items()):
+            lines.append(f"  - {key}: `{Path(value).name}`")
+    if provisional:
+        lines.extend(
+            [
+                "",
+                "## Provisional Source Fallback Warning",
+                "",
+            ]
+        )
+        for fallback in manifest.get("source_texture_fallbacks") or []:
+            lines.append(f"- material: `{fallback.get('material')}`")
+            lines.append(f"  - status: `{SOURCE_FALLBACK_STATUS}`")
+            lines.append(
+                f"  - remediation: `{fallback.get('remediation')}`"
+            )
+            for role, value in sorted(
+                (fallback.get("expected_t_paths") or {}).items()
+            ):
+                lines.append(f"  - expected {role}: `{value}`")
+    lines.extend(
+        [
+            "",
+            "## Atlas Mesh-Build Inputs",
+            "",
+            "These source images remain valid inputs for Blender atlas mesh construction only; they are not production SPM TexFilename values.",
+            "",
+        ]
+    )
+    for key, value in sorted((manifest.get("source_textures") or {}).items()):
         lines.append(f"- {key}: `{Path(value).name}`")
     path.write_text("\n".join(lines), encoding="utf-8")
     return path
@@ -409,10 +473,277 @@ def previous_scope_manifest(export_dir, manifest, fallback_manifest=None, target
     return {}
 
 
+OPERATIONAL_SOURCE_FIELDS = ("source_spm", "source_fbx")
+OPERATIONAL_SOURCE_BLOCKED_PARTS = {
+    ".sk_batch_isolated_bark",
+    "_sk_batch_isolated_bark",
+    ".sk_batch_temp",
+    "_sk_batch_temp",
+    ".sk_batch_cache",
+    "_sk_batch_cache",
+    ".speedtree_export_cache",
+    "_speedtree_export_cache",
+    ".cache",
+    "_cache",
+    "cache",
+}
+
+
+def operational_source_path_blocker(path):
+    try:
+        parts = Path(path).resolve().parts
+    except (OSError, TypeError, ValueError):
+        parts = Path(str(path or "")).parts
+    return next(
+        (
+            part
+            for part in parts
+            if part.casefold() in OPERATIONAL_SOURCE_BLOCKED_PARTS
+        ),
+        None,
+    )
+
+
+def _resolved_operational_source(path, production_root=None):
+    value = Path(str(path or "").strip())
+    if not value.is_absolute() and production_root is not None:
+        value = Path(production_root) / value
+    try:
+        return value.resolve()
+    except OSError:
+        return value
+
+
+def _source_rebase_pair(row):
+    if not isinstance(row, dict):
+        return None
+    source = (
+        row.get("source")
+        or row.get("isolated")
+        or row.get("cache")
+        or row.get("from")
+    )
+    production = (
+        row.get("production")
+        or row.get("canonical")
+        or row.get("target")
+        or row.get("to")
+    )
+    if source and production:
+        return str(source), str(production)
+    for field in OPERATIONAL_SOURCE_FIELDS:
+        value = row.get(field)
+        if not isinstance(value, dict):
+            continue
+        source = value.get("source") or value.get("isolated")
+        production = value.get("production") or value.get("canonical")
+        if source and production:
+            return str(source), str(production)
+    return None
+
+
+def collect_explicit_source_rebases(payload):
+    """Collect only explicit receipt/mapping declarations, never path guesses."""
+    mappings = {}
+
+    def visit(value):
+        if isinstance(value, list):
+            for child in value:
+                visit(child)
+            return
+        if not isinstance(value, dict):
+            return
+        declared = value.get("source_path_rebases")
+        if isinstance(declared, dict):
+            for source, production in declared.items():
+                if isinstance(production, str):
+                    mappings[str(source).casefold()] = production
+                else:
+                    pair = _source_rebase_pair(production)
+                    if pair is not None:
+                        mappings[pair[0].casefold()] = pair[1]
+        elif isinstance(declared, list):
+            for row in declared:
+                pair = _source_rebase_pair(row)
+                if pair is not None:
+                    mappings[pair[0].casefold()] = pair[1]
+        for key, child in value.items():
+            if key in {"historical_provenance", "source_path_rebases"}:
+                continue
+            visit(child)
+
+    visit(payload)
+    return mappings
+
+
+def sanitize_manifest_operational_sources(manifest, production_root=None):
+    """Keep isolated/cache capture paths as history, never as live sources."""
+    sanitized = copy.deepcopy(manifest)
+    mappings = collect_explicit_source_rebases(sanitized)
+    history = []
+    warnings = []
+    rebased = 0
+    ready = 0
+    blocked = 0
+
+    def historical_record(node, field, path, reason):
+        hash_field = f"{field}_sha256"
+        return {
+            "field": field,
+            "path": str(path),
+            "sha256": str(node.get(hash_field) or "") or None,
+            "reason": reason,
+        }
+
+    def explicit_candidate(node, field, authored):
+        direct = (
+            node.get(f"production_{field}")
+            or node.get(f"canonical_{field}")
+        )
+        local = node.get("source_path_rebase")
+        if not direct and isinstance(local, dict):
+            direct = local.get(field)
+        return direct or mappings.get(str(authored).casefold())
+
+    def visit(value):
+        nonlocal rebased, ready, blocked
+        if isinstance(value, list):
+            for child in value:
+                visit(child)
+            return
+        if not isinstance(value, dict):
+            return
+        node_warnings = []
+        for field in OPERATIONAL_SOURCE_FIELDS:
+            authored = str(value.get(field) or "").strip()
+            if not authored:
+                continue
+            current = _resolved_operational_source(
+                authored,
+                production_root,
+            )
+            blocker = operational_source_path_blocker(current)
+            missing = not current.is_file()
+            if not blocker and not missing:
+                value[field] = str(current)
+                ready += 1
+                continue
+            reason = (
+                f"blocked_component={blocker}"
+                if blocker
+                else "operational_source_missing"
+            )
+            history.append(
+                historical_record(value, field, authored, reason)
+            )
+            candidate = explicit_candidate(value, field, authored)
+            production = (
+                _resolved_operational_source(candidate, production_root)
+                if candidate
+                else None
+            )
+            candidate_blocker = (
+                operational_source_path_blocker(production)
+                if production is not None
+                else None
+            )
+            if (
+                production is not None
+                and production.is_file()
+                and not candidate_blocker
+            ):
+                value[field] = str(production)
+                value[f"{field}_sha256"] = file_sha256(production)
+                value[f"{field}_rebase_status"] = (
+                    "production_canonical_rebased"
+                )
+                rebased += 1
+                continue
+            value.pop(field, None)
+            value.pop(f"{field}_sha256", None)
+            value[f"{field}_rebase_status"] = "needs_refresh"
+            warning = (
+                f"{field} cannot use isolated/cache/missing source "
+                f"{authored!r}; provide an explicit existing production "
+                "canonical mapping/receipt."
+            )
+            value[f"{field}_warning"] = warning
+            node_warnings.append(warning)
+            warnings.append(warning)
+            blocked += 1
+        if node_warnings:
+            value["needs_refresh"] = True
+            value["operational_source_status"] = "needs_refresh"
+        elif any(
+            value.get(f"{field}_rebase_status")
+            == "production_canonical_rebased"
+            for field in OPERATIONAL_SOURCE_FIELDS
+        ):
+            value["needs_refresh"] = False
+            value["operational_source_status"] = (
+                "production_canonical_rebased"
+            )
+        for key, child in value.items():
+            if key in {"historical_provenance", "source_path_rebases"}:
+                continue
+            visit(child)
+
+    visit(sanitized)
+    unique_history = {}
+    for row in history:
+        key = (
+            row["field"],
+            row["path"].casefold(),
+            str(row.get("sha256") or "").casefold(),
+        )
+        unique_history[key] = row
+    if unique_history:
+        provenance = sanitized.get("historical_provenance")
+        if not isinstance(provenance, dict):
+            provenance = {}
+            sanitized["historical_provenance"] = provenance
+        existing = provenance.get("isolated_cache_sources")
+        if not isinstance(existing, list):
+            existing = []
+        combined = {}
+        for row in [*existing, *unique_history.values()]:
+            if not isinstance(row, dict):
+                continue
+            key = (
+                str(row.get("field") or ""),
+                str(row.get("path") or "").casefold(),
+                str(row.get("sha256") or "").casefold(),
+            )
+            combined[key] = row
+        provenance["isolated_cache_sources"] = list(combined.values())
+    if history or ready:
+        sanitized["operational_source_path_contract"] = {
+            "status": (
+                "needs_refresh"
+                if blocked
+                else (
+                    "production_canonical_rebased"
+                    if rebased
+                    else "production_ready"
+                )
+            ),
+            "needs_refresh": bool(blocked),
+            "production_ready_count": ready,
+            "rebased_count": rebased,
+            "blocked_count": blocked,
+            "warnings": list(dict.fromkeys(warnings)),
+        }
+    return sanitized
+
+
 def write_scope_manifest(export_dir, manifest, target_spm=None):
     path = scope_manifest_path(export_dir, manifest, target_spm)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    safe_manifest = sanitize_manifest_operational_sources(
+        manifest,
+        production_root=export_dir,
+    )
+    path.write_text(json.dumps(safe_manifest, indent=2), encoding="utf-8")
     return path
 
 
@@ -651,6 +982,8 @@ def set_material_map(
     spm_path,
     enabled=True,
     texture_size=None,
+    tex_source=None,
+    invert=None,
 ):
     map_node = None
     for candidate in material.findall("Map"):
@@ -664,6 +997,10 @@ def set_material_map(
     if texture_path:
         tex_filename.text = relative_spm_path(spm_path, texture_path)
         child_text(map_node, "TexEnabled", "true" if enabled else "false")
+        if tex_source is not None:
+            child_text(map_node, "TexSource", str(int(tex_source)))
+        if invert is not None:
+            child_text(map_node, "TexInvert", "true" if invert else "false")
         if texture_size is None:
             texture_size = texture_pixel_dimensions(texture_path)
         child_text(map_node, "TexSizeX", str(int(texture_size[0])))
@@ -677,7 +1014,16 @@ def make_spm_material(spm_path, texture_exports, mesh_ids, material_name, manife
     material = first_material_template()
     material.attrib["ID"] = "1"
     material.attrib["Name"] = material_name
-    update_spm_material(material, spm_path, texture_exports, mesh_ids)
+    update_spm_material(
+        material,
+        spm_path,
+        texture_exports,
+        mesh_ids,
+        texture_contract_status=(
+            (manifest or {}).get("texture_contract_status")
+            or CANONICAL_TEXTURE_STATUS
+        ),
+    )
     if manifest is not None:
         tag_spm_asset(material, manifest, "material")
     return material
@@ -698,7 +1044,13 @@ def update_spm_material_mesh_ids(material, mesh_ids):
     return material
 
 
-def update_spm_material_texture_maps(material, spm_path, texture_exports):
+def update_spm_material_texture_maps(
+    material,
+    spm_path,
+    texture_exports,
+    *,
+    texture_contract_status=CANONICAL_TEXTURE_STATUS,
+):
     previous_size = (
         integer_value(material.findtext("Width")),
         integer_value(material.findtext("Height")),
@@ -715,26 +1067,213 @@ def update_spm_material_texture_maps(material, spm_path, texture_exports):
     child_text(material, "Width", str(int(texture_size[0])))
     child_text(material, "Height", str(int(texture_size[1])))
 
-    set_material_map(material, "Color", texture_exports.get("albedo"), spm_path, texture_size=texture_size)
-    set_material_map(material, "Opacity", texture_exports.get("alpha"), spm_path, texture_size=texture_size)
-    set_material_map(material, "Normal", texture_exports.get("normal"), spm_path, texture_size=texture_size)
-    set_material_map(material, "Gloss", texture_exports.get("gloss") or texture_exports.get("roughness"), spm_path, texture_size=texture_size)
-    set_material_map(material, "Height", texture_exports.get("height"), spm_path, texture_size=texture_size)
-    set_material_map(material, "SubsurfaceColor", texture_exports.get("translucency"), spm_path, texture_size=texture_size)
-    set_material_map(material, "SubsurfaceAmount", texture_exports.get("translucency"), spm_path, texture_size=texture_size)
-    set_material_map(material, "AO", texture_exports.get("ao"), spm_path, texture_size=texture_size)
+    if texture_contract_status == SOURCE_FALLBACK_STATUS:
+        set_material_map(
+            material,
+            "Color",
+            texture_exports.get("albedo"),
+            spm_path,
+            texture_size=texture_size,
+        )
+        set_material_map(
+            material,
+            "Opacity",
+            texture_exports.get("alpha"),
+            spm_path,
+            texture_size=texture_size,
+        )
+        set_material_map(
+            material,
+            "Normal",
+            texture_exports.get("normal"),
+            spm_path,
+            texture_size=texture_size,
+        )
+        set_material_map(
+            material,
+            "Gloss",
+            texture_exports.get("gloss")
+            or texture_exports.get("roughness"),
+            spm_path,
+            texture_size=texture_size,
+        )
+        set_material_map(
+            material,
+            "Height",
+            texture_exports.get("height"),
+            spm_path,
+            texture_size=texture_size,
+        )
+        set_material_map(
+            material,
+            "SubsurfaceColor",
+            texture_exports.get("translucency"),
+            spm_path,
+            texture_size=texture_size,
+        )
+        set_material_map(
+            material,
+            "SubsurfaceAmount",
+            texture_exports.get("subsurface_amount")
+            or texture_exports.get("translucency"),
+            spm_path,
+            texture_size=texture_size,
+        )
+        set_material_map(
+            material,
+            "AO",
+            texture_exports.get("ao"),
+            spm_path,
+            texture_size=texture_size,
+        )
+        for empty_map in ("Specular", "Metallic", "Custom", "Custom2"):
+            set_material_map(
+                material,
+                empty_map,
+                None,
+                spm_path,
+                enabled=False,
+            )
+        return material
+    if texture_contract_status != CANONICAL_TEXTURE_STATUS:
+        raise RuntimeError(
+            "Unknown production texture_contract_status: "
+            f"{texture_contract_status!r}"
+        )
+    canonical_roles = {
+        "color",
+        "opacity",
+        "normal",
+        "extra",
+        "height",
+        "subsurface",
+    }
+    missing_roles = sorted(canonical_roles - set(texture_exports))
+    if missing_roles:
+        raise RuntimeError(
+            "Production SpeedTree material requires canonical PCG ST9 roles; "
+            f"missing={','.join(missing_roles)}. "
+            "PCG ST9 Texture에서 생성하세요."
+        )
+    set_material_map(
+        material,
+        "Color",
+        texture_exports["color"],
+        spm_path,
+        texture_size=texture_size,
+        tex_source=0,
+        invert=False,
+    )
+    set_material_map(
+        material,
+        "Opacity",
+        texture_exports["opacity"],
+        spm_path,
+        enabled=False,
+        texture_size=texture_size,
+        tex_source=1,
+        invert=False,
+    )
+    opacity = next(
+        (
+            node
+            for node in material.findall("Map")
+            if node.attrib.get("Name") == "Opacity"
+        ),
+        None,
+    )
+    if opacity is not None:
+        child_text(opacity, "ColorX", "1")
+    set_material_map(
+        material,
+        "Normal",
+        texture_exports["normal"],
+        spm_path,
+        texture_size=texture_size,
+        tex_source=0,
+        invert=False,
+    )
+    set_material_map(
+        material,
+        "Gloss",
+        texture_exports["extra"],
+        spm_path,
+        texture_size=texture_size,
+        tex_source=2,
+        invert=True,
+    )
+    set_material_map(
+        material,
+        "Height",
+        texture_exports["height"],
+        spm_path,
+        texture_size=texture_size,
+        tex_source=1,
+        invert=False,
+    )
+    set_material_map(
+        material,
+        "SubsurfaceColor",
+        texture_exports["subsurface"],
+        spm_path,
+        texture_size=texture_size,
+        tex_source=0,
+        invert=False,
+    )
+    set_material_map(
+        material,
+        "SubsurfaceAmount",
+        texture_exports["subsurface"],
+        spm_path,
+        enabled=False,
+        texture_size=texture_size,
+        tex_source=1,
+        invert=False,
+    )
+    subsurface_amount = next(
+        (
+            node
+            for node in material.findall("Map")
+            if node.attrib.get("Name") == "SubsurfaceAmount"
+        ),
+        None,
+    )
+    if subsurface_amount is not None:
+        child_text(subsurface_amount, "ColorX", "1")
+    ao_path = texture_exports.get("ao") or texture_exports["extra"]
+    set_material_map(
+        material,
+        "AO",
+        ao_path,
+        spm_path,
+        texture_size=texture_size,
+        tex_source=0 if texture_exports.get("ao") else 1,
+        invert=False,
+    )
     for empty_map in ("Specular", "Metallic", "Custom", "Custom2"):
         set_material_map(material, empty_map, None, spm_path, enabled=False)
     return material
 
 
-def update_spm_material(material, spm_path, texture_exports, mesh_ids):
+def update_spm_material(
+    material,
+    spm_path,
+    texture_exports,
+    mesh_ids,
+    *,
+    texture_contract_status=CANONICAL_TEXTURE_STATUS,
+):
     child_text(material, "TwoSided", "true")
     update_spm_material_mesh_ids(material, mesh_ids)
     child_text(material, "Atlas", "0")
     child_text(material, "AtlasName", "")
     child_text(material, "BackMaterialID", "-1")
-    update_spm_material_texture_maps(material, spm_path, texture_exports)
+    update_spm_material_texture_maps(
+        material,
+        spm_path,
+        texture_exports,
+        texture_contract_status=texture_contract_status,
+    )
     force_material_season_curve_one(material)
     return material
 
@@ -2057,20 +2596,31 @@ def apply_authoritative_source_binding_repairs(
         if (
             not source_name
             or source_id is None
-            or from_mesh_id != -9
-            or to_mesh_id != -10
+            or from_mesh_id is None
+            or to_mesh_id is None
+            or from_mesh_id == to_mesh_id
             or not str(repair.get("generator_guid") or "").strip()
             or not str(repair.get("slot_prefix") or "").strip()
         ):
             raise RuntimeError(
-                f"{context} is not the supported exact -9 to -10 sentinel "
-                "repair contract."
+                f"{context} is not a complete exact binding repair contract."
             )
         source = source_records.get(source_id)
         if source is None or source.get("name") != source_name:
             raise RuntimeError(
                 f"{context} source material identity does not match the "
                 "current target SPM."
+            )
+        authored_mesh_ids = {
+            positive_int(value)
+            for value in source.get("mesh_ids") or []
+        }
+        authored_mesh_ids.discard(None)
+        if to_mesh_id != -10 and to_mesh_id not in authored_mesh_ids:
+            raise RuntimeError(
+                f"{context} destination Mesh {to_mesh_id} is neither the "
+                "-10 sentinel nor a cutout owned by the current source "
+                f"material '{source_name}'."
             )
         pair = _generator_pair_for_binding(root, repair, context)
         slot_key = generator_binding_slot_key(pair)
@@ -2123,6 +2673,22 @@ def apply_authoritative_source_binding_repairs(
                 raise RuntimeError(
                     f"{evidence_context} does not contain exactly one "
                     f"material named '{source_name}'."
+                )
+            evidence_material = next(
+                node
+                for node in evidence_root.findall(".//Material_v8")
+                if positive_int(node.get("ID")) == evidence_material_id
+            )
+            evidence_mesh_ids = set(
+                spm_material_mesh_ids(evidence_material)
+            )
+            if (
+                to_mesh_id != -10
+                and to_mesh_id not in evidence_mesh_ids
+            ):
+                raise RuntimeError(
+                    f"{evidence_context} material '{source_name}' does not "
+                    f"own authored cutout Mesh {to_mesh_id}."
                 )
             evidence_pair = _generator_pair_for_binding(
                 evidence_root,
@@ -3396,12 +3962,52 @@ def target_scope_manifests_for_blend(spm_path, blend_path):
             payload["blend_file"], blend_path
         ):
             continue
-        if payload.get("spm") and not blend_paths_equal(payload["spm"], spm_path):
+        if (
+            not payload.get("spm")
+            or not blend_paths_equal(payload["spm"], spm_path)
+        ):
             continue
         payload = dict(payload)
         payload["_scope_manifest_path"] = str(path)
         manifests.append(payload)
     return manifests
+
+
+def blend_target_contract_manifest_paths(spm_path, blend_path, manifests):
+    """Return only operational manifests that exactly describe one live target."""
+    spm_path = Path(spm_path).expanduser().absolute()
+    blend_path = Path(blend_path).expanduser().absolute()
+    candidates = [
+        Path(manifest["_scope_manifest_path"])
+        for manifest in manifests
+        if manifest.get("_scope_manifest_path")
+    ]
+    candidates.extend(
+        (
+            target_manifest_path(spm_path),
+            spm_path.parent / "speedtree_import_manifest.json",
+        )
+    )
+
+    matched = []
+    seen = set()
+    for path in candidates:
+        path = Path(path).expanduser().absolute()
+        key = str(path).replace("\\", "/").casefold()
+        if key in seen or not path.is_file():
+            continue
+        seen.add(key)
+        payload = read_json_file(path, {})
+        if (
+            not isinstance(payload, dict)
+            or not payload.get("blend_file")
+            or not payload.get("spm")
+            or not blend_paths_equal(payload["blend_file"], blend_path)
+            or not blend_paths_equal(payload["spm"], spm_path)
+        ):
+            continue
+        matched.append(path)
+    return matched
 
 
 def managed_mesh_marker_matches_scope(mesh, scope):
@@ -4000,8 +4606,21 @@ def remove_atlas_scope_assets_from_spm(spm_path, manifests):
     }
 
 
-def remove_blend_target_from_spm(blend_path, spm_path):
-    """Transactionally detach one blend's managed Atlas data from one SPM."""
+def remove_blend_target_from_spm(
+    blend_path,
+    spm_path,
+    *,
+    preserve_scope_history=False,
+):
+    """Transactionally detach one blend's managed Atlas data from one SPM.
+
+    An immediate ON-refresh may preserve the exact per-target scope manifest
+    as adoption provenance. The cleaned SPM no longer contains the generated
+    output, while the next export can still reuse the original adopted
+    Material/Mesh snapshots. Generator connection state is stripped because
+    its relationship-created slots were just removed. A real OFF operation
+    keeps the default and retires every operational manifest.
+    """
     blend_path = Path(blend_path).expanduser().absolute()
     spm_path = Path(spm_path).expanduser().absolute()
     if not spm_path.is_file():
@@ -4047,6 +4666,37 @@ def remove_blend_target_from_spm(blend_path, spm_path):
             )
         return {"status": "no_managed_manifest", "spm": str(spm_path), "backup": None}
 
+    contract_manifest_paths = blend_target_contract_manifest_paths(
+        spm_path,
+        blend_path,
+        manifests,
+    )
+    contract_manifest_snapshots = {
+        path: path.read_bytes() for path in contract_manifest_paths
+    }
+    scope_manifest_keys = {
+        str(
+            Path(manifest["_scope_manifest_path"])
+            .expanduser()
+            .absolute()
+        ).replace("\\", "/").casefold()
+        for manifest in manifests
+        if manifest.get("_scope_manifest_path")
+    }
+    retained_scope_manifests = [
+        path
+        for path in contract_manifest_paths
+        if (
+            preserve_scope_history
+            and str(path).replace("\\", "/").casefold()
+            in scope_manifest_keys
+        )
+    ]
+    retired_contract_manifests = [
+        path
+        for path in contract_manifest_paths
+        if path not in retained_scope_manifests
+    ]
     backup_dir = spm_path.parent / "_spm_backups"
     backup_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -4054,14 +4704,51 @@ def remove_blend_target_from_spm(blend_path, spm_path):
     shutil.copy2(spm_path, backup)
     try:
         cleanup = remove_atlas_scope_assets_from_spm(spm_path, manifests)
-    except Exception:
-        shutil.copy2(backup, spm_path)
+        for path in retained_scope_manifests:
+            history = read_json_file(path, {})
+            if not isinstance(history, dict):
+                raise RuntimeError(
+                    f"Atlas scope history manifest is invalid: {path}"
+                )
+            history = copy.deepcopy(history)
+            history.pop("generator_connection", None)
+            path.write_text(
+                json.dumps(history, indent=2),
+                encoding="utf-8",
+            )
+        for path in retired_contract_manifests:
+            path.unlink()
+    except Exception as exc:
+        restore_errors = []
+        try:
+            shutil.copy2(backup, spm_path)
+        except OSError as restore_exc:
+            restore_errors.append(f"SPM restore failed: {restore_exc}")
+        for path, content in contract_manifest_snapshots.items():
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(content)
+            except OSError as restore_exc:
+                restore_errors.append(
+                    f"manifest restore failed for {path}: {restore_exc}"
+                )
+        if restore_errors:
+            raise RuntimeError(
+                f"Atlas target removal failed for {spm_path}: {exc}. "
+                + " ".join(restore_errors)
+            ) from exc
         raise
     return {
         "status": "cleaned" if cleanup["changed"] else "already_clean",
         "spm": str(spm_path),
         "backup": str(backup),
         "cleanup": cleanup,
+        "retired_contract_manifests": [
+            str(path) for path in retired_contract_manifests
+        ],
+        "retained_scope_manifests": [
+            str(path) for path in retained_scope_manifests
+        ],
     }
 
 
@@ -4645,9 +5332,22 @@ def upsert_speedtree_assets_in_spm(
                 material,
                 spm_path,
                 manifest["textures"],
+                texture_contract_status=(
+                    manifest.get("texture_contract_status")
+                    or CANONICAL_TEXTURE_STATUS
+                ),
             )
         else:
-            update_spm_material(material, spm_path, manifest["textures"], mesh_ids)
+            update_spm_material(
+                material,
+                spm_path,
+                manifest["textures"],
+                mesh_ids,
+                texture_contract_status=(
+                    manifest.get("texture_contract_status")
+                    or CANONICAL_TEXTURE_STATUS
+                ),
+            )
         tag_spm_asset(material, manifest, "material")
 
     for mesh_id, mesh_path in zip(mesh_ids, mesh_paths):
@@ -5057,24 +5757,300 @@ def physical_normalization_receipt_from_scene(scene):
     }
 
 
+def _texture_path_key(value):
+    try:
+        return str(Path(value).expanduser().resolve()).casefold()
+    except (OSError, TypeError, ValueError):
+        return str(value or "").replace("\\", "/").casefold()
+
+
+def source_group_material_users(group):
+    """Return objects that visibly consume the group's Blender material."""
+    material_name = str(group.get("material") or "").strip().casefold()
+    users = []
+    for obj in group.get("objects") or []:
+        for slot in getattr(obj, "material_slots", ()) or ():
+            material = getattr(slot, "material", None)
+            if (
+                material is not None
+                and str(getattr(material, "name", "") or "").strip().casefold()
+                == material_name
+            ):
+                users.append(str(getattr(obj, "name", "") or ""))
+                break
+    return sorted({name for name in users if name})
+
+
+def blender_cluster_bake_origin_receipt(
+    source_paths,
+    group,
+    normalization_receipt,
+    *,
+    blend_file=None,
+):
+    """Prove that direct provisional maps are this Blender Cluster bake.
+
+    A filename pattern alone is not evidence.  The current plan objects must
+    use the requested material, and every source path must be listed by the
+    physical-capture receipt.  Cache/isolated filtering remains enforced by
+    ``resolve_production_texture_contract`` before this function is called.
+    """
+    if not isinstance(normalization_receipt, dict):
+        return None
+    if normalization_receipt.get("workflow_mode") != "PHYSICAL_DIRECT_CAPTURE":
+        return None
+    capture = normalization_receipt.get("physical_capture_contract")
+    if not isinstance(capture, dict):
+        return None
+    capture_hash = str(
+        normalization_receipt.get(
+            "physical_capture_contract_sha256"
+        )
+        or ""
+    ).strip()
+    if (
+        not capture_hash
+        or str(capture.get("contract_sha256") or "").strip()
+        != capture_hash
+    ):
+        return None
+
+    capture_maps = []
+    capture_paths = {}
+    for row in capture.get("capture_maps") or []:
+        if not isinstance(row, dict):
+            continue
+        path = str(row.get("path") or "").strip()
+        role = str(row.get("role") or "").strip()
+        if not path or not role:
+            continue
+        record = {
+            "role": role,
+            "path": str(Path(path).expanduser().resolve()),
+            "sha256": str(row.get("sha256") or "").strip() or None,
+        }
+        capture_maps.append(record)
+        capture_paths[_texture_path_key(path)] = record
+    if not capture_maps:
+        return None
+
+    source_paths = {
+        str(role): Path(path).expanduser().resolve()
+        for role, path in (source_paths or {}).items()
+    }
+    if not source_paths or any(
+        _texture_path_key(path) not in capture_paths
+        for path in source_paths.values()
+    ):
+        return None
+
+    material_users = source_group_material_users(group)
+    if not material_users:
+        return None
+
+    current_blend = str(blend_file or "").strip()
+    receipt_blend = str(capture.get("source_blend") or "").strip()
+    if (
+        current_blend
+        and receipt_blend
+        and _texture_path_key(current_blend)
+        != _texture_path_key(receipt_blend)
+    ):
+        return None
+
+    return {
+        "kind": "blender_cluster_bake_texture_origin_receipt",
+        "version": 1,
+        "source_origin": BLENDER_CLUSTER_BAKE_ORIGIN,
+        "material": str(group.get("material") or ""),
+        "material_users": material_users,
+        "blend_file": current_blend or receipt_blend or None,
+        "physical_capture_contract_sha256": capture_hash,
+        "source_roles": sorted(source_paths),
+        "capture_maps": sorted(
+            capture_maps,
+            key=lambda row: (
+                row["role"].casefold(),
+                row["path"].casefold(),
+            ),
+        ),
+    }
+
+
+def target_material_id_hint(
+    target_spm,
+    material_name,
+    source_material_names=None,
+    source_material_ids=None,
+):
+    """Return the target-local material ID used to select a canonical output."""
+    target = Path(target_spm)
+    if target.is_file():
+        root = read_spm_xml(target)
+        assets = root.find("Assets")
+        matches = (
+            [
+                node
+                for node in assets.findall("Material_v8")
+                if node.attrib.get("Name") == material_name
+            ]
+            if assets is not None
+            else []
+        )
+        if len(matches) == 1:
+            value = positive_int(matches[0].attrib.get("ID"))
+            if value is not None:
+                return value
+    if isinstance(source_material_ids, dict):
+        return positive_int(source_material_ids.get(material_name))
+    names = [str(value) for value in source_material_names or []]
+    ids = list(source_material_ids or [])
+    if len(names) == len(ids):
+        for name, value in zip(names, ids):
+            if name == material_name:
+                return positive_int(value)
+    return None
+
+
+def serializable_canonical_texture_output(output, material_name):
+    return {
+        "kind": CANONICAL_OUTPUT_KIND,
+        "texture_contract_status": CANONICAL_TEXTURE_STATUS,
+        "material_name": material_name,
+        "material_id": output["material_target"]["material_id"],
+        "target_spm": str(output["material_target"]["spm"]),
+        "manifest": str(output["manifest_path"]),
+        "asset_root": str(output["asset_root"]),
+        "texture_root": str(output["texture_root"]),
+        "texture_base": output["texture_base"],
+        "required_roles": list(output["required_roles"]),
+        "files": {
+            role: str(path)
+            for role, path in sorted(output["files"].items())
+        },
+        "producer": dict(output["producer"]),
+    }
+
+
+def serializable_source_texture_fallback(
+    target_spm,
+    material_name,
+    source_paths,
+    *,
+    source_origin=None,
+    origin_receipt=None,
+):
+    expected = expected_canonical_role_paths(target_spm, material_name)
+    source_origin = str(source_origin or "atlas_mesh_build_source")
+    if source_origin == BLENDER_CLUSTER_BAKE_ORIGIN:
+        warning = (
+            "Canonical T_* manifest/output is absent. Production SpeedTree "
+            "handoff is provisionally referencing the verified Blender "
+            "Cluster bake maps directly; generate and export the Substance "
+            "graph in PCG ST9 Texture to promote and rewire this material."
+        )
+    else:
+        warning = (
+            "Canonical T_* manifest/output is absent. Production SpeedTree "
+            "handoff is provisionally referencing the original Atlas "
+            "mesh-build source directly; generate and export the Substance "
+            "graph in PCG ST9 Texture to promote and rewire this material."
+        )
+    result = {
+        "texture_contract_status": SOURCE_FALLBACK_STATUS,
+        "material": material_name,
+        "source_origin": source_origin,
+        "source_paths": {
+            role: str(path)
+            for role, path in sorted(source_paths.items())
+        },
+        "source_roles": sorted(source_paths),
+        "expected_t_paths": {
+            role: str(path)
+            for role, path in sorted(expected.items())
+        },
+        "expected_texture_base": canonical_texture_base_for_material(
+            material_name
+        ),
+        "remediation": SOURCE_FALLBACK_REMEDIATION,
+        "warning": warning,
+    }
+    if origin_receipt is not None:
+        result["origin_receipt"] = copy.deepcopy(origin_receipt)
+    result["provisional_receipt"] = {
+        "kind": TEXTURE_PROVISIONAL_RECEIPT_KIND,
+        "version": 1,
+        "status": SOURCE_FALLBACK_STATUS,
+        "source_origin": source_origin,
+        "material": material_name,
+        "target_spm": str(Path(target_spm).expanduser().resolve()),
+        "source_roles": sorted(source_paths),
+        "warning": result["warning"],
+        "remediation": result["remediation"],
+        "canonical_promotion_required": True,
+    }
+    if origin_receipt is not None:
+        result["provisional_receipt"][
+            "origin_receipt_kind"
+        ] = origin_receipt.get("kind")
+        result["provisional_receipt"][
+            "physical_capture_contract_sha256"
+        ] = origin_receipt.get("physical_capture_contract_sha256")
+    return result
+
+
+def exported_material_group_manifest(group, group_meshes):
+    """Preserve the resolved texture contract through FBX export."""
+    result = {
+        "collection": group["collection"],
+        "material": group["material"],
+        "mesh_count": len(group_meshes),
+        "meshes": group_meshes,
+        "texture_contract_status": group["texture_contract_status"],
+    }
+    if group["texture_contract_status"] == CANONICAL_TEXTURE_STATUS:
+        result["canonical_texture_output"] = copy.deepcopy(
+            group["canonical_texture_output"]
+        )
+    elif group["texture_contract_status"] == SOURCE_FALLBACK_STATUS:
+        result["source_texture_fallback"] = copy.deepcopy(
+            group["source_texture_fallback"]
+        )
+    else:
+        raise RuntimeError(
+            "Unknown material-group texture contract status: "
+            f"{group['texture_contract_status']!r}"
+        )
+    return result
+
+
 def export_speedtree_assets(
     props,
     export_dir,
     atlas_asset_name=None,
     *,
+    target_spm=None,
+    source_material_names=None,
+    source_material_ids=None,
+    canonical_texture_manifest_path=None,
     preserve_explicit_material_name=False,
 ):
     collection = bpy.data.collections.get(props.collection_name)
     if not collection:
         raise RuntimeError(f"Collection not found: {props.collection_name}")
-    texture_exports = {
+    if target_spm is None:
+        raise RuntimeError(
+            "Production SpeedTree export requires an explicit target SPM so "
+            "canonical PCG ST9 texture outputs can be resolved."
+        )
+    source_texture_exports = {
         key: str(path.resolve())
         for key, path in atlas_texture_paths(bpy.path.abspath(props.albedo_path)).items()
         if path.exists()
     }
-    texture_dimensions = common_texture_dimensions(texture_exports)
-    texture_signature = texture_path_signature(texture_exports)
-    export_scope_id = resolve_export_scope_id(collection, export_dir, texture_signature)
+    source_texture_dimensions = common_texture_dimensions(
+        source_texture_exports
+    )
 
     source_groups = grouped_source_objects(
         collection,
@@ -5106,6 +6082,91 @@ def export_speedtree_assets(
     else:
         # A stale scene-level report must not change a legacy export contract.
         normalization_receipt = None
+
+    canonical_outputs = {}
+    source_fallbacks = {}
+    production_texture_maps = {}
+    production_signature_paths = {}
+    production_dimensions = {}
+    for group in source_groups:
+        if not group["objects"]:
+            continue
+        material_name = group["material"]
+        material_id = target_material_id_hint(
+            target_spm,
+            material_name,
+            source_material_names,
+            source_material_ids,
+        )
+        contract = resolve_production_texture_contract(
+            target_spm,
+            material_name,
+            material_id,
+            source_paths=source_texture_exports,
+            manifest_path=canonical_texture_manifest_path,
+        )
+        texture_status = contract["texture_contract_status"]
+        if texture_status == CANONICAL_TEXTURE_STATUS:
+            output = contract["canonical_output"]
+            canonical_outputs[material_name] = output
+            serialized = serializable_canonical_texture_output(
+                output,
+                material_name,
+            )
+            group["texture_contract_status"] = CANONICAL_TEXTURE_STATUS
+            group["canonical_texture_output"] = serialized
+            production_texture_maps[material_name] = contract["files"]
+        else:
+            fallback_paths = contract["source_paths"]
+            origin_receipt = blender_cluster_bake_origin_receipt(
+                fallback_paths,
+                group,
+                normalization_receipt,
+                blend_file=bpy.data.filepath,
+            )
+            source_origin = (
+                BLENDER_CLUSTER_BAKE_ORIGIN
+                if origin_receipt is not None
+                else "atlas_mesh_build_source"
+            )
+            serialized = serializable_source_texture_fallback(
+                target_spm,
+                material_name,
+                fallback_paths,
+                source_origin=source_origin,
+                origin_receipt=origin_receipt,
+            )
+            source_fallbacks[material_name] = serialized
+            group["texture_contract_status"] = SOURCE_FALLBACK_STATUS
+            group["source_texture_fallback"] = serialized
+            production_texture_maps[material_name] = fallback_paths
+        production_dimensions[material_name] = list(
+            common_texture_dimensions(
+                production_texture_maps[material_name]
+            )
+        )
+        for role, path in production_texture_maps[material_name].items():
+            production_signature_paths[f"{material_name}:{role}"] = path
+    texture_statuses = {
+        group.get("texture_contract_status")
+        for group in source_groups
+        if group["objects"]
+    }
+    if len(texture_statuses) != 1:
+        raise RuntimeError(
+            "Atlas material groups resolved conflicting production texture "
+            f"states: {sorted(texture_statuses)}"
+        )
+    texture_contract_status = next(iter(texture_statuses))
+    canonical_manifest_available = (
+        texture_contract_status == CANONICAL_TEXTURE_STATUS
+    )
+    texture_signature = texture_path_signature(production_signature_paths)
+    export_scope_id = resolve_export_scope_id(
+        collection,
+        export_dir,
+        texture_signature,
+    )
     prototype_bounds = {
         row["skeletal_asset"].casefold(): row["normalized_bounds"]
         for row in (normalization_receipt or {}).get("prototypes") or []
@@ -5128,11 +6189,6 @@ def export_speedtree_assets(
     mesh_dir = export_dir / "meshes"
     mesh_dir.mkdir(parents=True, exist_ok=True)
 
-    materials = {
-        group["material"]: make_speedtree_material(group["material"], bpy.path.abspath(props.albedo_path))
-        for group in source_groups
-        if group["objects"]
-    }
     mesh_geometry_scale = max(float(props.speedtree_mesh_scale), 0.000001)
     mesh_asset_scale = max(
         float(getattr(props, "speedtree_mesh_asset_scale", 1.0)),
@@ -5169,9 +6225,29 @@ def export_speedtree_assets(
     depsgraph = bpy.context.evaluated_depsgraph_get()
     exported_meshes = []
     material_groups = []
+    materials = {}
     used_mesh_filenames = set()
     anchor_export_mode = getattr(props, "speedtree_anchor_export_mode", "OFF")
     try:
+        for group in source_groups:
+            if not group["objects"]:
+                continue
+            handoff_name = (
+                "_AtlasLeaf_SpeedTree_Handoff_"
+                + uuid.uuid4().hex[:12]
+            )
+            production_maps = production_texture_maps[group["material"]]
+            if group["texture_contract_status"] == CANONICAL_TEXTURE_STATUS:
+                color_path = production_maps["color"]
+                opacity_path = production_maps["opacity"]
+            else:
+                color_path = production_maps["albedo"]
+                opacity_path = production_maps.get("alpha")
+            materials[group["material"]] = make_speedtree_material(
+                handoff_name,
+                color_path,
+                opacity_path,
+            )
         for group in source_groups:
             group_meshes = []
             material = materials.get(group["material"])
@@ -5282,7 +6358,12 @@ def export_speedtree_assets(
                 asset_path = fbx_path
                 if anchor_export_mode == "XML" and anchor_records:
                     xml_path = mesh_dir / f"{export_stem}.xml"
-                    write_speedtree_xml_mesh(xml_path, mesh, material.name, anchor_records)
+                    write_speedtree_xml_mesh(
+                        xml_path,
+                        mesh,
+                        group["material"],
+                        anchor_records,
+                    )
                     asset_path = xml_path
                 item = {
                     "name": export_stem,
@@ -5310,7 +6391,7 @@ def export_speedtree_assets(
                         or positive_int(source.get("atlas_leaf_cluster_variant_index"))
                     ),
                     "source_collection": group["collection"],
-                    "material": material.name,
+                    "material": group["material"],
                 }
                 if normalization_receipt is not None:
                     skeletal_asset_name = str(
@@ -5342,12 +6423,10 @@ def export_speedtree_assets(
                 bpy.data.meshes.remove(mesh, do_unlink=True)
             if group_meshes:
                 material_groups.append(
-                    {
-                        "collection": group["collection"],
-                        "material": group["material"],
-                        "mesh_count": len(group_meshes),
-                        "meshes": group_meshes,
-                    }
+                    exported_material_group_manifest(
+                        group,
+                        group_meshes,
+                    )
                 )
     finally:
         for obj in bpy.context.selected_objects:
@@ -5357,8 +6436,25 @@ def export_speedtree_assets(
                 obj.select_set(True)
         if previous_active and previous_active.name in bpy.data.objects:
             bpy.context.view_layer.objects.active = previous_active
-        if temp_collection and not temp_collection.objects:
-            bpy.data.collections.remove(temp_collection)
+        if temp_collection:
+            for temp_obj in list(temp_collection.objects):
+                temp_mesh = (
+                    temp_obj.data
+                    if getattr(temp_obj, "type", None) == "MESH"
+                    else None
+                )
+                bpy.data.objects.remove(temp_obj, do_unlink=True)
+                if (
+                    temp_mesh is not None
+                    and temp_mesh.name in bpy.data.meshes
+                    and temp_mesh.users == 0
+                ):
+                    bpy.data.meshes.remove(temp_mesh)
+            if not temp_collection.objects:
+                bpy.data.collections.remove(temp_collection)
+        for material in materials.values():
+            if material.name in bpy.data.materials and material.users == 0:
+                bpy.data.materials.remove(material)
 
     removed_stale_mesh_exports = cleanup_stale_mesh_exports(export_dir, exported_meshes)
 
@@ -5400,17 +6496,70 @@ def export_speedtree_assets(
         "mesh_count": len(exported_meshes),
         "meshes": exported_meshes,
         "removed_stale_mesh_exports": removed_stale_mesh_exports,
-        "textures": texture_exports,
-        "texture_dimensions": (
-            list(texture_dimensions) if texture_dimensions is not None else None
+        "source_textures": source_texture_exports,
+        "source_texture_dimensions": (
+            list(source_texture_dimensions)
+            if source_texture_dimensions is not None
+            else None
         ),
+        "texture_contract_status": texture_contract_status,
+        "canonical_texture_outputs": [
+            serializable_canonical_texture_output(
+                canonical_outputs[group["material"]],
+                group["material"],
+            )
+            for group in source_groups
+            if group["objects"] and group["material"] in canonical_outputs
+        ],
+        "source_texture_fallbacks": [
+            source_fallbacks[group["material"]]
+            for group in source_groups
+            if group["objects"] and group["material"] in source_fallbacks
+        ],
+        "source_texture_origins": {
+            material_name: fallback.get("source_origin")
+            for material_name, fallback in sorted(
+                source_fallbacks.items()
+            )
+        },
+        "textures": (
+            {
+                role: str(path)
+                for role, path in next(
+                    iter(production_texture_maps.values())
+                ).items()
+            }
+            if len(production_texture_maps) == 1
+            else {}
+        ),
+        "texture_dimensions": (
+            next(iter(production_dimensions.values()))
+            if len(production_dimensions) == 1
+            else None
+        ),
+        "texture_dimensions_by_material": production_dimensions,
         "notes": [
             "Use each mesh item's asset path as the SpeedTree mesh asset source.",
             "Use one atlas material for all leaf mesh variants.",
             "The SPM material mesh list is synchronized to the current Blender collection when rebuilt.",
-            "Texture maps reference the original source files and are not copied into the SPM folder.",
-            "The original gloss map is preferred for the SpeedTree gloss slot; roughness remains the fallback.",
-            "The original AO map is connected to the SpeedTree AO slot when present.",
+            "Atlas source textures are retained only as Blender mesh-build inputs.",
+            (
+                "Production SPM and exported FBX handoff materials use the "
+                "asset-local T_* files declared by PCG ST9 Texture."
+                if canonical_manifest_available
+                else (
+                    "WARNING: canonical T_* output is absent; production "
+                    "handoff provisionally references the original Atlas "
+                    "source directly without copying it."
+                )
+            ),
+            (
+                "Gloss and AO consume the canonical extra map channels unless "
+                "the manifest declares an optional generated AO."
+                if canonical_manifest_available
+                else SOURCE_FALLBACK_REMEDIATION
+            ),
+            "Cache, isolated, and export-generated PNG paths are never source fallbacks.",
             "SpeedTree XML anchor assets store child empties as LeafReferences.",
             "Source mesh transforms are applied on build so FBX pivots sit at the origin; anchor empties keep their transforms.",
         ],
@@ -5792,6 +6941,20 @@ def _export_or_update_speedtree_spm_path_impl(
         props,
         target_spm.parent,
         atlas_asset_name,
+        target_spm=target_spm,
+        source_material_names=source_material_names,
+        source_material_ids=source_material_ids,
+        canonical_texture_manifest_path=(
+            str(
+                getattr(
+                    props,
+                    "speedtree_canonical_texture_manifest_path",
+                    "",
+                )
+                or ""
+            ).strip()
+            or None
+        ),
         preserve_explicit_material_name=preserve_explicit_material_name,
     )
     manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
@@ -5926,6 +7089,32 @@ def _export_or_update_speedtree_spm_path_impl(
         if not group_manifest["meshes"]:
             continue
         material_name = group.get("material") or group.get("collection") or manifest.get("source_collection", props.collection_name)
+        texture_status = (
+            group.get("texture_contract_status")
+            or manifest.get("texture_contract_status")
+        )
+        if texture_status == CANONICAL_TEXTURE_STATUS:
+            contract = group.get("canonical_texture_output") or {}
+        elif texture_status == SOURCE_FALLBACK_STATUS:
+            contract = group.get("source_texture_fallback") or {}
+        else:
+            contract = {}
+        production_files = (
+            contract.get("files")
+            if texture_status == CANONICAL_TEXTURE_STATUS
+            else contract.get("source_paths")
+        ) or {}
+        if not production_files:
+            raise RuntimeError(
+                "Production texture mapping is missing after export for "
+                f"material={material_name}, status={texture_status!r}."
+            )
+        group_manifest["texture_contract_status"] = texture_status
+        group_manifest["textures"] = dict(production_files)
+        if texture_status == CANONICAL_TEXTURE_STATUS:
+            group_manifest["canonical_texture_output"] = contract
+        else:
+            group_manifest["source_texture_fallback"] = contract
         spm_path, action, material_id, mesh_ids = upsert_speedtree_assets_in_spm(
             target_spm,
             group_manifest,
@@ -5954,6 +7143,16 @@ def _export_or_update_speedtree_spm_path_impl(
                 "material_id": material_id,
                 "mesh_ids": mesh_ids,
                 "action": action,
+                "texture_contract_status": texture_status,
+                "texture_source_origin": contract.get("source_origin"),
+                "texture_origin_receipt": copy.deepcopy(
+                    contract.get("origin_receipt")
+                ),
+                "texture_provisional_receipt": copy.deepcopy(
+                    contract.get("provisional_receipt")
+                ),
+                "texture_warning": contract.get("warning"),
+                "texture_remediation": contract.get("remediation"),
             }
         )
 

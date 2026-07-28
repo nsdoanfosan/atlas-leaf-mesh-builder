@@ -48,7 +48,24 @@ def load_speedtree_module():
     props.speedtree_spm_targets = lambda value: []
     sys.modules[props.__name__] = props
     texture_paths = types.ModuleType(f"{package_name}.texture_paths")
+    texture_paths.CANONICAL_OUTPUT_KIND = (
+        "pcg_st9_canonical_output_manifest"
+    )
+    texture_paths.CANONICAL_TEXTURE_STATUS = "canonical_pcg_output"
+    texture_paths.SOURCE_FALLBACK_REMEDIATION = "run PCG ST9 Texture"
+    texture_paths.SOURCE_FALLBACK_STATUS = (
+        "source_fallback_needs_pcg_generation"
+    )
     texture_paths.atlas_texture_paths = lambda value: {}
+    texture_paths.canonical_texture_base_for_material = (
+        lambda value: "T_" + str(value)
+    )
+    texture_paths.expected_canonical_role_paths = (
+        lambda *args, **kwargs: {}
+    )
+    texture_paths.resolve_production_texture_contract = (
+        lambda *args, **kwargs: {}
+    )
     sys.modules[texture_paths.__name__] = texture_paths
 
     name = f"{package_name}.speedtree"
@@ -60,6 +77,18 @@ def load_speedtree_module():
 
 
 speedtree = load_speedtree_module()
+
+
+def canonical_test_textures(path):
+    path = str(path)
+    return {
+        "color": path,
+        "opacity": path,
+        "normal": path,
+        "extra": path,
+        "height": path,
+        "subsurface": path,
+    }
 
 
 class PhysicalNormalizationReceiptTests(unittest.TestCase):
@@ -136,6 +165,152 @@ class PhysicalNormalizationReceiptTests(unittest.TestCase):
         }
         self.assertIsNone(
             speedtree.physical_normalization_receipt_from_scene(scene)
+        )
+
+
+class ClusterBakeTextureOriginTests(unittest.TestCase):
+    def test_receipt_and_blender_material_use_prove_cluster_bake_origin(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            blend = root / "SK_branch_test.blend"
+            color = root / "branch_test.tga"
+            opacity = root / "branch_test_Opacity.tga"
+            color.touch()
+            opacity.touch()
+            material = types.SimpleNamespace(name="M_branch_test")
+            source = types.SimpleNamespace(
+                name="branch_test_01",
+                material_slots=[
+                    types.SimpleNamespace(material=material)
+                ],
+            )
+            capture_hash = "physical-capture-hash"
+            receipt = {
+                "workflow_mode": "PHYSICAL_DIRECT_CAPTURE",
+                "physical_capture_contract_sha256": capture_hash,
+                "physical_capture_contract": {
+                    "contract_sha256": capture_hash,
+                    "source_blend": str(blend),
+                    "capture_maps": [
+                        {
+                            "role": "Color",
+                            "path": str(color),
+                            "sha256": "color-hash",
+                        },
+                        {
+                            "role": "Opacity",
+                            "path": str(opacity),
+                            "sha256": "opacity-hash",
+                        },
+                    ],
+                },
+            }
+            group = {
+                "material": "M_branch_test",
+                "objects": [source],
+            }
+
+            origin = speedtree.blender_cluster_bake_origin_receipt(
+                {"albedo": color, "alpha": opacity},
+                group,
+                receipt,
+                blend_file=blend,
+            )
+
+            self.assertEqual(
+                origin["source_origin"],
+                speedtree.BLENDER_CLUSTER_BAKE_ORIGIN,
+            )
+            self.assertEqual(
+                origin["material_users"],
+                ["branch_test_01"],
+            )
+            self.assertEqual(len(origin["capture_maps"]), 2)
+
+            fallback = speedtree.serializable_source_texture_fallback(
+                root / "SK_tree_test.spm",
+                "M_branch_test",
+                {"albedo": color, "alpha": opacity},
+                source_origin=speedtree.BLENDER_CLUSTER_BAKE_ORIGIN,
+                origin_receipt=origin,
+            )
+            self.assertEqual(
+                fallback["source_origin"],
+                speedtree.BLENDER_CLUSTER_BAKE_ORIGIN,
+            )
+            self.assertEqual(
+                fallback["provisional_receipt"]["status"],
+                speedtree.SOURCE_FALLBACK_STATUS,
+            )
+            self.assertTrue(
+                fallback["provisional_receipt"][
+                    "canonical_promotion_required"
+                ]
+            )
+            self.assertIn("Cluster bake", fallback["warning"])
+
+    def test_filename_match_without_material_use_is_not_cluster_bake(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            color = root / "branch_test.tga"
+            color.touch()
+            capture_hash = "physical-capture-hash"
+            receipt = {
+                "workflow_mode": "PHYSICAL_DIRECT_CAPTURE",
+                "physical_capture_contract_sha256": capture_hash,
+                "physical_capture_contract": {
+                    "contract_sha256": capture_hash,
+                    "capture_maps": [
+                        {"role": "Color", "path": str(color)}
+                    ],
+                },
+            }
+            group = {
+                "material": "M_branch_test",
+                "objects": [
+                    types.SimpleNamespace(
+                        name="branch_test_01",
+                        material_slots=[],
+                    )
+                ],
+            }
+
+            self.assertIsNone(
+                speedtree.blender_cluster_bake_origin_receipt(
+                    {"albedo": color},
+                    group,
+                    receipt,
+                )
+            )
+
+    def test_exported_group_keeps_provisional_contract_for_spm_upsert(self):
+        fallback = {
+            "texture_contract_status": (
+                speedtree.SOURCE_FALLBACK_STATUS
+            ),
+            "source_origin": speedtree.BLENDER_CLUSTER_BAKE_ORIGIN,
+            "source_paths": {"albedo": "branch.tga"},
+            "provisional_receipt": {"kind": "test"},
+        }
+        result = speedtree.exported_material_group_manifest(
+            {
+                "collection": "Atlas_Branch_Plans",
+                "material": "M_branch_test",
+                "texture_contract_status": (
+                    speedtree.SOURCE_FALLBACK_STATUS
+                ),
+                "source_texture_fallback": fallback,
+            },
+            [{"asset": "branch.fbx"}],
+        )
+
+        self.assertEqual(
+            result["source_texture_fallback"]["source_paths"],
+            {"albedo": "branch.tga"},
+        )
+        self.assertIsNot(
+            result["source_texture_fallback"],
+            fallback,
         )
 
 
@@ -501,6 +676,77 @@ class GeneratorConnectionTests(unittest.TestCase):
             result["bindings"][0]["source_mesh_id"],
             -10,
         )
+
+    def test_managed_orphan_binding_restores_hashed_authored_cutout(self):
+        live_root = ET.Element("SpeedTreeModel")
+        live_assets = ET.SubElement(live_root, "Assets")
+        add_material(live_assets, 4, "M_branch", [5, 6])
+        add_material(live_assets, 7, "M_branch_atlas", [63])
+        for mesh_id in [5, 6, 63, 107]:
+            add_mesh(live_assets, mesh_id)
+        add_generator(live_root, "Frond", "Frond 4", [(4, 107)])
+        write_spm(self.spm_path, live_root)
+
+        evidence_path = Path(self.temp_dir.name) / "evidence-authored.spm"
+        evidence_root = ET.Element("SpeedTreeModel")
+        evidence_assets = ET.SubElement(evidence_root, "Assets")
+        add_material(evidence_assets, 19, "M_branch", [5, 6])
+        add_mesh(evidence_assets, 5)
+        add_mesh(evidence_assets, 6)
+        add_generator(
+            evidence_root,
+            "Frond",
+            "Frond 4",
+            [(19, 5)],
+        )
+        write_spm(evidence_path, evidence_root)
+        repair = {
+            "generator_name": "Frond 4",
+            "generator_guid": "Frond:Frond 4",
+            "generator_type": "Frond",
+            "slot_prefix": "Material:Frond:0",
+            "source_material_name": "M_branch",
+            "source_material_id": 4,
+            "from_mesh_id": 107,
+            "to_mesh_id": 5,
+            "evidence": [
+                {
+                    "path": str(evidence_path),
+                    "sha256": speedtree.file_sha256(evidence_path),
+                }
+            ],
+        }
+        groups = [
+            {
+                "material": "M_branch_atlas",
+                "material_id": 7,
+                "mesh_ids": [63],
+                "meshes": [
+                    {
+                        "source_object": "branch_01",
+                        "source_ordinal": 1,
+                    }
+                ],
+            }
+        ]
+
+        result = speedtree.connect_atlas_generators_in_spm(
+            self.spm_path,
+            ["M_branch"],
+            groups,
+            [4],
+            source_binding_repairs=[repair],
+        )
+
+        self.assertEqual(
+            result["applied_source_binding_repairs"][0]["from_mesh_id"],
+            107,
+        )
+        self.assertEqual(
+            result["applied_source_binding_repairs"][0]["to_mesh_id"],
+            5,
+        )
+        self.assertEqual(result["bindings"][0]["source_mesh_id"], 5)
 
     def test_explicit_source_ordinals_support_non_leaf_plan_names(self):
         groups = json.loads(json.dumps(self.groups))
@@ -2183,7 +2429,9 @@ class SafetyTests(unittest.TestCase):
             "source_collection": material_name,
             "material_collection": material_name,
             "atlas_asset_name": material_name,
-            "textures": {},
+            "textures": canonical_test_textures(
+                folder / "T_leaf_test_color.tga"
+            ),
             "meshes": [{"asset": str(folder / "meshes" / "18.fbx")}],
         }
         return target, sample, manifest, material_name
@@ -2891,7 +3139,7 @@ class SafetyTests(unittest.TestCase):
                 "source_collection": "Plans",
                 "material_collection": "Plans",
                 "blend_file": str(folder / "normalized.blend"),
-                "textures": {"albedo": str(color)},
+                "textures": canonical_test_textures(color),
                 "meshes": mesh_items,
             }
             original_material_sample = speedtree.SPEEDTREE_101_MATERIAL_SAMPLE
@@ -3092,7 +3340,7 @@ class SafetyTests(unittest.TestCase):
                 "source_collection": "Plans",
                 "material_collection": "Plans",
                 "blend_file": str(folder / "normalized.blend"),
-                "textures": {"albedo": str(color)},
+                "textures": canonical_test_textures(color),
                 "meshes": mesh_items,
             }
             adoption = speedtree.prepare_source_material_adoption(
@@ -3471,6 +3719,183 @@ class SafetyTests(unittest.TestCase):
 
             self.assertEqual(result["status"], "no_managed_manifest")
             self.assertIsNone(result["backup"])
+
+    def test_remove_target_retires_only_exact_operational_manifests(self):
+        with tempfile.TemporaryDirectory() as folder:
+            folder = Path(folder)
+            blend = folder / "M_leaf_test_atlas_01.blend"
+            target = folder / "SK_test.spm"
+            root = ET.Element("SpeedTreeModel")
+            ET.SubElement(root, "Assets")
+            write_spm(target, root)
+            manifest = {
+                "export_scope_id": "scope-a",
+                "blend_file": str(blend),
+                "spm": str(target),
+                "speedtree_material_groups": [],
+                "meshes": [],
+            }
+            target_scope = speedtree.write_scope_manifest(
+                folder,
+                manifest,
+                target,
+            )
+            scope_identity = speedtree.write_scope_manifest(folder, manifest)
+            per_target = speedtree.target_manifest_path(target)
+            per_target.parent.mkdir(parents=True, exist_ok=True)
+            per_target.write_text(json.dumps(manifest), encoding="utf-8")
+            global_manifest = folder / "speedtree_import_manifest.json"
+            global_manifest.write_text(json.dumps(manifest), encoding="utf-8")
+
+            result = speedtree.remove_blend_target_from_spm(blend, target)
+
+            self.assertEqual(result["status"], "already_clean")
+            self.assertEqual(
+                set(result["retired_contract_manifests"]),
+                {str(target_scope), str(per_target), str(global_manifest)},
+            )
+            self.assertFalse(target_scope.exists())
+            self.assertFalse(per_target.exists())
+            self.assertFalse(global_manifest.exists())
+            self.assertTrue(scope_identity.exists())
+
+    def test_on_refresh_preserves_exact_scope_adoption_history_only(self):
+        with tempfile.TemporaryDirectory() as folder:
+            folder = Path(folder)
+            blend = folder / "SK_cluster_test_01.blend"
+            target = folder / "SK_tree_01.spm"
+            root = ET.Element("SpeedTreeModel")
+            assets = ET.SubElement(root, "Assets")
+            marker = json.dumps({
+                "generator": speedtree.ATLAS_LEAF_SPM_GENERATOR,
+                "scope": "scope-a",
+                "kind": "material",
+            })
+            add_material(
+                assets,
+                8,
+                "M_cluster_test_01",
+                [10],
+                marker,
+            )
+            add_mesh(
+                assets,
+                10,
+                marker.replace('"material"', '"mesh"'),
+            )
+            write_spm(target, root)
+            original_assets = ET.Element("Assets")
+            original_material = add_material(
+                original_assets,
+                8,
+                "M_cluster_test_01",
+                [1],
+            )
+            original_mesh = add_mesh(original_assets, 1)
+            manifest = {
+                "export_scope_id": "scope-a",
+                "blend_file": str(blend),
+                "spm": str(target),
+                "speedtree_material_groups": [{
+                    "material": "M_cluster_test_01",
+                    "material_id": 8,
+                    "mesh_ids": [10],
+                }],
+                "meshes": [{"asset": str(folder / "mesh.fbx")}],
+                "source_material_adoption": {
+                    "version": speedtree.SOURCE_MATERIAL_ADOPTION_VERSION,
+                    "material_name": "M_cluster_test_01",
+                    "material_id": 8,
+                    "original_mesh_ids": [1],
+                    "original_material_snapshot": (
+                        speedtree.encode_spm_node_snapshot(
+                            original_material
+                        )
+                    ),
+                    "original_mesh_snapshots": [
+                        {
+                            "mesh_id": 1,
+                            "snapshot": (
+                                speedtree.encode_spm_node_snapshot(
+                                    original_mesh
+                                )
+                            ),
+                        },
+                    ],
+                    "generated_mesh_ids": [10],
+                },
+                "generator_connection": {
+                    "complete": True,
+                    "bindings": [{
+                        "generator_guid": "stale-guid",
+                        "slot_prefix": "Leaves:Type:2",
+                    }],
+                },
+            }
+            target_scope = speedtree.write_scope_manifest(
+                folder,
+                manifest,
+                target,
+            )
+            per_target = speedtree.target_manifest_path(target)
+            per_target.parent.mkdir(parents=True, exist_ok=True)
+            per_target.write_text(json.dumps(manifest), encoding="utf-8")
+            global_manifest = folder / "speedtree_import_manifest.json"
+            global_manifest.write_text(json.dumps(manifest), encoding="utf-8")
+
+            result = speedtree.remove_blend_target_from_spm(
+                blend,
+                target,
+                preserve_scope_history=True,
+            )
+
+            self.assertEqual(
+                result["retained_scope_manifests"],
+                [str(target_scope)],
+            )
+            self.assertEqual(
+                set(result["retired_contract_manifests"]),
+                {str(per_target), str(global_manifest)},
+            )
+            self.assertTrue(target_scope.exists())
+            retained = json.loads(
+                target_scope.read_text(encoding="utf-8")
+            )
+            self.assertNotIn("generator_connection", retained)
+            self.assertIn("source_material_adoption", retained)
+            self.assertFalse(per_target.exists())
+            self.assertFalse(global_manifest.exists())
+
+    def test_scope_manifest_without_exact_spm_is_not_cleanup_input(self):
+        with tempfile.TemporaryDirectory() as folder:
+            folder = Path(folder)
+            blend = folder / "SK_cluster_test_01.blend"
+            target = folder / "SK_tree_01.spm"
+            scope_dir = folder / ".atlas_leaf_speedtree_scopes"
+            scope_dir.mkdir()
+            legacy_scope = (
+                scope_dir
+                / f"legacy__{speedtree.target_manifest_key(target)}.json"
+            )
+            legacy_scope.write_text(
+                json.dumps({
+                    "export_scope_id": "legacy",
+                    "blend_file": str(blend),
+                    "generator_connection": {"complete": True},
+                }),
+                encoding="utf-8",
+            )
+
+            manifests = speedtree.target_scope_manifests_for_blend(
+                target,
+                blend,
+            )
+
+            self.assertEqual(manifests, [])
+            self.assertIn(
+                "generator_connection",
+                json.loads(legacy_scope.read_text(encoding="utf-8")),
+            )
 
     def test_cleanup_preserves_mesh_referenced_by_a_different_material(self):
         with tempfile.TemporaryDirectory() as folder:
