@@ -1566,6 +1566,12 @@ def resolve_generator_binding(
         f"{slot_prefix}:Material" not in names
         or f"{slot_prefix}:Mesh" not in names
     ):
+        if allow_missing:
+            # The Generator can survive a normalized Cluster rewrite while a
+            # previously Atlas-managed tail slot is removed.  Treat that
+            # missing pair the same as a missing Generator for cleanup/update
+            # callers: it is an idempotent tombstone, not a new binding target.
+            return None
         raise RuntimeError(
             f"{context} resolved Generator '{actual_name}', but slot "
             f"{slot_prefix!r} is missing its Material/Mesh pair."

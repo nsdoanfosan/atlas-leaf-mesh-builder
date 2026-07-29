@@ -2076,6 +2076,41 @@ class GeneratorConnectionTests(unittest.TestCase):
             [],
         )
 
+    def test_missing_guid_generator_slot_is_a_tombstone(self):
+        root = ET.Element("SpeedTreeModel")
+        generator = add_variant_generator(
+            root,
+            "Leaf Mesh",
+            "Leaf 9",
+            [(8, 12)],
+        )
+        binding = {
+            "generator_guid": speedtree.generator_guid(generator),
+            "generator_index": 0,
+            "generator_name": "Leaf 9",
+            "generator_type": "Leaf Mesh",
+            "slot_prefix": "Leaves:Type:3",
+            "source_material_id": 8,
+            "source_mesh_id": 2,
+            "target_material_id": 8,
+            "target_mesh_id": 12,
+        }
+
+        self.assertEqual(
+            speedtree.normalize_generator_bindings(
+                root,
+                [binding],
+                context="Atlas scope removal binding",
+                allow_missing=True,
+            ),
+            [],
+        )
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "missing its Material/Mesh pair",
+        ):
+            speedtree.normalize_generator_bindings(root, [binding])
+
     def test_legacy_renamed_generator_migrates_by_unique_slot_values(self):
         root = ET.Element("SpeedTreeModel")
         add_variant_generator(
