@@ -5209,6 +5209,127 @@ def max_asset_id(assets, tag):
     return maximum
 
 
+def remove_unreferenced_missing_external_mesh_nodes(
+    root,
+    spm_path,
+    *,
+    candidate_mesh_ids=None,
+):
+    """Remove dead external Mesh assets only when no live contract uses them."""
+    assets = root.find("Assets")
+    if assets is None:
+        return []
+    allowed = (
+        {
+            value
+            for value in (
+                positive_int(item) for item in candidate_mesh_ids
+            )
+            if value is not None
+        }
+        if candidate_mesh_ids is not None
+        else None
+    )
+    generator_referenced = spm_generator_referenced_mesh_ids(root)
+    material_owners = {}
+    for material in assets.findall("Material_v8"):
+        for mesh_id in spm_material_mesh_ids(material):
+            material_owners.setdefault(mesh_id, []).append(material)
+    spm_path = Path(spm_path)
+    removed = []
+    for mesh in list(assets.findall("Mesh")):
+        mesh_id = positive_int(mesh.attrib.get("ID"))
+        owners = material_owners.get(mesh_id, [])
+        managed_owners = []
+        for material in owners:
+            marker = parse_atlas_leaf_spm_user_data(
+                material.findtext("UserData")
+            )
+            if (
+                not marker
+                or marker.get("generator") != ATLAS_LEAF_SPM_GENERATOR
+                or marker.get("kind") != "material"
+            ):
+                managed_owners = []
+                break
+            managed_owners.append(material)
+        if (
+            mesh_id is None
+            or mesh_id in generator_referenced
+            or (owners and len(managed_owners) != len(owners))
+            or (allowed is not None and mesh_id not in allowed)
+        ):
+            continue
+        embedded = str(mesh.findtext("Embedded") or "").strip().casefold() in {
+            "1",
+            "true",
+            "yes",
+        }
+        if embedded:
+            continue
+        filenames = [str(mesh.findtext("Filename") or "").strip()]
+        for lod_tag in ("Lod_1", "Lod_2"):
+            lod = mesh.find(lod_tag)
+            if lod is not None:
+                filenames.append(str(lod.findtext("Filename") or "").strip())
+        missing = []
+        for filename in filenames:
+            if not filename:
+                continue
+            candidate = Path(filename)
+            resolved = (
+                candidate
+                if candidate.is_absolute()
+                else spm_path.parent / candidate
+            )
+            if not resolved.is_file():
+                missing.append(str(resolved))
+        if not missing:
+            continue
+        remaining_by_material = []
+        for material in managed_owners:
+            remaining = [
+                value
+                for value in spm_material_mesh_ids(material)
+                if value != mesh_id
+            ]
+            # A material cannot be left without a cutout mesh. Preserve that
+            # final reference so the missing file remains a visible data error.
+            if not remaining:
+                remaining_by_material = []
+                break
+            remaining_by_material.append((material, remaining))
+        if managed_owners and not remaining_by_material:
+            continue
+        removed_from_materials = []
+        for material, remaining in remaining_by_material:
+            update_spm_material_mesh_ids(material, remaining)
+            removed_from_materials.append(
+                {
+                    "material_id": positive_int(
+                        material.attrib.get("ID")
+                    ),
+                    "material_name": str(
+                        material.attrib.get("Name") or ""
+                    ),
+                }
+            )
+        assets.remove(mesh)
+        removed.append(
+            {
+                "mesh_id": mesh_id,
+                "mesh_name": str(mesh.attrib.get("Name") or ""),
+                "filenames": [
+                    filename for filename in filenames if filename
+                ],
+                "missing_paths": missing,
+                "removed_from_materials": removed_from_materials,
+                "reason": "unreferenced_external_mesh_file_missing",
+            }
+        )
+    return removed
+
+
 def upsert_speedtree_assets_in_spm(
     spm_path,
     manifest,
@@ -5457,6 +5578,21 @@ def upsert_speedtree_assets_in_spm(
             if mesh_id in removable_unused_old_ids:
                 assets.remove(node)
 
+    cleanup_candidate_mesh_ids = {
+        mesh_id
+        for mesh_id in (
+            positive_int(node.attrib.get("ID"))
+            for node in assets.findall("Mesh")
+        )
+        if mesh_id is not None and mesh_id not in set(mesh_ids)
+    }
+    removed_missing_orphans = (
+        remove_unreferenced_missing_external_mesh_nodes(
+            root,
+            spm_path,
+            candidate_mesh_ids=cleanup_candidate_mesh_ids,
+        )
+    )
     write_spm_xml(spm_path, root)
 
     parsed = read_spm_xml(spm_path)
@@ -5480,6 +5616,16 @@ def upsert_speedtree_assets_in_spm(
     stale_mesh_ids = [str(mesh_id) for mesh_id in removable_unused_old_ids if str(mesh_id) in parsed_mesh_ids]
     if stale_mesh_ids:
         raise RuntimeError(f"SpeedTree SPM validation failed: stale deleted mesh IDs remain {stale_mesh_ids}")
+    stale_missing_orphan_ids = [
+        str(item["mesh_id"])
+        for item in removed_missing_orphans
+        if str(item["mesh_id"]) in parsed_mesh_ids
+    ]
+    if stale_missing_orphan_ids:
+        raise RuntimeError(
+            "SpeedTree SPM validation failed: dead unreferenced external "
+            f"Mesh IDs remain {stale_missing_orphan_ids}"
+        )
     return spm_path, action, material_id, mesh_ids
 
 

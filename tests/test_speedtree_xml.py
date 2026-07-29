@@ -3120,6 +3120,96 @@ class SafetyTests(unittest.TestCase):
                 "new-uuid-scope",
             )
 
+    def test_upsert_removes_only_unreferenced_missing_external_meshes(self):
+        with tempfile.TemporaryDirectory() as folder:
+            target, sample, manifest, material_name = (
+                self._write_upsert_fixture(folder, None)
+            )
+            root = speedtree.read_spm_xml(target)
+            assets = root.find("Assets")
+            orphan = add_mesh(assets, 77)
+            ET.SubElement(orphan, "Filename").text = (
+                "meshes/old_atlas_plate_missing.fbx"
+            )
+            ET.SubElement(orphan, "Embedded").text = "false"
+            write_spm(target, root)
+
+            original_material_sample = speedtree.SPEEDTREE_101_MATERIAL_SAMPLE
+            original_mesh_sample = (
+                speedtree.SPEEDTREE_101_EXTERNAL_MESH_SAMPLE
+            )
+            speedtree.SPEEDTREE_101_MATERIAL_SAMPLE = sample
+            speedtree.SPEEDTREE_101_EXTERNAL_MESH_SAMPLE = sample
+            try:
+                speedtree.upsert_speedtree_assets_in_spm(
+                    target,
+                    manifest,
+                    material_name,
+                )
+            finally:
+                speedtree.SPEEDTREE_101_MATERIAL_SAMPLE = (
+                    original_material_sample
+                )
+                speedtree.SPEEDTREE_101_EXTERNAL_MESH_SAMPLE = (
+                    original_mesh_sample
+                )
+
+            parsed_assets = speedtree.read_spm_xml(target).find("Assets")
+            self.assertIsNone(parsed_assets.find("Mesh[@ID='77']"))
+            self.assertIsNotNone(parsed_assets.find("Mesh[@ID='18']"))
+
+    def test_cleanup_prunes_unbound_managed_mesh_but_preserves_source(self):
+        with tempfile.TemporaryDirectory() as folder:
+            folder = Path(folder)
+            spm = folder / "SK_tree.spm"
+            root = ET.Element("SpeedTreeModel")
+            assets = ET.SubElement(root, "Assets")
+            marker = json.dumps(
+                {
+                    "generator": speedtree.ATLAS_LEAF_SPM_GENERATOR,
+                    "scope": "managed-scope",
+                    "kind": "material",
+                }
+            )
+            managed = add_material(
+                assets,
+                8,
+                "M_leaf_atlas_01",
+                [77, 78],
+                marker,
+            )
+            add_material(assets, 9, "M_leaf_source_01", [79])
+            for mesh_id, filename in (
+                (77, "meshes/missing_managed.fbx"),
+                (78, "meshes/present_managed.fbx"),
+                (79, "meshes/missing_source.fbx"),
+            ):
+                mesh = add_mesh(assets, mesh_id)
+                ET.SubElement(mesh, "Filename").text = filename
+                ET.SubElement(mesh, "Embedded").text = "false"
+            present = folder / "meshes" / "present_managed.fbx"
+            present.parent.mkdir()
+            present.write_bytes(b"fbx")
+
+            removed = (
+                speedtree.remove_unreferenced_missing_external_mesh_nodes(
+                    root,
+                    spm,
+                    candidate_mesh_ids={77, 79},
+                )
+            )
+
+            self.assertEqual(
+                [item["mesh_id"] for item in removed],
+                [77],
+            )
+            self.assertEqual(
+                speedtree.spm_material_mesh_ids(managed),
+                [78],
+            )
+            self.assertIsNone(assets.find("Mesh[@ID='77']"))
+            self.assertIsNotNone(assets.find("Mesh[@ID='79']"))
+
     def test_source_material_adoption_is_idempotent_and_reversible(self):
         with tempfile.TemporaryDirectory() as folder:
             folder = Path(folder)
