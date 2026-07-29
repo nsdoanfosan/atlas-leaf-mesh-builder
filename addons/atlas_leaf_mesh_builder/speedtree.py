@@ -41,6 +41,7 @@ FROND_BAKED_GEOMETRY_SCALE_PROPERTIES = (
     "Shape:Scale:Height",
 )
 BLENDER_CLUSTER_BAKE_ORIGIN = "blender_cluster_bake"
+BLENDER_CLUSTER_BAKE_TEXTURE_STATUS = "blender_cluster_bake"
 TEXTURE_PROVISIONAL_RECEIPT_KIND = (
     "speedtree_texture_provisional_receipt"
 )
@@ -65,6 +66,9 @@ def write_speedtree_readme(export_dir, manifest):
     mesh_count = len(manifest["meshes"])
     texture_status = manifest.get("texture_contract_status")
     provisional = texture_status == SOURCE_FALLBACK_STATUS
+    cluster_bake = (
+        texture_status == BLENDER_CLUSTER_BAKE_TEXTURE_STATUS
+    )
     lines = [
         "# SpeedTree Import Notes",
         "",
@@ -80,9 +84,15 @@ def write_speedtree_readme(export_dir, manifest):
             "directly and still requires PCG ST9 generation."
             if provisional
             else (
-                "- Atlas mesh construction keeps its original source images; "
-                "production SpeedTree materials use only the canonical "
-                "asset-local T_* outputs declared by PCG ST9 Texture."
+                "- Production SpeedTree materials use the verified physical "
+                "maps baked by this Blender Cluster source."
+                if cluster_bake
+                else (
+                    "- Atlas mesh construction keeps its original source "
+                    "images; production SpeedTree materials use only the "
+                    "canonical asset-local T_* outputs declared by PCG ST9 "
+                    "Texture."
+                )
             )
         ),
         "- Meshes are closed shells with the stem pivot at object origin.",
@@ -98,7 +108,15 @@ def write_speedtree_readme(export_dir, manifest):
             "2. The atlas material currently uses a provisional original-source "
             "fallback; run PCG ST9 Texture to promote it to canonical T_* maps."
             if provisional
-            else "2. The atlas material should reference the canonical T_* texture maps."
+            else (
+                "2. The Cluster material should reference the verified "
+                "Blender physical bake maps."
+                if cluster_bake
+                else (
+                    "2. The atlas material should reference the canonical "
+                    "T_* texture maps."
+                )
+            )
         ),
         "3. The material's cutout mesh list should reference the generated asset files in `meshes/`.",
         "4. Use that material/mesh set in a Leaf Mesh generator as leaf variants.",
@@ -111,6 +129,12 @@ def write_speedtree_readme(export_dir, manifest):
         lines.append(
             f"- {output.get('material_name')}: "
             f"`{output.get('texture_base')}`"
+        )
+        for key, value in sorted((output.get("files") or {}).items()):
+            lines.append(f"  - {key}: `{Path(value).name}`")
+    for output in manifest.get("blender_cluster_bake_textures") or []:
+        lines.append(
+            f"- {output.get('material')}: verified Blender Cluster bake"
         )
         for key, value in sorted((output.get("files") or {}).items()):
             lines.append(f"  - {key}: `{Path(value).name}`")
@@ -1067,7 +1091,10 @@ def update_spm_material_texture_maps(
     child_text(material, "Width", str(int(texture_size[0])))
     child_text(material, "Height", str(int(texture_size[1])))
 
-    if texture_contract_status == SOURCE_FALLBACK_STATUS:
+    if texture_contract_status in {
+        SOURCE_FALLBACK_STATUS,
+        BLENDER_CLUSTER_BAKE_TEXTURE_STATUS,
+    }:
         set_material_map(
             material,
             "Color",
@@ -3558,6 +3585,24 @@ def decode_spm_node_snapshot(payload):
         raise RuntimeError("Atlas source-material adoption snapshot is invalid.") from exc
 
 
+def spm_node_semantic_signature(node):
+    """Return an XML-node identity that ignores serializer-only whitespace."""
+    text = node.text
+    if text is not None and not text.strip():
+        text = None
+    return (
+        node.tag,
+        tuple(sorted(node.attrib.items())),
+        text,
+        tuple(spm_node_semantic_signature(child) for child in list(node)),
+    )
+
+
+def spm_node_semantic_sha256(node):
+    encoded = repr(spm_node_semantic_signature(node)).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def adoption_original_mesh_ids(adoption):
     return [
         positive_int(value)
@@ -4231,6 +4276,7 @@ def source_material_adoptions_from_manifests(manifests):
 def restore_adopted_source_nodes(assets, adoptions):
     restored = []
     for material_id, adoption in adoptions.items():
+        scope = str(adoption.get("scope") or "") or None
         current = next(
             (
                 node
@@ -4258,6 +4304,7 @@ def restore_adopted_source_nodes(assets, adoptions):
         assets.insert(insert_at, original_material)
 
         restored_mesh_ids = []
+        mesh_states = []
         for item in adoption.get("original_mesh_snapshots") or []:
             mesh_id = positive_int(item.get("mesh_id"))
             original_mesh = decode_spm_node_snapshot(item.get("snapshot"))
@@ -4272,16 +4319,37 @@ def restore_adopted_source_nodes(assets, adoptions):
                 None,
             )
             if existing_mesh is not None:
-                raise RuntimeError(
-                    f"Cannot restore adopted source Mesh {mesh_id}: the ID is already occupied."
-                )
-            assets.append(original_mesh)
+                if (
+                    spm_node_semantic_signature(existing_mesh)
+                    != spm_node_semantic_signature(original_mesh)
+                ):
+                    existing_filename = (
+                        existing_mesh.findtext("Filename")
+                        or existing_mesh.findtext("FileName")
+                        or ""
+                    )
+                    raise RuntimeError(
+                        f"Cannot restore adopted source Mesh {mesh_id}: the ID is "
+                        "occupied by a different node "
+                        f"(material_id={material_id}, "
+                        f"material_name={adoption.get('material_name')!r}, "
+                        f"scope={scope!r}, "
+                        f"existing_filename={existing_filename!r}, "
+                        f"existing_sha256={spm_node_semantic_sha256(existing_mesh)}, "
+                        f"expected_sha256={spm_node_semantic_sha256(original_mesh)})."
+                    )
+                state = "already_restored"
+            else:
+                assets.append(original_mesh)
+                state = "restored"
             restored_mesh_ids.append(mesh_id)
+            mesh_states.append({"mesh_id": mesh_id, "state": state})
         restored.append(
             {
                 "material_id": material_id,
                 "material_name": adoption.get("material_name"),
                 "mesh_ids": restored_mesh_ids,
+                "mesh_states": mesh_states,
             }
         )
     return restored
@@ -5999,6 +6067,29 @@ def serializable_source_texture_fallback(
     return result
 
 
+def serializable_blender_cluster_bake(
+    material_name,
+    source_paths,
+    origin_receipt,
+):
+    """Persist a verified Blender bake as a finished production texture set."""
+    return {
+        "kind": "blender_cluster_bake_texture_contract",
+        "version": 1,
+        "texture_contract_status": BLENDER_CLUSTER_BAKE_TEXTURE_STATUS,
+        "material": material_name,
+        "source_origin": BLENDER_CLUSTER_BAKE_ORIGIN,
+        "files": {
+            role: str(path)
+            for role, path in sorted(source_paths.items())
+        },
+        "source_roles": sorted(source_paths),
+        "origin_receipt": copy.deepcopy(origin_receipt),
+        "warning": None,
+        "remediation": None,
+    }
+
+
 def exported_material_group_manifest(group, group_meshes):
     """Preserve the resolved texture contract through FBX export."""
     result = {
@@ -6015,6 +6106,13 @@ def exported_material_group_manifest(group, group_meshes):
     elif group["texture_contract_status"] == SOURCE_FALLBACK_STATUS:
         result["source_texture_fallback"] = copy.deepcopy(
             group["source_texture_fallback"]
+        )
+    elif (
+        group["texture_contract_status"]
+        == BLENDER_CLUSTER_BAKE_TEXTURE_STATUS
+    ):
+        result["blender_cluster_bake_texture"] = copy.deepcopy(
+            group["blender_cluster_bake_texture"]
         )
     else:
         raise RuntimeError(
@@ -6085,6 +6183,7 @@ def export_speedtree_assets(
 
     canonical_outputs = {}
     source_fallbacks = {}
+    blender_cluster_bakes = {}
     production_texture_maps = {}
     production_signature_paths = {}
     production_dimensions = {}
@@ -6129,16 +6228,28 @@ def export_speedtree_assets(
                 if origin_receipt is not None
                 else "atlas_mesh_build_source"
             )
-            serialized = serializable_source_texture_fallback(
-                target_spm,
-                material_name,
-                fallback_paths,
-                source_origin=source_origin,
-                origin_receipt=origin_receipt,
-            )
-            source_fallbacks[material_name] = serialized
-            group["texture_contract_status"] = SOURCE_FALLBACK_STATUS
-            group["source_texture_fallback"] = serialized
+            if origin_receipt is not None:
+                serialized = serializable_blender_cluster_bake(
+                    material_name,
+                    fallback_paths,
+                    origin_receipt,
+                )
+                blender_cluster_bakes[material_name] = serialized
+                group["texture_contract_status"] = (
+                    BLENDER_CLUSTER_BAKE_TEXTURE_STATUS
+                )
+                group["blender_cluster_bake_texture"] = serialized
+            else:
+                serialized = serializable_source_texture_fallback(
+                    target_spm,
+                    material_name,
+                    fallback_paths,
+                    source_origin=source_origin,
+                    origin_receipt=origin_receipt,
+                )
+                source_fallbacks[material_name] = serialized
+                group["texture_contract_status"] = SOURCE_FALLBACK_STATUS
+                group["source_texture_fallback"] = serialized
             production_texture_maps[material_name] = fallback_paths
         production_dimensions[material_name] = list(
             common_texture_dimensions(
@@ -6516,11 +6627,20 @@ def export_speedtree_assets(
             for group in source_groups
             if group["objects"] and group["material"] in source_fallbacks
         ],
-        "source_texture_origins": {
-            material_name: fallback.get("source_origin")
-            for material_name, fallback in sorted(
-                source_fallbacks.items()
+        "blender_cluster_bake_textures": [
+            blender_cluster_bakes[group["material"]]
+            for group in source_groups
+            if (
+                group["objects"]
+                and group["material"] in blender_cluster_bakes
             )
+        ],
+        "source_texture_origins": {
+            material_name: contract.get("source_origin")
+            for material_name, contract in sorted({
+                **source_fallbacks,
+                **blender_cluster_bakes,
+            }.items())
         },
         "textures": (
             {
@@ -7097,11 +7217,16 @@ def _export_or_update_speedtree_spm_path_impl(
             contract = group.get("canonical_texture_output") or {}
         elif texture_status == SOURCE_FALLBACK_STATUS:
             contract = group.get("source_texture_fallback") or {}
+        elif texture_status == BLENDER_CLUSTER_BAKE_TEXTURE_STATUS:
+            contract = group.get("blender_cluster_bake_texture") or {}
         else:
             contract = {}
         production_files = (
             contract.get("files")
-            if texture_status == CANONICAL_TEXTURE_STATUS
+            if texture_status in {
+                CANONICAL_TEXTURE_STATUS,
+                BLENDER_CLUSTER_BAKE_TEXTURE_STATUS,
+            }
             else contract.get("source_paths")
         ) or {}
         if not production_files:
@@ -7113,6 +7238,8 @@ def _export_or_update_speedtree_spm_path_impl(
         group_manifest["textures"] = dict(production_files)
         if texture_status == CANONICAL_TEXTURE_STATUS:
             group_manifest["canonical_texture_output"] = contract
+        elif texture_status == BLENDER_CLUSTER_BAKE_TEXTURE_STATUS:
+            group_manifest["blender_cluster_bake_texture"] = contract
         else:
             group_manifest["source_texture_fallback"] = contract
         spm_path, action, material_id, mesh_ids = upsert_speedtree_assets_in_spm(

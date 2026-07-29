@@ -44,7 +44,7 @@ def write_tga_header(path, width, height):
 
 
 class SpeedTreeTextureMapTests(unittest.TestCase):
-    def test_cluster_bake_provisional_maps_keep_distinct_subsurface_amount(self):
+    def test_cluster_bake_maps_keep_distinct_subsurface_amount(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             textures = {}
@@ -81,7 +81,7 @@ class SpeedTreeTextureMapTests(unittest.TestCase):
                 textures,
                 [1],
                 texture_contract_status=(
-                    speedtree.SOURCE_FALLBACK_STATUS
+                    speedtree.BLENDER_CLUSTER_BAKE_TEXTURE_STATUS
                 ),
             )
 

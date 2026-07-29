@@ -368,7 +368,11 @@ def _canonical_file_path(manifest_path, texture_root, texture_base, role, value)
     return path
 
 
-def load_canonical_output_manifest(manifest_path):
+def load_canonical_output_manifest(
+    manifest_path,
+    *,
+    output_predicate=None,
+):
     """Load and structurally validate one PCG ST9 canonical output manifest."""
     manifest_path = _resolved_path(manifest_path)
     try:
@@ -430,6 +434,15 @@ def load_canonical_output_manifest(manifest_path):
         raise RuntimeError(
             f"Canonical texture manifest has no outputs: {manifest_path}"
         )
+    if output_predicate is not None:
+        raw_outputs = [
+            raw_output
+            for raw_output in raw_outputs
+            if (
+                isinstance(raw_output, dict)
+                and output_predicate(raw_output, asset_root)
+            )
+        ]
     outputs = []
     for index, raw_output in enumerate(raw_outputs):
         if not isinstance(raw_output, dict):
@@ -589,6 +602,8 @@ def resolve_canonical_texture_output(
     material_name,
     material_id=None,
     manifest_path=None,
+    *,
+    allow_absent_mapping=False,
 ):
     """Resolve one production SPM material to one verified T_* role set."""
     target = _resolved_path(target_spm)
@@ -618,9 +633,36 @@ def resolve_canonical_texture_output(
 
     matches = []
     manifest_errors = []
+
+    def raw_output_matches_request(raw_output, asset_root):
+        raw_targets = raw_output.get("material_targets")
+        if not isinstance(raw_targets, list):
+            return False
+        for raw_target in raw_targets:
+            if not isinstance(raw_target, dict):
+                continue
+            raw_spm = _target_path(asset_root, raw_target.get("spm"))
+            if raw_spm != target:
+                continue
+            raw_id = _material_id(raw_target.get("material_id"))
+            raw_name = str(
+                raw_target.get("material_name") or ""
+            ).strip()
+            if material_id is not None and raw_id == material_id:
+                return True
+            if (
+                material_name
+                and raw_name.casefold() == material_name.casefold()
+            ):
+                return True
+        return False
+
     for candidate in candidates:
         try:
-            manifest = load_canonical_output_manifest(candidate)
+            manifest = load_canonical_output_manifest(
+                candidate,
+                output_predicate=raw_output_matches_request,
+            )
         except RuntimeError as exc:
             manifest_errors.append(f"{candidate}: {exc}")
             continue
@@ -662,6 +704,12 @@ def resolve_canonical_texture_output(
         )
         unique[key] = row
     matches = list(unique.values())
+    if (
+        not matches
+        and allow_absent_mapping
+        and not manifest_errors
+    ):
+        return None
     if len(matches) != 1:
         detail = (
             " | ".join(manifest_errors)
@@ -706,15 +754,17 @@ def resolve_production_texture_contract(
             material_name,
             material_id,
             manifest_path=manifest_path,
+            allow_absent_mapping=True,
         )
-        return {
-            "texture_contract_status": CANONICAL_TEXTURE_STATUS,
-            "material": str(material_name or ""),
-            "files": dict(output["files"]),
-            "canonical_output": output,
-            "warning": None,
-            "remediation": None,
-        }
+        if output is not None:
+            return {
+                "texture_contract_status": CANONICAL_TEXTURE_STATUS,
+                "material": str(material_name or ""),
+                "files": dict(output["files"]),
+                "canonical_output": output,
+                "warning": None,
+                "remediation": None,
+            }
 
     sources = validate_source_texture_fallback(
         source_paths,

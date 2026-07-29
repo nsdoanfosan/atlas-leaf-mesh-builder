@@ -227,27 +227,21 @@ class ClusterBakeTextureOriginTests(unittest.TestCase):
             )
             self.assertEqual(len(origin["capture_maps"]), 2)
 
-            fallback = speedtree.serializable_source_texture_fallback(
-                root / "SK_tree_test.spm",
+            baked = speedtree.serializable_blender_cluster_bake(
                 "M_branch_test",
                 {"albedo": color, "alpha": opacity},
-                source_origin=speedtree.BLENDER_CLUSTER_BAKE_ORIGIN,
-                origin_receipt=origin,
+                origin,
             )
             self.assertEqual(
-                fallback["source_origin"],
+                baked["source_origin"],
                 speedtree.BLENDER_CLUSTER_BAKE_ORIGIN,
             )
             self.assertEqual(
-                fallback["provisional_receipt"]["status"],
-                speedtree.SOURCE_FALLBACK_STATUS,
+                baked["texture_contract_status"],
+                speedtree.BLENDER_CLUSTER_BAKE_TEXTURE_STATUS,
             )
-            self.assertTrue(
-                fallback["provisional_receipt"][
-                    "canonical_promotion_required"
-                ]
-            )
-            self.assertIn("Cluster bake", fallback["warning"])
+            self.assertIsNone(baked["warning"])
+            self.assertEqual(baked["files"]["albedo"], str(color))
 
     def test_filename_match_without_material_use_is_not_cluster_bake(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -283,34 +277,34 @@ class ClusterBakeTextureOriginTests(unittest.TestCase):
                 )
             )
 
-    def test_exported_group_keeps_provisional_contract_for_spm_upsert(self):
-        fallback = {
+    def test_exported_group_keeps_cluster_bake_contract_for_spm_upsert(self):
+        baked = {
             "texture_contract_status": (
-                speedtree.SOURCE_FALLBACK_STATUS
+                speedtree.BLENDER_CLUSTER_BAKE_TEXTURE_STATUS
             ),
             "source_origin": speedtree.BLENDER_CLUSTER_BAKE_ORIGIN,
-            "source_paths": {"albedo": "branch.tga"},
-            "provisional_receipt": {"kind": "test"},
+            "files": {"albedo": "branch.tga"},
+            "origin_receipt": {"kind": "test"},
         }
         result = speedtree.exported_material_group_manifest(
             {
                 "collection": "Atlas_Branch_Plans",
                 "material": "M_branch_test",
                 "texture_contract_status": (
-                    speedtree.SOURCE_FALLBACK_STATUS
+                    speedtree.BLENDER_CLUSTER_BAKE_TEXTURE_STATUS
                 ),
-                "source_texture_fallback": fallback,
+                "blender_cluster_bake_texture": baked,
             },
             [{"asset": "branch.fbx"}],
         )
 
         self.assertEqual(
-            result["source_texture_fallback"]["source_paths"],
+            result["blender_cluster_bake_texture"]["files"],
             {"albedo": "branch.tga"},
         )
         self.assertIsNot(
-            result["source_texture_fallback"],
-            fallback,
+            result["blender_cluster_bake_texture"],
+            baked,
         )
 
 
@@ -3848,6 +3842,12 @@ class SafetyTests(unittest.TestCase):
                 target,
                 preserve_scope_history=True,
             )
+            first_restored_xml = target.read_bytes()
+            repeated = speedtree.remove_blend_target_from_spm(
+                blend,
+                target,
+                preserve_scope_history=True,
+            )
 
             self.assertEqual(
                 result["retained_scope_manifests"],
@@ -3865,6 +3865,134 @@ class SafetyTests(unittest.TestCase):
             self.assertIn("source_material_adoption", retained)
             self.assertFalse(per_target.exists())
             self.assertFalse(global_manifest.exists())
+            self.assertEqual(target.read_bytes(), first_restored_xml)
+            self.assertEqual(
+                repeated["cleanup"]["restored_adopted_materials"],
+                [{
+                    "material_id": 8,
+                    "material_name": "M_cluster_test_01",
+                    "mesh_ids": [1],
+                    "mesh_states": [{
+                        "mesh_id": 1,
+                        "state": "already_restored",
+                    }],
+                }],
+            )
+
+    def test_adoption_restore_rejects_different_mesh_id_occupant_with_diagnostics(self):
+        assets = ET.Element("Assets")
+        managed = add_material(
+            assets,
+            8,
+            "M_cluster_test_01",
+            [10],
+        )
+        original_assets = ET.Element("Assets")
+        original_material = add_material(
+            original_assets,
+            8,
+            "M_cluster_test_01",
+            [1],
+        )
+        original_mesh = add_mesh(original_assets, 1)
+        original_mesh.find("Filename").text = "authored.fbx"
+        occupied = add_mesh(assets, 1)
+        occupied.find("Filename").text = "unrelated.fbx"
+        adoption = {
+            "version": speedtree.SOURCE_MATERIAL_ADOPTION_VERSION,
+            "scope": "scope-conflict",
+            "material_name": "M_cluster_test_01",
+            "material_id": 8,
+            "original_mesh_ids": [1],
+            "original_material_snapshot": (
+                speedtree.encode_spm_node_snapshot(original_material)
+            ),
+            "original_mesh_snapshots": [{
+                "mesh_id": 1,
+                "snapshot": speedtree.encode_spm_node_snapshot(original_mesh),
+            }],
+        }
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            (
+                r"occupied by a different node .*"
+                r"material_id=8.*scope='scope-conflict'.*"
+                r"existing_filename='unrelated\.fbx'.*"
+                r"existing_sha256=.*expected_sha256="
+            ),
+        ):
+            speedtree.restore_adopted_source_nodes(
+                assets,
+                {8: adoption},
+            )
+
+        self.assertIsNotNone(managed)
+
+    def test_adoption_restore_reuses_exact_retained_shared_source_mesh(self):
+        assets = ET.Element("Assets")
+        add_material(
+            assets,
+            2,
+            "M_authored_shared_source",
+            [1],
+        )
+        add_material(
+            assets,
+            19,
+            "M_cluster_test_01",
+            [21],
+        )
+        retained = add_mesh(assets, 1)
+        generated = add_mesh(assets, 21)
+        original_assets = ET.Element("Assets")
+        original_material = add_material(
+            original_assets,
+            19,
+            "M_cluster_test_01",
+            [1],
+        )
+        adoption = {
+            "version": speedtree.SOURCE_MATERIAL_ADOPTION_VERSION,
+            "scope": "scope-shared-source",
+            "material_name": "M_cluster_test_01",
+            "material_id": 19,
+            "original_mesh_ids": [1],
+            "original_material_snapshot": (
+                speedtree.encode_spm_node_snapshot(original_material)
+            ),
+            "original_mesh_snapshots": [{
+                "mesh_id": 1,
+                "snapshot": speedtree.encode_spm_node_snapshot(retained),
+            }],
+            "retained_shared_original_mesh_ids": [1],
+            "generated_mesh_ids": [21],
+        }
+
+        restored = speedtree.restore_adopted_source_nodes(
+            assets,
+            {19: adoption},
+        )
+
+        self.assertEqual(
+            speedtree.spm_material_mesh_ids(
+                assets.find("Material_v8[@ID='19']")
+            ),
+            [1],
+        )
+        self.assertEqual(
+            len([
+                node
+                for node in assets.findall("Mesh")
+                if node.attrib.get("ID") == "1"
+            ]),
+            1,
+        )
+        self.assertIsNotNone(generated)
+        self.assertEqual(
+            restored[0]["mesh_states"],
+            [{"mesh_id": 1, "state": "already_restored"}],
+        )
 
     def test_scope_manifest_without_exact_spm_is_not_cleanup_input(self):
         with tempfile.TemporaryDirectory() as folder:

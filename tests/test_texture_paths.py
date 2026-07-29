@@ -360,6 +360,100 @@ class AtlasTexturePathTests(unittest.TestCase):
             )
             self.assertNotIn("source_paths", result)
 
+    def test_irrelevant_manifest_output_does_not_block_source_contract(self):
+        with tempfile.TemporaryDirectory() as folder:
+            _asset, _texture, target, _manifest = (
+                self._write_canonical_manifest(
+                    folder,
+                    [{
+                        "texture_base": "T_leaf_other",
+                        "material_id": 9,
+                        "material_name": "M_leaf_other",
+                    }],
+                )
+            )
+            source = Path(folder) / "capture" / "cluster_color.tga"
+            source.parent.mkdir()
+            source.touch()
+
+            result = texture_paths.resolve_production_texture_contract(
+                target,
+                "M_cluster_requested",
+                8,
+                source_paths={"albedo": source},
+            )
+
+            self.assertEqual(
+                result["texture_contract_status"],
+                texture_paths.SOURCE_FALLBACK_STATUS,
+            )
+            self.assertEqual(result["source_paths"]["albedo"], source)
+
+    def test_relevant_malformed_output_still_blocks_source_contract(self):
+        with tempfile.TemporaryDirectory() as folder:
+            _asset, _texture, target, manifest = (
+                self._write_canonical_manifest(
+                    folder,
+                    [{
+                        "texture_base": "T_leaf_requested",
+                        "material_id": 8,
+                        "material_name": "M_leaf_requested",
+                    }],
+                )
+            )
+            payload = json.loads(manifest.read_text(encoding="utf-8"))
+            payload["outputs"][0]["producer"] = {}
+            manifest.write_text(json.dumps(payload), encoding="utf-8")
+            source = Path(folder) / "capture" / "cluster_color.tga"
+            source.parent.mkdir()
+            source.touch()
+
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "producer.tool/source are required",
+            ):
+                texture_paths.resolve_production_texture_contract(
+                    target,
+                    "M_leaf_requested",
+                    8,
+                    source_paths={"albedo": source},
+                )
+
+    def test_irrelevant_malformed_output_does_not_hide_valid_exact_output(self):
+        with tempfile.TemporaryDirectory() as folder:
+            _asset, _texture, target, manifest = (
+                self._write_canonical_manifest(
+                    folder,
+                    [
+                        {
+                            "texture_base": "T_leaf_requested",
+                            "material_id": 8,
+                            "material_name": "M_leaf_requested",
+                        },
+                        {
+                            "texture_base": "T_leaf_other",
+                            "material_id": 9,
+                            "material_name": "M_leaf_other",
+                        },
+                    ],
+                )
+            )
+            payload = json.loads(manifest.read_text(encoding="utf-8"))
+            payload["outputs"][1]["producer"] = {}
+            manifest.write_text(json.dumps(payload), encoding="utf-8")
+
+            result = texture_paths.resolve_production_texture_contract(
+                target,
+                "M_leaf_requested",
+                8,
+                source_paths={},
+            )
+
+            self.assertEqual(
+                result["canonical_output"]["texture_base"],
+                "T_leaf_requested",
+            )
+
     def test_absent_canonical_uses_structured_provisional_source_warning(self):
         with tempfile.TemporaryDirectory() as folder:
             asset = Path(folder) / "tree_asset"
