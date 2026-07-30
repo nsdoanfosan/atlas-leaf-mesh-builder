@@ -3876,7 +3876,11 @@ def migrate_previous_scope_material_for_adoption(
     legacy = groups[0]
     legacy_name = str(legacy.get("material") or "")
     legacy_id = positive_int(legacy.get("material_id"))
-    if not legacy_name or legacy_name == source_material_name or legacy_id is None:
+    if (
+        not legacy_name
+        or legacy_id is None
+        or legacy_id == positive_int(source_material_id)
+    ):
         return None
 
     root = read_spm_xml(spm_path)
@@ -3995,6 +3999,61 @@ def migrate_previous_scope_material_for_adoption(
         "reusable_mesh_ids": reusable_mesh_ids,
         "restored_generator_slots": restored,
     }
+
+
+def source_material_for_adoption(
+    root,
+    source_material_name,
+    requested_source_material_id=None,
+):
+    """Select one authored source when a legacy managed namesake remains."""
+    assets = root.find("Assets")
+    matches = (
+        [
+            node
+            for node in assets.findall("Material_v8")
+            if node.attrib.get("Name") == source_material_name
+        ]
+        if assets is not None
+        else []
+    )
+    referenced_ids = spm_visible_generator_referenced_material_ids(root)
+    referenced = [
+        node
+        for node in matches
+        if positive_int(node.attrib.get("ID")) in referenced_ids
+    ]
+    if len(referenced) == 1:
+        return referenced[0]
+    requested_id = positive_int(requested_source_material_id)
+    requested = [
+        node
+        for node in matches
+        if positive_int(node.attrib.get("ID")) == requested_id
+    ]
+    if not referenced and len(requested) == 1:
+        return requested[0]
+    if not referenced and requested_id is None and len(matches) == 1:
+        return matches[0]
+    details = [
+        {
+            "material_id": positive_int(node.attrib.get("ID")),
+            "generator_referenced": (
+                positive_int(node.attrib.get("ID")) in referenced_ids
+            ),
+            "atlas_scope": str(
+                parse_atlas_leaf_spm_user_data(
+                    node.findtext("UserData")
+                ).get("scope")
+                or ""
+            ),
+        }
+        for node in matches
+    ]
+    raise RuntimeError(
+        "Source-material adoption could not select one authoritative local "
+        f"Material_v8 named '{source_material_name}': {details}"
+    )
 
 
 def target_scope_manifests_for_blend(spm_path, blend_path):
@@ -7292,23 +7351,18 @@ def _export_or_update_speedtree_spm_path_impl(
                 "In-place source-material adoption requires generated and source material names to match."
             )
         target_root = read_spm_xml(target_spm)
-        target_assets = target_root.find("Assets")
-        local_source_matches = (
-            [
-                node
-                for node in target_assets.findall("Material_v8")
-                if node.attrib.get("Name") == source_name
-            ]
-            if target_assets is not None
-            else []
+        requested_source_id = None
+        if isinstance(source_material_ids, dict):
+            requested_source_id = source_material_ids.get(source_name)
+        elif source_material_ids:
+            if len(source_material_ids) != 1:
+                raise RuntimeError("Source-material adoption requires exactly one source material ID.")
+            requested_source_id = source_material_ids[0]
+        local_source_material = source_material_for_adoption(
+            target_root,
+            source_name,
+            requested_source_id,
         )
-        if len(local_source_matches) != 1:
-            raise RuntimeError(
-                "Source-material adoption requires exactly one local "
-                f"Material_v8 named '{source_name}'; found "
-                f"{len(local_source_matches)} in {target_spm.name}."
-            )
-        local_source_material = local_source_matches[0]
         local_source_id = positive_int(
             local_source_material.attrib.get("ID")
         )
@@ -7317,13 +7371,6 @@ def _export_or_update_speedtree_spm_path_impl(
                 f"Source material '{source_name}' has an invalid local ID in "
                 f"{target_spm.name}."
             )
-        requested_source_id = None
-        if isinstance(source_material_ids, dict):
-            requested_source_id = source_material_ids.get(source_name)
-        elif source_material_ids:
-            if len(source_material_ids) != 1:
-                raise RuntimeError("Source-material adoption requires exactly one source material ID.")
-            requested_source_id = source_material_ids[0]
         # Material IDs are local to each SPM.  Stored mappings can legitimately
         # carry the ID from a sibling target, so the exact-name material in the
         # current target is authoritative for this explicit adoption request.

@@ -3600,6 +3600,77 @@ class SafetyTests(unittest.TestCase):
                 {("Frond 36", "Material:Frond:0"): (8, 1)},
             )
 
+    def test_adoption_migrates_same_name_managed_output_to_live_source(self):
+        with tempfile.TemporaryDirectory() as folder:
+            folder = Path(folder)
+            target = folder / "SK_tree.spm"
+            root = ET.Element("SpeedTreeModel")
+            assets = ET.SubElement(root, "Assets")
+            add_material(assets, 8, "M_leaf", [1])
+            marker = json.dumps(
+                {
+                    "generator": speedtree.ATLAS_LEAF_SPM_GENERATOR,
+                    "scope": "scope-adopt",
+                    "kind": "material",
+                    "group": "Plans",
+                }
+            )
+            add_material(assets, 19, "M_leaf", [20], marker)
+            add_mesh(assets, 1)
+            add_mesh(
+                assets,
+                20,
+                marker.replace('"material"', '"mesh"'),
+            )
+            add_generator(root, "Leaf Mesh", "Leaf 1", [(8, 1)])
+            write_spm(target, root)
+
+            selected = speedtree.source_material_for_adoption(
+                root,
+                "M_leaf",
+                8,
+            )
+            self.assertEqual(selected.attrib.get("ID"), "8")
+
+            previous = {
+                "export_scope_id": "scope-adopt",
+                "speedtree_material_groups": [
+                    {
+                        "collection": "Plans",
+                        "material": "M_leaf",
+                        "material_id": 19,
+                        "mesh_ids": [20],
+                    }
+                ],
+                "generator_connection": {
+                    "requested": False,
+                    "complete": False,
+                    "bindings": [],
+                },
+            }
+            migration = (
+                speedtree.migrate_previous_scope_material_for_adoption(
+                    target,
+                    previous,
+                    "M_leaf",
+                    8,
+                )
+            )
+
+            migrated_assets = speedtree.read_spm_xml(target).find("Assets")
+            self.assertEqual(migration["legacy_material_id"], 19)
+            self.assertEqual(migration["reusable_mesh_ids"], [20])
+            self.assertIsNotNone(
+                migrated_assets.find("Material_v8[@ID='8']")
+            )
+            self.assertIsNone(
+                migrated_assets.find("Material_v8[@ID='19']")
+            )
+            self.assertEqual(
+                generator_values(target),
+                {("Leaf 1", "Leaves:Type:0"): (8, 1)},
+            )
+
     def test_untagged_unused_same_name_with_different_mesh_paths_is_reclaimed(self):
         with tempfile.TemporaryDirectory() as folder:
             target, sample, manifest, material_name = self._write_upsert_fixture(folder, None)
