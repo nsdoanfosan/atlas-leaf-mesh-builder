@@ -829,6 +829,71 @@ def texture_path_signature(texture_exports):
     return hashlib.sha256(encoded).hexdigest()
 
 
+def speedtree_handoff_material_name(export_scope_id, material_name):
+    """Return a stable, collision-resistant temporary FBX material name."""
+    payload = json.dumps(
+        {
+            "export_scope_id": str(export_scope_id or ""),
+            "material": str(material_name or ""),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return "_AtlasLeaf_SpeedTree_Handoff_" + hashlib.sha256(payload).hexdigest()[:12]
+
+
+SOURCE_REFRESH_BUILDER_CONTRACT = (
+    "atlas_leaf_speedtree_deleted_lifecycle_atomic_fleet_v2"
+)
+
+
+def source_refresh_receipt(blend_path, texture_signature, texture_inputs):
+    """Capture immutable source inputs used to decide a later fleet no-op."""
+    blend = Path(blend_path)
+    return {
+        "kind": "atlas_leaf_source_refresh_receipt",
+        "version": 2,
+        "builder_contract": SOURCE_REFRESH_BUILDER_CONTRACT,
+        "blend_file": str(blend),
+        "blend_sha256": file_sha256(blend) if blend.is_file() else None,
+        "texture_signature": str(texture_signature or ""),
+        "texture_inputs": {
+            str(key): str(value)
+            for key, value in sorted((texture_inputs or {}).items())
+        },
+    }
+
+
+def source_refresh_receipt_is_current(receipt, blend_path):
+    """Verify a no-op receipt without trusting recorded hashes alone."""
+    if not isinstance(receipt, dict):
+        return False
+    if (
+        receipt.get("kind") != "atlas_leaf_source_refresh_receipt"
+        or receipt.get("version") != 2
+        or receipt.get("builder_contract") != SOURCE_REFRESH_BUILDER_CONTRACT
+    ):
+        return False
+    blend = Path(blend_path)
+    recorded_blend = str(receipt.get("blend_file") or "")
+    recorded_sha = str(receipt.get("blend_sha256") or "")
+    if (
+        not blend.is_file()
+        or not recorded_blend
+        or not blend_paths_equal(recorded_blend, blend)
+        or not recorded_sha
+        or file_sha256(blend) != recorded_sha
+    ):
+        return False
+    texture_inputs = receipt.get("texture_inputs")
+    if not isinstance(texture_inputs, dict) or not texture_inputs:
+        return False
+    return texture_path_signature(texture_inputs) == str(
+        receipt.get("texture_signature") or ""
+    )
+
+
 def collection_scope_is_duplicated(collection, scope_id, existing_manifest=None):
     collections = getattr(getattr(bpy, "data", None), "collections", ())
     matches = []
@@ -7447,9 +7512,9 @@ def export_speedtree_assets(
         for group in source_groups:
             if not group["objects"]:
                 continue
-            handoff_name = (
-                "_AtlasLeaf_SpeedTree_Handoff_"
-                + uuid.uuid4().hex[:12]
+            handoff_name = speedtree_handoff_material_name(
+                export_scope_id,
+                group["material"],
             )
             production_maps = production_texture_maps[group["material"]]
             if group["texture_contract_status"] == CANONICAL_TEXTURE_STATUS:
@@ -7678,6 +7743,11 @@ def export_speedtree_assets(
         "export_scope_id": export_scope_id,
         "blend_file": bpy.data.filepath,
         "texture_signature": texture_signature,
+        "source_refresh_receipt": source_refresh_receipt(
+            bpy.data.filepath,
+            texture_signature,
+            production_signature_paths,
+        ),
         "requested_atlas_asset_name": str(atlas_asset_name or ""),
         "atlas_asset_name": blender_material_base_name(
             collection,
@@ -8667,6 +8737,97 @@ def _external_mesh_filenames(mesh):
         if lod is not None:
             filenames.append(str(lod.findtext("Filename") or "").strip())
     return [filename for filename in filenames if filename]
+
+
+def spm_managed_reference_audit(spm_path):
+    """Report managed external Mesh ownership and Generator usage.
+
+    A managed Mesh can be present and readable while no Generator references
+    it.  Keep that state distinct from a missing file: authoritative Atlas
+    sources may deliberately retain currently-unbound outputs, while old
+    groupless markers need lineage/tombstone evidence before cleanup.
+    """
+    spm_path = Path(spm_path).absolute()
+    root = read_spm_xml(spm_path)
+    assets = root.find("Assets")
+    if assets is None:
+        raise RuntimeError(
+            f"SpeedTree SPM reference audit failed: Assets missing in {spm_path.name}."
+        )
+    referenced_mesh_ids = spm_generator_referenced_mesh_ids(root)
+    rows = []
+    by_scope = {}
+    for mesh in assets.findall("Mesh"):
+        marker = parse_atlas_leaf_spm_user_data(mesh.findtext("UserData"))
+        if not marker:
+            continue
+        mesh_id = positive_int(mesh.attrib.get("ID"))
+        filenames = _external_mesh_filenames(mesh)
+        embedded = str(mesh.findtext("Embedded") or "").strip().casefold()
+        missing_filenames = []
+        if embedded not in {"1", "true", "yes"}:
+            if not filenames:
+                missing_filenames.append("<missing Filename>")
+            for filename in filenames:
+                candidate = Path(filename)
+                resolved = (
+                    candidate
+                    if candidate.is_absolute()
+                    else spm_path.parent / candidate
+                ).absolute()
+                if not resolved.is_file():
+                    missing_filenames.append(filename)
+        usage = "active" if mesh_id in referenced_mesh_ids else "managed_orphan"
+        scope = str(marker.get("scope") or "").strip()
+        group = str(marker.get("group") or "").strip()
+        row = {
+            "mesh_id": mesh_id,
+            "name": str(mesh.attrib.get("Name") or ""),
+            "scope": scope,
+            "group": group,
+            "groupless": not bool(group),
+            "usage": usage,
+            "embedded": embedded in {"1", "true", "yes"},
+            "filenames": filenames,
+            "missing_filenames": missing_filenames,
+        }
+        rows.append(row)
+        bucket = by_scope.setdefault(
+            scope,
+            {
+                "scope": scope,
+                "checked": 0,
+                "active": 0,
+                "managed_orphan": 0,
+                "missing": 0,
+                "orphan_missing": 0,
+                "groupless": 0,
+            },
+        )
+        bucket["checked"] += 1
+        bucket[usage] += 1
+        if missing_filenames:
+            bucket["missing"] += 1
+            if usage == "managed_orphan":
+                bucket["orphan_missing"] += 1
+        if not group:
+            bucket["groupless"] += 1
+    rows.sort(key=lambda row: (row["mesh_id"] is None, row["mesh_id"] or 0))
+    return {
+        "spm": str(spm_path),
+        "checked": len(rows),
+        "active": sum(row["usage"] == "active" for row in rows),
+        "managed_orphan": sum(
+            row["usage"] == "managed_orphan" for row in rows
+        ),
+        "missing": sum(bool(row["missing_filenames"]) for row in rows),
+        "orphan_missing": sum(
+            row["usage"] == "managed_orphan" and bool(row["missing_filenames"])
+            for row in rows
+        ),
+        "by_scope": sorted(by_scope.values(), key=lambda row: row["scope"]),
+        "meshes": rows,
+    }
 
 
 def _validate_staged_speedtree_targets(staged_targets, states):

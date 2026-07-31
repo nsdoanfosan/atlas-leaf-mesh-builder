@@ -309,6 +309,51 @@ class ClusterBakeTextureOriginTests(unittest.TestCase):
 
 
 class MeshAssetScaleTests(unittest.TestCase):
+    def test_handoff_material_name_is_stable_per_scope_and_material(self):
+        first = speedtree.speedtree_handoff_material_name("scope-a", "M_leaf")
+        second = speedtree.speedtree_handoff_material_name("scope-a", "M_leaf")
+        other = speedtree.speedtree_handoff_material_name("scope-a", "M_stem")
+        self.assertEqual(first, second)
+        self.assertNotEqual(first, other)
+        self.assertTrue(first.startswith("_AtlasLeaf_SpeedTree_Handoff_"))
+
+    def test_source_refresh_receipt_rehashes_blend_and_textures(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            blend = root / "atlas.blend"
+            texture = root / "leaf.tga"
+            blend.write_bytes(b"blend-v1")
+            texture.write_bytes(b"texture-v1")
+            texture_inputs = {"M_leaf:albedo": str(texture)}
+            signature = speedtree.texture_path_signature(texture_inputs)
+            receipt = speedtree.source_refresh_receipt(
+                blend,
+                signature,
+                texture_inputs,
+            )
+            self.assertEqual(receipt["version"], 2)
+            self.assertEqual(
+                receipt["builder_contract"],
+                speedtree.SOURCE_REFRESH_BUILDER_CONTRACT,
+            )
+
+            self.assertTrue(
+                speedtree.source_refresh_receipt_is_current(receipt, blend)
+            )
+            stale_contract = dict(receipt, builder_contract="older-builder")
+            self.assertFalse(
+                speedtree.source_refresh_receipt_is_current(stale_contract, blend)
+            )
+            texture.write_bytes(b"texture-v2")
+            self.assertFalse(
+                speedtree.source_refresh_receipt_is_current(receipt, blend)
+            )
+            texture.write_bytes(b"texture-v1")
+            blend.write_bytes(b"blend-v2")
+            self.assertFalse(
+                speedtree.source_refresh_receipt_is_current(receipt, blend)
+            )
+
     def test_same_float_accepts_blender_float32_rounding(self):
         self.assertTrue(speedtree._same_float(0.1, 0.10000000149011612))
         self.assertFalse(speedtree._same_float(0.1, 0.1001))
@@ -461,6 +506,56 @@ def generator_values(path):
             int(pair["mesh_property"].findtext("Value")),
         )
     return values
+
+
+class ManagedReferenceAuditTests(unittest.TestCase):
+    def test_audit_keeps_orphan_and_missing_dimensions_separate(self):
+        with tempfile.TemporaryDirectory() as folder:
+            folder = Path(folder)
+            target = folder / "SK_tree.spm"
+            (folder / "meshes").mkdir()
+            (folder / "meshes" / "10.fbx").write_bytes(b"active")
+            (folder / "meshes" / "11.fbx").write_bytes(b"orphan")
+            root = ET.Element("SpeedTreeModel")
+            assets = ET.SubElement(root, "Assets")
+            marker = json.dumps({
+                "generator": speedtree.ATLAS_LEAF_SPM_GENERATOR,
+                "scope": "scope-current",
+                "group": "Atlas_Cards",
+                "kind": "mesh",
+            })
+            legacy = json.dumps({
+                "generator": speedtree.ATLAS_LEAF_SPM_GENERATOR,
+                "scope": "scope-legacy",
+                "kind": "mesh",
+            })
+            for mesh_id, user_data in ((10, marker), (11, marker), (12, legacy)):
+                add_mesh(assets, mesh_id, user_data)
+            missing_name = add_mesh(assets, 13, legacy)
+            missing_name.remove(missing_name.find("Filename"))
+            add_generator(root, "Leaf Mesh", "Leaf", [(8, 10)])
+            write_spm(target, root)
+
+            audit = speedtree.spm_managed_reference_audit(target)
+
+            self.assertEqual(
+                {name: audit[name] for name in (
+                    "checked", "active", "managed_orphan", "missing", "orphan_missing"
+                )},
+                {
+                    "checked": 4,
+                    "active": 1,
+                    "managed_orphan": 3,
+                    "missing": 2,
+                    "orphan_missing": 2,
+                },
+            )
+            self.assertFalse(audit["meshes"][1]["groupless"])
+            self.assertTrue(audit["meshes"][2]["groupless"])
+            self.assertEqual(
+                audit["meshes"][3]["missing_filenames"],
+                ["<missing Filename>"],
+            )
 
 
 class FrondGeneratorGeometryScaleTests(unittest.TestCase):
