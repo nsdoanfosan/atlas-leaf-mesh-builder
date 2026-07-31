@@ -4401,6 +4401,501 @@ class SafetyTests(unittest.TestCase):
             self.assertNotEqual(duplicate_scope, "shared-scope")
 
 
+class DeletedMeshLifecycleTests(unittest.TestCase):
+    def _managed_manifest(self, target, blend, scope="scope-current"):
+        return {
+            "export_scope_id": scope,
+            "blend_file": str(blend),
+            "source_collection": "Atlas_Cluster_Cards",
+            "spm": str(target),
+            "material_groups": [{
+                "collection": "Atlas_Cluster_Cards",
+                "material": "M_leaf_test",
+                "meshes": [
+                    {"source_object": f"leaf_{ordinal:02d}"}
+                    for ordinal in range(1, 4)
+                ],
+            }],
+            "speedtree_material_groups": [{
+                "collection": "Atlas_Cluster_Cards",
+                "material": "M_leaf_test",
+                "material_id": 8,
+                "mesh_ids": [10, 11, 12],
+            }],
+        }
+
+    def _binding(self, generator, slot, ordinal, *, source=True, created=False):
+        binding = {
+            "generator_index": 0,
+            "generator_name": "Leaf",
+            "generator_guid": speedtree.generator_guid(generator),
+            "generator_type": "Leaf Mesh",
+            "slot_prefix": f"Leaves:Type:{slot}",
+            "source_material_id": 4 if source else None,
+            "source_material_name": "M_source" if source else None,
+            "source_mesh_id": ordinal if source else None,
+            "target_material_id": 8,
+            "target_mesh_id": 9 + ordinal,
+            "leaf_ordinal": ordinal,
+            "created_slot": created,
+        }
+        return binding
+
+    def test_middle_deleted_ordinal_restores_authored_generator_binding(self):
+        root = ET.Element("SpeedTreeModel")
+        assets = ET.SubElement(root, "Assets")
+        add_material(assets, 4, "M_source", [1, 2, 3])
+        add_material(assets, 8, "M_leaf_test", [10, 11, 12])
+        for mesh_id in (1, 2, 3, 10, 11, 12):
+            add_mesh(assets, mesh_id)
+        generator = add_variant_generator(
+            root,
+            "Leaf Mesh",
+            "Leaf",
+            [(8, 10), (8, 11), (8, 12)],
+        )
+        bindings = [
+            self._binding(generator, slot, ordinal)
+            for slot, ordinal in enumerate((1, 2, 3))
+        ]
+
+        result = speedtree.retire_deleted_generator_bindings(
+            root,
+            bindings,
+            {
+                1: {"target_material_id": 8, "target_mesh_id": 10},
+                3: {"target_material_id": 8, "target_mesh_id": 12},
+            },
+            {4: {"material": assets.find("Material_v8[@ID='4']"), "mesh_ids": [1, 2, 3]}},
+        )
+
+        pairs = {
+            pair["slot_prefix"]: (
+                speedtree.positive_int(pair["material_property"].findtext("Value")),
+                speedtree.integer_value(pair["mesh_property"].findtext("Value")),
+            )
+            for pair in speedtree.spm_generator_property_pairs(root)
+        }
+        self.assertEqual(pairs["Leaves:Type:1"], (4, 2))
+        self.assertEqual(
+            [binding["leaf_ordinal"] for binding in result["active_bindings"]],
+            [1, 3],
+        )
+        self.assertEqual(
+            result["retired_bindings"][0]["mode"],
+            "restored_original_binding",
+        )
+
+    def test_connect_tombstones_middle_deleted_ordinal_under_default_policy(self):
+        with tempfile.TemporaryDirectory() as folder:
+            target = Path(folder) / "SK_tree.spm"
+            root = ET.Element("SpeedTreeModel")
+            assets = ET.SubElement(root, "Assets")
+            add_material(assets, 4, "M_source", [1, 2, 3])
+            add_material(assets, 8, "M_leaf_test", [10, 11, 12])
+            for mesh_id in (1, 2, 3, 10, 11, 12):
+                add_mesh(assets, mesh_id)
+            generator = add_variant_generator(
+                root,
+                "Leaf Mesh",
+                "Leaf",
+                [(8, 10), (8, 11), (8, 12)],
+            )
+            write_spm(target, root)
+            previous = [
+                self._binding(generator, slot, ordinal)
+                for slot, ordinal in enumerate((1, 2, 3))
+            ]
+            groups = [{
+                "material": "M_leaf_test",
+                "material_id": 8,
+                "mesh_ids": [10, 12],
+                "meshes": [
+                    {"source_object": "leaf_01", "source_ordinal": 1},
+                    {"source_object": "leaf_03", "source_ordinal": 3},
+                ],
+            }]
+
+            result = speedtree.connect_atlas_generators_in_spm(
+                target,
+                ["M_source"],
+                groups,
+                [4],
+                previous_bindings=previous,
+            )
+
+            self.assertEqual(
+                result["generator_variant_policy"],
+                "preserve_existing_slots",
+            )
+            self.assertEqual(
+                result["retired_deleted_bindings"][0]["mode"],
+                "restored_original_binding",
+            )
+            self.assertEqual(
+                generator_values(target)[("Leaf", "Leaves:Type:1")],
+                (4, 2),
+            )
+
+    def test_ensure_all_policy_does_not_resurrect_deleted_ordinal(self):
+        with tempfile.TemporaryDirectory() as folder:
+            target = Path(folder) / "SK_tree.spm"
+            root = ET.Element("SpeedTreeModel")
+            assets = ET.SubElement(root, "Assets")
+            add_material(assets, 4, "M_source", [1, 2])
+            add_material(assets, 8, "M_leaf_test", [10, 11])
+            for mesh_id in (1, 2, 10, 11):
+                add_mesh(assets, mesh_id)
+            generator = add_variant_generator(
+                root,
+                "Leaf Mesh",
+                "Leaf",
+                [(8, 10), (8, 11)],
+            )
+            write_spm(target, root)
+            previous = [
+                self._binding(generator, slot, ordinal)
+                for slot, ordinal in enumerate((1, 2))
+            ]
+
+            result = speedtree.connect_atlas_generators_in_spm(
+                target,
+                ["M_source"],
+                [{
+                    "material": "M_leaf_test",
+                    "material_id": 8,
+                    "mesh_ids": [10],
+                    "meshes": [{
+                        "source_object": "leaf_01",
+                        "source_ordinal": 1,
+                    }],
+                }],
+                [4],
+                previous_bindings=previous,
+                generator_variant_policy="ensure_all_material_cutouts",
+            )
+
+            self.assertEqual(
+                generator_values(target)[("Leaf", "Leaves:Type:1")],
+                (4, 2),
+            )
+            self.assertEqual(
+                result["retired_deleted_bindings"][0]["target_mesh_id"],
+                11,
+            )
+
+    def test_adopted_deleted_ordinal_restores_captured_source_mesh_snapshot(self):
+        root = ET.Element("SpeedTreeModel")
+        assets = ET.SubElement(root, "Assets")
+        material = add_material(assets, 4, "M_source", [10, 11])
+        for mesh_id in (10, 11):
+            add_mesh(assets, mesh_id)
+        generator = add_variant_generator(
+            root,
+            "Leaf Mesh",
+            "Leaf",
+            [(4, 10), (4, 11)],
+        )
+        original_mesh = ET.Element("Mesh", {"ID": "2", "Name": "source_02"})
+        ET.SubElement(original_mesh, "Embedded").text = "true"
+        previous_binding = self._binding(generator, 1, 2)
+        previous_binding["target_material_id"] = 4
+        previous_binding["target_mesh_id"] = 11
+        ownership_manifest = {
+            "export_scope_id": "scope-current",
+            "source_material_adoption": {
+                "material_id": 4,
+                "original_mesh_snapshots": [{
+                    "mesh_id": 2,
+                    "snapshot": speedtree.encode_spm_node_snapshot(original_mesh),
+                }],
+            },
+        }
+
+        result = speedtree.retire_deleted_generator_bindings(
+            root,
+            [previous_binding],
+            {1: {"target_material_id": 4, "target_mesh_id": 10}},
+            {4: {"material": material, "mesh_ids": [1, 2]}},
+            ownership_manifest=ownership_manifest,
+        )
+
+        self.assertIsNotNone(assets.find("Mesh[@ID='2']"))
+        pair = speedtree.spm_generator_property_pairs(root)[1]
+        self.assertEqual(pair["material_property"].findtext("Value"), "4")
+        self.assertEqual(pair["mesh_property"].findtext("Value"), "2")
+        self.assertEqual(
+            result["retired_bindings"][0]["mode"],
+            "restored_original_binding_and_mesh_snapshot",
+        )
+
+    def test_last_created_tail_outputs_are_removed_only_with_full_provenance(self):
+        root = ET.Element("SpeedTreeModel")
+        assets = ET.SubElement(root, "Assets")
+        add_material(assets, 4, "M_source", [1, 2, 3])
+        add_material(assets, 8, "M_leaf_test", [10, 11, 12])
+        for mesh_id in (1, 2, 3, 10, 11, 12):
+            add_mesh(assets, mesh_id)
+        generator = add_variant_generator(
+            root,
+            "Leaf Mesh",
+            "Leaf",
+            [(8, 10), (8, 11), (8, 12)],
+        )
+        bindings = [self._binding(generator, 0, 1)]
+        for slot, ordinal in ((1, 2), (2, 3)):
+            binding = self._binding(
+                generator,
+                slot,
+                ordinal,
+                created=True,
+            )
+            binding.update({
+                "variant_parent_property": "Leaves:Type",
+                "variant_parent_children_before": 1,
+                "variant_parent_children_after": 3,
+                "created_material_property": f"Leaves:Type:{slot}:Material",
+                "created_mesh_property": f"Leaves:Type:{slot}:Mesh",
+            })
+            bindings.append(binding)
+
+        result = speedtree.retire_deleted_generator_bindings(
+            root,
+            bindings,
+            {1: {"target_material_id": 8, "target_mesh_id": 10}},
+            {4: {"material": assets.find("Material_v8[@ID='4']"), "mesh_ids": [1, 2, 3]}},
+        )
+
+        state = speedtree.generator_variant_parent_state(
+            generator,
+            "Leaves:Type",
+        )
+        self.assertEqual(state["child_count"], 1)
+        self.assertEqual(
+            [item["mode"] for item in result["retired_bindings"]],
+            ["removed_created_variant_slot", "removed_created_variant_slot"],
+        )
+
+    def test_completely_empty_collection_publishes_idempotent_target_tombstone(self):
+        with tempfile.TemporaryDirectory() as folder:
+            folder = Path(folder)
+            target = folder / "SK_tree.spm"
+            blend = folder / "atlas.blend"
+            root = ET.Element("SpeedTreeModel")
+            assets = ET.SubElement(root, "Assets")
+            add_material(assets, 4, "M_source", [1])
+            add_mesh(assets, 1)
+            previous = self._managed_manifest(target, blend)
+            previous["material_groups"][0]["meshes"] = [
+                {"source_object": "leaf_01", "asset": str(folder / "meshes" / "leaf_01.fbx")}
+            ]
+            previous["speedtree_material_groups"][0]["mesh_ids"] = [10]
+            managed_material = add_material(assets, 8, "M_leaf_test", [10])
+            managed_mesh = add_mesh(assets, 10)
+            speedtree.tag_spm_asset(managed_material, previous, "material")
+            speedtree.tag_spm_asset(managed_mesh, previous, "mesh")
+            generator = add_variant_generator(
+                root,
+                "Leaf Mesh",
+                "Leaf",
+                [(8, 10)],
+            )
+            previous["generator_connection"] = {
+                "bindings": [self._binding(generator, 0, 1)]
+            }
+            write_spm(target, root)
+            speedtree.write_scope_manifest(folder, previous, target)
+            per_target = speedtree.target_manifest_path(target)
+            per_target.parent.mkdir(parents=True)
+            per_target.write_text(json.dumps(previous), encoding="utf-8")
+            tombstone = {
+                "source_collection": "Atlas_Cluster_Cards",
+                "export_scope_id": "scope-current",
+                "blend_file": str(blend),
+                "material_groups": [],
+                "meshes": [],
+                "collection_tombstone": {
+                    "state": "empty",
+                    "reason": "no_live_mesh_objects",
+                },
+            }
+            original_export = speedtree.export_speedtree_assets
+
+            def fake_export(_props, export_dir, *_args, **_kwargs):
+                manifest_path = Path(export_dir) / "speedtree_import_manifest.json"
+                manifest_path.write_text(json.dumps(tombstone), encoding="utf-8")
+                return manifest_path, Path(export_dir) / "README.md", []
+
+            props = types.SimpleNamespace(
+                collection_name="Atlas_Cluster_Cards",
+                speedtree_atlas_asset_name="M_leaf_test",
+                speedtree_canonical_texture_manifest_path="",
+            )
+            speedtree.export_speedtree_assets = fake_export
+            try:
+                first = speedtree.export_or_update_speedtree_spm_path(
+                    props,
+                    target,
+                    source_material_names=["M_source"],
+                )
+                first_spm = target.read_bytes()
+                first_manifest = per_target.read_bytes()
+                second = speedtree.export_or_update_speedtree_spm_path(
+                    props,
+                    target,
+                    source_material_names=["M_source"],
+                )
+            finally:
+                speedtree.export_speedtree_assets = original_export
+
+            self.assertEqual(first[3], "tombstoned")
+            self.assertEqual(second[3], "tombstoned")
+            self.assertEqual(target.read_bytes(), first_spm)
+            self.assertEqual(per_target.read_bytes(), first_manifest)
+            final_root = speedtree.read_spm_xml(target)
+            final_assets = final_root.find("Assets")
+            self.assertIsNone(final_assets.find("Material_v8[@ID='8']"))
+            self.assertIsNone(final_assets.find("Mesh[@ID='10']"))
+            self.assertEqual(
+                generator_values(target)[("Leaf", "Leaves:Type:0")],
+                (4, 1),
+            )
+            final_manifest = json.loads(per_target.read_text(encoding="utf-8"))
+            self.assertEqual(final_manifest["mesh_ids"], [])
+            self.assertEqual(final_manifest["speedtree_material_groups"], [])
+
+    def test_last_group_output_without_binding_provenance_is_detached(self):
+        with tempfile.TemporaryDirectory() as folder:
+            folder = Path(folder)
+            target = folder / "SK_tree.spm"
+            blend = folder / "atlas.blend"
+            manifest = self._managed_manifest(target, blend)
+            manifest["speedtree_material_groups"][0]["mesh_ids"] = [10]
+            manifest["material_groups"][0]["meshes"] = [
+                {"source_object": "leaf_01"}
+            ]
+            root = ET.Element("SpeedTreeModel")
+            assets = ET.SubElement(root, "Assets")
+            material = add_material(assets, 8, "M_leaf_test", [10])
+            mesh = add_mesh(assets, 10)
+            speedtree.tag_spm_asset(material, manifest, "material")
+            speedtree.tag_spm_asset(mesh, manifest, "mesh")
+            add_variant_generator(root, "Leaf Mesh", "Leaf", [(8, 10)])
+
+            result = speedtree.retire_deleted_generator_bindings(
+                root,
+                [],
+                {},
+                {},
+                ownership_manifest=manifest,
+                spm_path=target,
+            )
+
+            pair = speedtree.spm_generator_property_pairs(root)[0]
+            self.assertEqual(pair["material_property"].findtext("Value"), "-1")
+            self.assertEqual(pair["mesh_property"].findtext("Value"), "-10")
+            self.assertEqual(
+                result["retired_bindings"][0]["mode"],
+                "detached_unassigned_missing_original_binding",
+            )
+
+    def test_partial_legacy_deletion_detaches_tagged_mesh_removed_from_cutout_list(self):
+        with tempfile.TemporaryDirectory() as folder:
+            folder = Path(folder)
+            target = folder / "SK_tree.spm"
+            blend = folder / "atlas.blend"
+            manifest = self._managed_manifest(target, blend)
+            manifest["speedtree_material_groups"][0]["mesh_ids"] = [10, 11]
+            root = ET.Element("SpeedTreeModel")
+            assets = ET.SubElement(root, "Assets")
+            material = add_material(assets, 8, "M_leaf_test", [10])
+            current_mesh = add_mesh(assets, 10)
+            deleted_mesh = add_mesh(assets, 11)
+            speedtree.tag_spm_asset(material, manifest, "material")
+            speedtree.tag_spm_asset(current_mesh, manifest, "mesh")
+            speedtree.tag_spm_asset(deleted_mesh, manifest, "mesh")
+            add_variant_generator(
+                root,
+                "Leaf Mesh",
+                "Leaf",
+                [(8, 10), (8, 11)],
+            )
+
+            result = speedtree.retire_deleted_generator_bindings(
+                root,
+                [],
+                {1: {"target_material_id": 8, "target_mesh_id": 10}},
+                {},
+                ownership_manifest=manifest,
+                spm_path=target,
+            )
+
+            pairs = speedtree.spm_generator_property_pairs(root)
+            self.assertEqual(
+                (
+                    pairs[1]["material_property"].findtext("Value"),
+                    pairs[1]["mesh_property"].findtext("Value"),
+                ),
+                ("-1", "-10"),
+            )
+            self.assertEqual(len(result["retired_bindings"]), 1)
+
+    def test_same_source_legacy_scope_is_selected_and_retired_idempotently(self):
+        with tempfile.TemporaryDirectory() as folder:
+            folder = Path(folder)
+            target = folder / "SK_tree.spm"
+            blend = folder / "atlas.blend"
+            current = self._managed_manifest(target, blend)
+            current["material_groups"][0]["meshes"] = [
+                {"source_object": "leaf_02"}
+            ]
+            previous = self._managed_manifest(target, blend, "M_leaf_test")
+            previous["material_groups"][0]["meshes"] = [
+                {"source_object": "leaf_01"},
+                {"source_object": "leaf_02"},
+            ]
+            scope_path = speedtree.write_scope_manifest(folder, previous, target)
+
+            selected, diagnostics = speedtree.superseded_scope_manifests_for_update(
+                target,
+                current,
+            )
+
+            self.assertEqual([item["export_scope_id"] for item in selected], ["M_leaf_test"])
+            self.assertEqual(diagnostics, [])
+            first = speedtree.retire_scope_manifest_records(selected, current)
+            first_bytes = scope_path.read_bytes()
+            second = speedtree.retire_scope_manifest_records(selected, current)
+            self.assertEqual(scope_path.read_bytes(), first_bytes)
+            self.assertEqual(first, second)
+            payload = json.loads(scope_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["atlas_scope_lifecycle"]["state"], "retired")
+            self.assertEqual(payload["speedtree_material_groups"], [])
+
+    def test_ambiguous_legacy_scope_is_preserved_with_diagnostic(self):
+        with tempfile.TemporaryDirectory() as folder:
+            folder = Path(folder)
+            target = folder / "SK_tree.spm"
+            blend = folder / "atlas.blend"
+            current = self._managed_manifest(target, blend)
+            previous = self._managed_manifest(target, blend, "legacy-scope")
+            previous["material_groups"][0]["meshes"] = [{}]
+            scope_path = speedtree.write_scope_manifest(folder, previous, target)
+
+            selected, diagnostics = speedtree.superseded_scope_manifests_for_update(
+                target,
+                current,
+            )
+
+            self.assertEqual(selected, [])
+            self.assertEqual(diagnostics[0]["scope"], "legacy-scope")
+            self.assertEqual(diagnostics[0]["reason"], "asset_lineage_unproven")
+            self.assertNotIn(
+                "atlas_scope_lifecycle",
+                json.loads(scope_path.read_text(encoding="utf-8")),
+            )
+
+
 class SpmWriterTests(unittest.TestCase):
     def sample_root(self):
         root = ET.Element("SpeedTreeRaw")
