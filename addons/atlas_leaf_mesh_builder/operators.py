@@ -1,7 +1,9 @@
 import colorsys
 import json
+import shutil
 from pathlib import Path
 
+import bmesh
 import bpy
 import numpy as np
 from bpy.props import IntProperty
@@ -9,9 +11,17 @@ from bpy.types import Operator, Panel
 from mathutils import Matrix, Vector
 
 from .constants import DEFAULT_PAIRS, HELPER_PATH
-from .materials import build_mesh_object, ensure_collection, make_atlas_material, make_side_material, show_preview_images_in_view
-from .props import add_spm_target_item, ensure_pair_items, fill_pair_items, pair_items_to_json, sync_alpha_path
-from .speedtree import export_or_update_speedtree_spm_targets
+from .materials import build_mesh_object, configure_leaf_surface, ensure_collection, make_atlas_material, make_side_material, show_preview_images_in_view
+from .props import (
+    add_spm_target_item,
+    ensure_pair_items,
+    fill_pair_items,
+    pair_items_to_json,
+    save_spm_target_registry,
+    sync_alpha_path,
+    sync_spm_target_registry,
+)
+from .speedtree import export_or_update_speedtree_spm_targets, remove_blend_target_from_spm
 from .utils import dependency_status, run_external_python, write_report
 
 
@@ -36,6 +46,15 @@ LEGACY_AUTO_SPLIT_COLLECTIONS = {
     "Twigs",
     "Stem_or_Twig",
 }
+STRAIGHT_BACKUP_COLLECTION = "AtlasLeaf_Straight_Backups"
+STRAIGHT_BACKUP_FLAG = "atlas_leaf_straight_backup"
+STRAIGHT_BACKUP_SOURCE = "atlas_leaf_straight_source"
+STRAIGHT_BACKUP_REFERENCE = "atlas_leaf_straight_backup_object"
+PROJECTED_SOURCE_BACKUP_COLLECTION = "AtlasLeaf_ProjectedShell_Source_Backups"
+PROJECTED_SOURCE_BACKUP_FLAG = "atlas_leaf_projected_source_backup"
+PROJECTED_SOURCE_ROLE = "atlas_leaf_projected_source_role"
+PROJECTED_SOURCE_OUTPUT = "atlas_leaf_projected_source_output"
+PROJECTED_SOURCE_COLLECTIONS = "atlas_leaf_projected_source_collections"
 
 
 def remove_collection_tree(collection):
@@ -305,6 +324,507 @@ def auto_split_classifications(objects, props):
 
 def selected_mesh_objects(context):
     return [obj for obj in context.selected_objects if obj.type == "MESH"]
+
+
+def split_below_world_x_axis_and_center(obj, tolerance=1.0e-6):
+    """Delete world Y < 0, then place the cut-bottom pivot at world origin."""
+    if obj.data.shape_keys is not None:
+        return False, "Shape keys are not supported", None
+
+    mesh = obj.data
+    bm = bmesh.new()
+    try:
+        bm.from_mesh(mesh)
+        if not bm.verts:
+            return False, "Mesh has no vertices", None
+
+        original_matrix = obj.matrix_world.copy()
+        bmesh.ops.transform(bm, matrix=original_matrix, verts=list(bm.verts))
+        world_y = [float(vertex.co.y) for vertex in bm.verts]
+        minimum_y = min(world_y)
+        maximum_y = max(world_y)
+        cut_applied = minimum_y < -tolerance
+
+        if cut_applied and maximum_y <= tolerance:
+            return False, "Mesh has no geometry above the world X axis", None
+
+        if cut_applied:
+            geometry = list(bm.verts) + list(bm.edges) + list(bm.faces)
+            bmesh.ops.bisect_plane(
+                bm,
+                geom=geometry,
+                dist=tolerance,
+                plane_co=Vector((0.0, 0.0, 0.0)),
+                plane_no=Vector((0.0, 1.0, 0.0)),
+                clear_inner=True,
+                clear_outer=False,
+            )
+            if not bm.verts or not bm.faces:
+                return False, "Split left no usable faces", None
+
+        post_minimum_y = min(float(vertex.co.y) for vertex in bm.verts)
+        extent = max(
+            max(float(vertex.co.y) for vertex in bm.verts) - post_minimum_y,
+            1.0,
+        )
+        bottom_tolerance = max(tolerance * 10.0, extent * 1.0e-6)
+        bottom_y = 0.0 if cut_applied else post_minimum_y
+        bottom_vertices = [
+            vertex
+            for vertex in bm.verts
+            if abs(float(vertex.co.y) - bottom_y) <= bottom_tolerance
+        ]
+        if not bottom_vertices:
+            return False, "Could not find the bottom boundary", None
+
+        pivot_world = Vector(
+            (
+                (
+                    min(float(vertex.co.x) for vertex in bottom_vertices)
+                    + max(float(vertex.co.x) for vertex in bottom_vertices)
+                )
+                * 0.5,
+                bottom_y,
+                (
+                    min(float(vertex.co.z) for vertex in bottom_vertices)
+                    + max(float(vertex.co.z) for vertex in bottom_vertices)
+                )
+                * 0.5,
+            )
+        )
+
+        origin_matrix = original_matrix.copy()
+        origin_matrix.translation = pivot_world
+        bmesh.ops.transform(
+            bm,
+            matrix=origin_matrix.inverted(),
+            verts=list(bm.verts),
+        )
+        bm.to_mesh(mesh)
+        mesh.update()
+
+        child_world_matrices = {
+            child: child.matrix_world.copy()
+            for child in obj.children
+        }
+        obj.matrix_world = origin_matrix
+        for child, child_matrix in child_world_matrices.items():
+            child.matrix_world = child_matrix
+
+        centered_matrix = origin_matrix.copy()
+        centered_matrix.translation = Vector((0.0, 0.0, 0.0))
+        obj.matrix_world = centered_matrix
+        return True, "Split and centered" if cut_applied else "Centered", {
+            "cut_applied": cut_applied,
+            "bottom_vertex_count": len(bottom_vertices),
+        }
+    finally:
+        bm.free()
+
+
+def generation_pair_json(props):
+    if props.surface_mode == "SINGLE":
+        return "[]"
+    return pair_items_to_json(props)
+
+
+def ensure_straight_backup_collection(context):
+    collection = bpy.data.collections.get(STRAIGHT_BACKUP_COLLECTION)
+    if collection is None:
+        collection = bpy.data.collections.new(STRAIGHT_BACKUP_COLLECTION)
+    if collection.name not in context.scene.collection.children:
+        context.scene.collection.children.link(collection)
+    collection.hide_render = True
+    return collection
+
+
+def existing_straight_backup(obj, collection):
+    stored_name = obj.get(STRAIGHT_BACKUP_REFERENCE)
+    if stored_name:
+        candidate = bpy.data.objects.get(stored_name)
+        if candidate is not None and candidate.get(STRAIGHT_BACKUP_FLAG):
+            return candidate
+    for candidate in collection.objects:
+        if candidate.get(STRAIGHT_BACKUP_FLAG) and candidate.get(STRAIGHT_BACKUP_SOURCE) == obj.name:
+            obj[STRAIGHT_BACKUP_REFERENCE] = candidate.name
+            return candidate
+    return None
+
+
+def create_straight_backup(context, obj):
+    collection = ensure_straight_backup_collection(context)
+    existing = existing_straight_backup(obj, collection)
+    if existing is not None:
+        return existing, False
+
+    backup = obj.copy()
+    backup.data = obj.data.copy()
+    backup.name = f"{obj.name}__straight_backup"
+    backup.data.name = f"{backup.name}_Mesh"
+    collection.objects.link(backup)
+    backup.matrix_world = obj.matrix_world.copy()
+    backup[STRAIGHT_BACKUP_FLAG] = True
+    backup[STRAIGHT_BACKUP_SOURCE] = obj.name
+    backup.hide_render = True
+    backup.hide_select = True
+    backup.hide_viewport = True
+    obj[STRAIGHT_BACKUP_REFERENCE] = backup.name
+    return backup, True
+
+
+def remove_straight_backup(obj, backup):
+    backup_data = backup.data if backup and backup.type == "MESH" else None
+    backup_name = backup.name if backup else ""
+    if backup is not None:
+        bpy.data.objects.remove(backup, do_unlink=True)
+    if backup_data is not None and backup_data.users == 0:
+        bpy.data.meshes.remove(backup_data)
+    if obj.get(STRAIGHT_BACKUP_REFERENCE) == backup_name:
+        del obj[STRAIGHT_BACKUP_REFERENCE]
+
+
+class BackProjectionCoverageError(ValueError):
+    def __init__(self, outside_count, back_vertex_indices):
+        self.outside_count = int(outside_count)
+        self.back_vertex_indices = sorted(set(int(index) for index in back_vertex_indices))
+        super().__init__(
+            f"Back Projection does not cover {self.outside_count} Front vertices. "
+            f"The nearest Back boundary vertices were selected; enlarge or realign that area."
+        )
+
+
+def point_segment_distance_squared_2d(point, start, end):
+    segment = end - start
+    length_squared = segment.length_squared
+    if length_squared <= 1.0e-18:
+        return (point - start).length_squared
+    factor = min(1.0, max(0.0, (point - start).dot(segment) / length_squared))
+    nearest = start + segment * factor
+    return (point - nearest).length_squared
+
+
+def nearest_back_boundary_vertices(back_obj, outside_points):
+    mesh = back_obj.data
+    uv_layer = mesh.uv_layers.active
+    if uv_layer is None:
+        return []
+    boundary_records = front_boundary_records(mesh, uv_layer)
+    selected = set()
+    for point in outside_points:
+        best_record = None
+        best_distance = None
+        for record in boundary_records:
+            start = mesh.vertices[record["start"]].co.xy
+            end = mesh.vertices[record["end"]].co.xy
+            distance = point_segment_distance_squared_2d(point, start, end)
+            if best_distance is None or distance < best_distance:
+                best_distance = distance
+                best_record = record
+        if best_record is not None:
+            selected.add(best_record["start"])
+            selected.add(best_record["end"])
+    return sorted(selected)
+
+
+def select_back_projection_vertices(context, back_obj, vertex_indices):
+    if context.object is not None and context.object.mode != "OBJECT":
+        bpy.ops.object.mode_set(mode="OBJECT")
+    back_obj.hide_viewport = False
+    back_obj.hide_select = False
+    try:
+        back_obj.hide_set(False)
+    except RuntimeError:
+        pass
+    bpy.ops.object.select_all(action="DESELECT")
+    back_obj.select_set(True)
+    context.view_layer.objects.active = back_obj
+    for vertex in back_obj.data.vertices:
+        vertex.select = vertex.index in vertex_indices
+    back_obj.data.update()
+    context.tool_settings.mesh_select_mode = (True, False, False)
+    bpy.ops.object.mode_set(mode="EDIT")
+
+
+def ensure_projected_source_backup_collection(context):
+    collection = bpy.data.collections.get(PROJECTED_SOURCE_BACKUP_COLLECTION)
+    if collection is None:
+        collection = bpy.data.collections.new(PROJECTED_SOURCE_BACKUP_COLLECTION)
+    if collection.name not in context.scene.collection.children:
+        context.scene.collection.children.link(collection)
+    collection.hide_render = True
+    collection.hide_viewport = True
+    return collection
+
+
+def archive_projected_shell_sources(context, front_obj, back_obj, output_obj):
+    sources = ((front_obj, "FRONT"), (back_obj, "BACK"))
+    for obj, role in sources:
+        if obj.get(PROJECTED_SOURCE_BACKUP_FLAG):
+            raise ValueError(f"{role} source is already archived: {obj.name}")
+
+    backup_collection = ensure_projected_source_backup_collection(context)
+    states = []
+    try:
+        for obj, role in sources:
+            original_collections = list(obj.users_collection)
+            states.append(
+                {
+                    "object": obj,
+                    "collections": original_collections,
+                    "hide_viewport": obj.hide_viewport,
+                    "hide_render": obj.hide_render,
+                    "hide_select": obj.hide_select,
+                }
+            )
+            try:
+                obj.select_set(False)
+            except RuntimeError:
+                pass
+            if obj.name not in backup_collection.objects:
+                backup_collection.objects.link(obj)
+            for collection in original_collections:
+                if collection != backup_collection:
+                    collection.objects.unlink(obj)
+            obj[PROJECTED_SOURCE_BACKUP_FLAG] = True
+            obj[PROJECTED_SOURCE_ROLE] = role
+            obj[PROJECTED_SOURCE_OUTPUT] = output_obj.name
+            obj[PROJECTED_SOURCE_COLLECTIONS] = json.dumps(
+                [collection.name for collection in original_collections]
+            )
+            obj.hide_render = True
+            obj.hide_select = True
+            obj.hide_viewport = True
+    except Exception:
+        for state in states:
+            obj = state["object"]
+            for collection in state["collections"]:
+                if obj.name not in collection.objects:
+                    collection.objects.link(obj)
+            if obj.name in backup_collection.objects:
+                backup_collection.objects.unlink(obj)
+            for property_name in (
+                PROJECTED_SOURCE_BACKUP_FLAG,
+                PROJECTED_SOURCE_ROLE,
+                PROJECTED_SOURCE_OUTPUT,
+                PROJECTED_SOURCE_COLLECTIONS,
+            ):
+                if property_name in obj:
+                    del obj[property_name]
+            obj.hide_viewport = state["hide_viewport"]
+            obj.hide_render = state["hide_render"]
+            obj.hide_select = state["hide_select"]
+        raise
+    return backup_collection
+
+
+def remove_mesh_object_and_data(obj):
+    mesh = obj.data if obj is not None and obj.type == "MESH" else None
+    if obj is not None:
+        bpy.data.objects.remove(obj, do_unlink=True)
+    if mesh is not None and mesh.users == 0:
+        bpy.data.meshes.remove(mesh)
+
+
+def barycentric_coordinates_2d(point, a, b, c):
+    denominator = (b.y - c.y) * (a.x - c.x) + (c.x - b.x) * (a.y - c.y)
+    if abs(denominator) <= 1.0e-14:
+        return None
+    weight_a = ((b.y - c.y) * (point.x - c.x) + (c.x - b.x) * (point.y - c.y)) / denominator
+    weight_b = ((c.y - a.y) * (point.x - c.x) + (a.x - c.x) * (point.y - c.y)) / denominator
+    weight_c = 1.0 - weight_a - weight_b
+    return weight_a, weight_b, weight_c
+
+
+def back_projection_triangles(back_obj):
+    mesh = back_obj.data
+    uv_layer = mesh.uv_layers.active
+    if uv_layer is None:
+        raise ValueError(f"Back projection mesh has no active UV map: {back_obj.name}")
+    mesh.calc_loop_triangles()
+    triangles = []
+    for triangle in mesh.loop_triangles:
+        positions = [mesh.vertices[index].co.xy.copy() for index in triangle.vertices]
+        loops = list(triangle.loops)
+        uvs = [uv_layer.data[index].uv.copy() for index in loops]
+        triangles.append(
+            {
+                "positions": positions,
+                "uvs": uvs,
+                "min_x": min(position.x for position in positions),
+                "max_x": max(position.x for position in positions),
+                "min_y": min(position.y for position in positions),
+                "max_y": max(position.y for position in positions),
+            }
+        )
+    if not triangles:
+        raise ValueError(f"Back projection mesh has no usable triangles: {back_obj.name}")
+    return triangles
+
+
+def projected_back_uvs(front_obj, back_obj, tolerance=1.0e-6):
+    triangles = back_projection_triangles(back_obj)
+    front_to_back = back_obj.matrix_world.inverted_safe() @ front_obj.matrix_world
+    projected = {}
+    outside_points = []
+    for vertex in front_obj.data.vertices:
+        point_3d = front_to_back @ vertex.co
+        point = point_3d.xy
+        matched_uv = None
+        for triangle in triangles:
+            if (
+                point.x < triangle["min_x"] - tolerance
+                or point.x > triangle["max_x"] + tolerance
+                or point.y < triangle["min_y"] - tolerance
+                or point.y > triangle["max_y"] + tolerance
+            ):
+                continue
+            weights = barycentric_coordinates_2d(
+                point,
+                triangle["positions"][0],
+                triangle["positions"][1],
+                triangle["positions"][2],
+            )
+            if weights is None or min(weights) < -tolerance or max(weights) > 1.0 + tolerance:
+                continue
+            matched_uv = Vector((0.0, 0.0))
+            for weight, uv in zip(weights, triangle["uvs"]):
+                matched_uv += uv * weight
+            break
+        if matched_uv is None:
+            outside_points.append(point.copy())
+        else:
+            projected[vertex.index] = matched_uv
+    if outside_points:
+        raise BackProjectionCoverageError(
+            len(outside_points),
+            nearest_back_boundary_vertices(back_obj, outside_points),
+        )
+    return projected
+
+
+def front_boundary_records(mesh, uv_layer):
+    edge_uses = {}
+    for polygon in mesh.polygons:
+        loop_indices = list(polygon.loop_indices)
+        polygon_uvs = [uv_layer.data[index].uv.copy() for index in loop_indices]
+        face_center_uv = Vector((0.0, 0.0))
+        for uv in polygon_uvs:
+            face_center_uv += uv
+        face_center_uv /= max(len(polygon_uvs), 1)
+        for offset, start_loop in enumerate(loop_indices):
+            end_loop = loop_indices[(offset + 1) % len(loop_indices)]
+            start_vertex = mesh.loops[start_loop].vertex_index
+            end_vertex = mesh.loops[end_loop].vertex_index
+            key = tuple(sorted((start_vertex, end_vertex)))
+            edge_uses.setdefault(key, []).append(
+                {
+                    "start": start_vertex,
+                    "end": end_vertex,
+                    "start_uv": uv_layer.data[start_loop].uv.copy(),
+                    "end_uv": uv_layer.data[end_loop].uv.copy(),
+                    "face_center_uv": face_center_uv.copy(),
+                }
+            )
+    return [records[0] for records in edge_uses.values() if len(records) == 1]
+
+
+def projected_shell_name(front_obj):
+    suffix = "_single_plate"
+    base = front_obj.name[:-len(suffix)] if front_obj.name.endswith(suffix) else front_obj.name
+    return f"{base}_projected_shell"
+
+
+def build_projected_shell_object(context, front_obj, back_obj, props):
+    if front_obj is back_obj:
+        raise ValueError("Front and Back Projection must be different mesh objects")
+    if front_obj.type != "MESH" or back_obj.type != "MESH":
+        raise ValueError("Front and Back Projection must both be mesh objects")
+    if front_obj.get(PROJECTED_SOURCE_BACKUP_FLAG) or back_obj.get(PROJECTED_SOURCE_BACKUP_FLAG):
+        raise ValueError("Archived Projected Shell sources cannot be used again")
+    front_mesh = front_obj.data
+    front_uv_layer = front_mesh.uv_layers.active
+    if front_uv_layer is None:
+        raise ValueError(f"Front mesh has no active UV map: {front_obj.name}")
+    if not front_mesh.polygons:
+        raise ValueError(f"Front mesh has no faces: {front_obj.name}")
+    if not front_obj.material_slots or front_obj.material_slots[0].material is None:
+        raise ValueError(f"Front mesh has no material in slot 1: {front_obj.name}")
+    if not back_obj.material_slots or back_obj.material_slots[0].material is None:
+        raise ValueError(f"Back projection mesh has no material in slot 1: {back_obj.name}")
+
+    back_uvs = projected_back_uvs(front_obj, back_obj)
+    boundary_records = front_boundary_records(front_mesh, front_uv_layer)
+    vertex_count = len(front_mesh.vertices)
+    half_gap = float(props.shell_gap) * 0.5
+    vertices = []
+    for vertex in front_mesh.vertices:
+        position = vertex.co.copy()
+        position.z += half_gap
+        vertices.append(tuple(position))
+    for vertex in front_mesh.vertices:
+        position = vertex.co.copy()
+        position.z -= half_gap
+        vertices.append(tuple(position))
+
+    faces = []
+    face_materials = []
+    face_uvs = []
+    for polygon in front_mesh.polygons:
+        source_vertices = list(polygon.vertices)
+        source_uvs = [front_uv_layer.data[index].uv.copy() for index in polygon.loop_indices]
+        faces.append(source_vertices)
+        face_materials.append(0)
+        face_uvs.append(source_uvs)
+
+        faces.append([index + vertex_count for index in reversed(source_vertices)])
+        face_materials.append(1)
+        face_uvs.append([back_uvs[index].copy() for index in reversed(source_vertices)])
+
+    if not props.no_shell:
+        inset = min(0.95, max(0.0, float(props.side_uv_inset)))
+        for record in boundary_records:
+            start = record["start"]
+            end = record["end"]
+            start_uv = record["start_uv"]
+            end_uv = record["end_uv"]
+            center_uv = record["face_center_uv"]
+            start_inner_uv = start_uv.lerp(center_uv, inset)
+            end_inner_uv = end_uv.lerp(center_uv, inset)
+            faces.append([start, start + vertex_count, end + vertex_count, end])
+            face_materials.append(2)
+            face_uvs.append([start_uv, start_inner_uv, end_inner_uv, end_uv])
+
+    output_name = projected_shell_name(front_obj)
+    mesh = bpy.data.meshes.new(f"{output_name}_Mesh")
+    output_obj = None
+    try:
+        mesh.from_pydata(vertices, [], faces)
+        mesh.update()
+        mesh.materials.append(front_obj.material_slots[0].material)
+        mesh.materials.append(back_obj.material_slots[0].material)
+        mesh.materials.append(make_side_material("elm01_leaf_shell_edge"))
+        for polygon, material_index in zip(mesh.polygons, face_materials):
+            polygon.material_index = material_index
+        uv_layer = mesh.uv_layers.new(name=front_uv_layer.name or "UVMap")
+        for polygon, polygon_uvs in zip(mesh.polygons, face_uvs):
+            for loop_index, uv in zip(polygon.loop_indices, polygon_uvs):
+                uv_layer.data[loop_index].uv = uv
+
+        output_obj = bpy.data.objects.new(output_name, mesh)
+        target_collection = front_obj.users_collection[0] if front_obj.users_collection else context.scene.collection
+        target_collection.objects.link(output_obj)
+        output_obj.matrix_world = front_obj.matrix_world.copy()
+        output_obj["atlas_leaf_projected_shell"] = True
+        output_obj["atlas_leaf_projected_front"] = front_obj.name
+        output_obj["atlas_leaf_projected_back"] = back_obj.name
+        configure_leaf_surface(output_obj, props.shell_side_sharp_angle)
+    except Exception:
+        if output_obj is not None:
+            bpy.data.objects.remove(output_obj, do_unlink=True)
+        if mesh.users == 0:
+            bpy.data.meshes.remove(mesh)
+        raise
+    return output_obj, len(boundary_records)
 
 
 def make_anchor_container_name(obj):
@@ -606,14 +1126,254 @@ def project_to_centerline(profile, x, y):
     return best[1], best[2]
 
 
-def straighten_mesh_by_uv(obj, end_window_pct=0.015, unbend_deviation_pct=0.02):
-    if obj.data.users > 1:
-        obj.data = obj.data.copy()
+def deformation_edge_change(mesh, source_positions, target_positions):
+    relative_changes = []
+    for edge in mesh.edges:
+        start_index, end_index = edge.vertices
+        source_length = (
+            source_positions[start_index] - source_positions[end_index]
+        ).length
+        if source_length <= 1.0e-9:
+            continue
+        target_length = (
+            target_positions[start_index] - target_positions[end_index]
+        ).length
+        relative_changes.append(abs(target_length - source_length) / source_length)
+    if not relative_changes:
+        return 0.0, 0.0
+    relative_changes.sort()
+    p95_index = int((len(relative_changes) - 1) * 0.95)
+    return relative_changes[p95_index], relative_changes[-1]
 
+
+def merged_slice_intervals(intervals, tolerance):
+    if not intervals:
+        return []
+    merged = [dict(intervals[0])]
+    for interval in intervals[1:]:
+        current = merged[-1]
+        if interval["start"] <= current["end"] + tolerance:
+            if interval["start"] < current["start"]:
+                current["start"] = interval["start"]
+                current["start_position"] = interval["start_position"].copy()
+            if interval["end"] > current["end"]:
+                current["end"] = interval["end"]
+                current["end_position"] = interval["end_position"].copy()
+        else:
+            merged.append(dict(interval))
+    for interval in merged:
+        interval["center_cross"] = (interval["start"] + interval["end"]) * 0.5
+        interval["center_position"] = (
+            interval["start_position"] + interval["end_position"]
+        ) * 0.5
+    return merged
+
+
+def front_uv_slice_analysis(obj, long_axis, long_min, long_max, slice_count=32):
+    mesh = obj.data
+    uv_layer = mesh.uv_layers.active
+    if uv_layer is None:
+        return 0.0, 0, []
+
+    long_component = 0 if long_axis == "U" else 1
+    cross_component = 1 - long_component
+    cross_values = [
+        uv_layer.data[loop_index].uv[cross_component]
+        for poly in mesh.polygons
+        if poly.material_index == 0
+        for loop_index in poly.loop_indices
+    ]
+    if not cross_values:
+        return 0.0, 0, []
+    tolerance = max((max(cross_values) - min(cross_values)) * 1.0e-5, 1.0e-8)
+    slices = []
+    for sample_index in range(slice_count):
+        factor = (sample_index + 0.5) / slice_count
+        long_value = long_min + (long_max - long_min) * factor
+        intervals = []
+        for poly in mesh.polygons:
+            if poly.material_index != 0:
+                continue
+            loops = list(poly.loop_indices)
+            coords = [uv_layer.data[index].uv.copy() for index in loops]
+            positions = [mesh.vertices[mesh.loops[index].vertex_index].co.copy() for index in loops]
+            polygon_longs = [coord[long_component] for coord in coords]
+            if long_value < min(polygon_longs) or long_value > max(polygon_longs):
+                continue
+            crossings = []
+            for index, start in enumerate(coords):
+                end = coords[(index + 1) % len(coords)]
+                start_position = positions[index]
+                end_position = positions[(index + 1) % len(positions)]
+                start_long = start[long_component]
+                end_long = end[long_component]
+                if abs(end_long - start_long) <= 1.0e-12:
+                    continue
+                if not (min(start_long, end_long) <= long_value < max(start_long, end_long)):
+                    continue
+                edge_factor = (long_value - start_long) / (end_long - start_long)
+                crossings.append({
+                    "cross": start[cross_component]
+                    + (end[cross_component] - start[cross_component]) * edge_factor,
+                    "position": start_position.lerp(end_position, edge_factor),
+                })
+            crossings.sort(key=lambda item: item["cross"])
+            for index in range(0, len(crossings) - 1, 2):
+                intervals.append({
+                    "start": crossings[index]["cross"],
+                    "end": crossings[index + 1]["cross"],
+                    "start_position": crossings[index]["position"],
+                    "end_position": crossings[index + 1]["position"],
+                })
+        merged = merged_slice_intervals(
+            sorted(intervals, key=lambda item: (item["start"], item["end"])),
+            tolerance,
+        )
+        slices.append({"long": long_value, "intervals": merged})
+
+    interval_counts = [len(item["intervals"]) for item in slices]
+    body_counts = interval_counts[2:-2] if len(interval_counts) > 4 else interval_counts
+    if not body_counts:
+        return 0.0, 0, slices
+    multi_fraction = sum(count > 1 for count in body_counts) / len(body_counts)
+    return multi_fraction, max(body_counts), slices
+
+
+def build_profile_from_slice_centers(centers):
+    if len(centers) < 4:
+        return []
+    centers = sorted(centers, key=lambda item: item[0])
+    long_values = [item[0] for item in centers]
+    center_x = [item[1].x for item in centers]
+    center_y = [item[1].y for item in centers]
+    radius = max(1, len(centers) // 20)
+    center_x = smooth_profile_values(center_x, radius=radius, passes=2)
+    center_y = smooth_profile_values(center_y, radius=radius, passes=2)
+
+    tangents = []
+    previous_tangent = (0.0, 1.0)
+    for index in range(len(centers)):
+        previous_index = max(0, index - 1)
+        next_index = min(len(centers) - 1, index + 1)
+        tangent_x = center_x[next_index] - center_x[previous_index]
+        tangent_y = center_y[next_index] - center_y[previous_index]
+        length = (tangent_x * tangent_x + tangent_y * tangent_y) ** 0.5
+        if length > 1.0e-12:
+            previous_tangent = (tangent_x / length, tangent_y / length)
+        tangents.append(previous_tangent)
+    tangent_x_values = smooth_profile_values(
+        [tangent[0] for tangent in tangents], radius=radius, passes=2
+    )
+    tangent_y_values = smooth_profile_values(
+        [tangent[1] for tangent in tangents], radius=radius, passes=2
+    )
+
+    profile = []
+    cumulative = 0.0
+    previous_tangent = (0.0, 1.0)
+    for index in range(len(centers)):
+        if index:
+            delta_x = center_x[index] - center_x[index - 1]
+            delta_y = center_y[index] - center_y[index - 1]
+            cumulative += (delta_x * delta_x + delta_y * delta_y) ** 0.5
+        tangent_x = tangent_x_values[index]
+        tangent_y = tangent_y_values[index]
+        length = (tangent_x * tangent_x + tangent_y * tangent_y) ** 0.5
+        if length > 1.0e-12:
+            previous_tangent = (tangent_x / length, tangent_y / length)
+        profile.append({
+            "long": long_values[index],
+            "cx": center_x[index],
+            "cy": center_y[index],
+            "tx": previous_tangent[0],
+            "ty": previous_tangent[1],
+            "arc": cumulative,
+        })
+    return profile
+
+
+def build_connected_uv_centerline(
+    slices,
+    vertex_uvs,
+    stem_indices,
+    stem_is_min,
+    long_axis,
+    object_extent,
+):
+    cross_component = 1 if long_axis == "U" else 0
+    stem_cross_values = [
+        vertex_uvs[index][cross_component]
+        for index in stem_indices
+        if index in vertex_uvs
+    ]
+    if not stem_cross_values:
+        return []
+    stem_cross = percentile(sorted(stem_cross_values), 0.5)
+    populated = [item for item in slices if item["intervals"]]
+    if not stem_is_min:
+        populated.reverse()
+    if len(populated) < 4:
+        return []
+
+    all_crosses = [
+        value
+        for item in populated
+        for interval in item["intervals"]
+        for value in (interval["start"], interval["end"])
+    ]
+    cross_range = max(max(all_crosses) - min(all_crosses), 1.0e-9)
+    object_extent = max(object_extent, 1.0e-9)
+    selected = []
+    previous = None
+    for item in populated:
+        candidates = item["intervals"]
+        if previous is None:
+            def initial_score(interval):
+                if interval["start"] <= stem_cross <= interval["end"]:
+                    cross_distance = 0.0
+                else:
+                    cross_distance = min(
+                        abs(stem_cross - interval["start"]),
+                        abs(stem_cross - interval["end"]),
+                    )
+                pivot_distance = interval["center_position"].xy.length / object_extent
+                return cross_distance / cross_range + pivot_distance * 0.2
+
+            chosen = min(candidates, key=initial_score)
+        else:
+            def continuity_score(interval):
+                overlap = min(previous["end"], interval["end"]) - max(
+                    previous["start"], interval["start"]
+                )
+                if overlap >= 0.0:
+                    gap = 0.0
+                else:
+                    gap = -overlap
+                center_delta = abs(
+                    interval["center_cross"] - previous["center_cross"]
+                )
+                position_delta = (
+                    interval["center_position"].xy
+                    - previous["center_position"].xy
+                ).length
+                return (
+                    gap / cross_range * 4.0
+                    + center_delta / cross_range * 0.35
+                    + position_delta / object_extent
+                )
+
+            chosen = min(candidates, key=continuity_score)
+        selected.append((item["long"], chosen["center_position"].copy()))
+        previous = chosen
+
+    return build_profile_from_slice_centers(selected)
+
+
+def analyze_straight_mesh(obj, end_window_pct=0.015):
     mesh = obj.data
     vertex_uvs = front_plate_vertex_uvs(obj)
     if vertex_uvs is None:
-        return False, "No usable active UVs"
+        return None, "No usable active UVs"
 
     u_values = [uv.x for uv in vertex_uvs.values()]
     v_values = [uv.y for uv in vertex_uvs.values()]
@@ -650,23 +1410,50 @@ def straighten_mesh_by_uv(obj, end_window_pct=0.015, unbend_deviation_pct=0.02):
     min_indices = endpoint_indices(True)
     max_indices = endpoint_indices(False)
     if not min_indices or not max_indices:
-        return False, "Could not find usable UV endpoints"
+        return None, "Could not find usable UV endpoints"
 
     min_endpoint = endpoint_center(min_indices)
     max_endpoint = endpoint_center(max_indices)
     stem_is_min = min_endpoint.length <= max_endpoint.length
-    stem_indices = min_indices if stem_is_min else max_indices
 
     samples = [
         (long_values[index], float(source_positions[index].x), float(source_positions[index].y), index)
         for index in vertex_uvs
     ]
+    multi_fraction, max_intervals, slice_data = front_uv_slice_analysis(
+        obj,
+        long_axis,
+        long_min,
+        long_max,
+    )
+    is_branching_plate = (
+        multi_fraction >= 0.15
+        or (max_intervals >= 3 and multi_fraction >= 0.05)
+    )
     profile = build_uv_centerline(samples, long_min, long_range)
+    profile_mode = "silhouette"
+    if is_branching_plate:
+        x_values = [position.x for position in source_positions.values()]
+        y_values = [position.y for position in source_positions.values()]
+        object_extent = Vector(
+            (max(x_values) - min(x_values), max(y_values) - min(y_values))
+        ).length
+        connected_profile = build_connected_uv_centerline(
+            slice_data,
+            vertex_uvs,
+            min_indices if stem_is_min else max_indices,
+            stem_is_min,
+            long_axis,
+            object_extent,
+        )
+        if len(connected_profile) >= 4:
+            profile = connected_profile
+            profile_mode = "connected stem"
     if len(profile) < 2:
-        return False, "Could not build a usable stem centerline"
+        return None, "Could not build a usable stem centerline"
     total_arc = profile[-1]["arc"]
     if total_arc <= 1.0e-9:
-        return False, "Mesh has no usable stem-tip length"
+        return None, "Mesh has no usable stem-tip length"
 
     chord = Vector((profile[-1]["cx"] - profile[0]["cx"], profile[-1]["cy"] - profile[0]["cy"]))
     chord_length = chord.length
@@ -694,11 +1481,91 @@ def straighten_mesh_by_uv(obj, end_window_pct=0.015, unbend_deviation_pct=0.02):
     offsets.sort()
     strip_width = 2.0 * percentile(offsets, 0.9) if offsets else 0.0
     strip_ratio = total_arc / max(strip_width, 1.0e-9)
-    use_unbend = strip_ratio >= 2.5 and (chord_length <= 1.0e-12 or deviation > total_arc * unbend_deviation_pct)
+    return {
+        "mesh": mesh,
+        "vertex_uvs": vertex_uvs,
+        "long_axis": long_axis,
+        "long_values": long_values,
+        "long_min": long_min,
+        "long_max": long_max,
+        "long_range": long_range,
+        "source_positions": source_positions,
+        "min_indices": min_indices,
+        "max_indices": max_indices,
+        "min_endpoint": min_endpoint,
+        "max_endpoint": max_endpoint,
+        "stem_is_min": stem_is_min,
+        "samples": samples,
+        "profile": profile,
+        "total_arc": total_arc,
+        "chord": chord,
+        "chord_length": chord_length,
+        "deviation": deviation,
+        "strip_width": strip_width,
+        "strip_ratio": strip_ratio,
+        "multi_fraction": multi_fraction,
+        "max_intervals": max_intervals,
+        "is_branching_plate": is_branching_plate,
+        "profile_mode": profile_mode,
+    }, None
+
+
+def pivot_body_direction(analysis):
+    profile = analysis["profile"]
+    from_stem = profile if analysis["stem_is_min"] else list(reversed(profile))
+    last_index = len(from_stem) - 1
+    start_index = min(last_index, max(0, int(last_index * 0.08)))
+    end_index = min(last_index, max(start_index + 1, int(last_index * 0.22)))
+    start = from_stem[start_index]
+    end = from_stem[end_index]
+    direction = Vector((end["cx"] - start["cx"], end["cy"] - start["cy"]))
+    tip_direction = Vector(
+        (
+            from_stem[-1]["cx"] - from_stem[0]["cx"],
+            from_stem[-1]["cy"] - from_stem[0]["cy"],
+        )
+    )
+    if direction.length <= 1.0e-12:
+        direction = tip_direction
+    if direction.length <= 1.0e-12:
+        return Vector((0.0, 1.0))
+    direction.normalize()
+    if tip_direction.length > 1.0e-12 and direction.dot(tip_direction) < 0.0:
+        direction.negate()
+    return direction
+
+
+def straighten_mesh_by_uv(obj, end_window_pct=0.015, unbend_deviation_pct=0.02):
+    analysis, error = analyze_straight_mesh(obj, end_window_pct)
+    if analysis is None:
+        return False, error
+
+    root_direction = pivot_body_direction(analysis)
+
+    if obj.data.users > 1:
+        obj.data = obj.data.copy()
+
+    mesh = obj.data
+    source_positions = analysis["source_positions"]
+    samples = analysis["samples"]
+    profile = analysis["profile"]
+    total_arc = analysis["total_arc"]
+    chord = analysis["chord"]
+    chord_length = analysis["chord_length"]
+    stem_is_min = analysis["stem_is_min"]
+    is_branching_plate = analysis["is_branching_plate"]
+    use_unbend = (
+        (
+            (is_branching_plate and analysis["profile_mode"] == "connected stem")
+            or (not is_branching_plate and analysis["strip_ratio"] >= 2.5)
+        )
+        and (chord_length <= 1.0e-12 or analysis["deviation"] > total_arc * unbend_deviation_pct)
+    )
 
     # Both frames below map with determinant +1 so face winding (and therefore
     # normals) are preserved; the previous implementation mirrored the mesh.
     new_positions = {}
+    shape_guard_fallback = False
     if use_unbend:
         for long_value, x, y, index in samples:
             center_x = interpolated_profile_field(profile, "cx", long_value)
@@ -730,11 +1597,27 @@ def straighten_mesh_by_uv(obj, end_window_pct=0.015, unbend_deviation_pct=0.02):
                 long_position = total_arc - long_position
                 cross_position = -cross_position
             new_positions[index] = Vector((cross_position, long_position, position.z))
-        mode = "unbend"
-    else:
-        direction = chord / chord_length
-        if not stem_is_min:
-            direction = -direction
+        if is_branching_plate:
+            p95_change, max_change = deformation_edge_change(
+                mesh,
+                source_positions,
+                new_positions,
+            )
+            if p95_change > 0.08 or max_change > 0.5:
+                use_unbend = False
+                shape_guard_fallback = True
+                new_positions = {}
+        if use_unbend:
+            mode = "main-stem unbend" if is_branching_plate else "unbend"
+    if not use_unbend:
+        if is_branching_plate:
+            direction = root_direction
+        else:
+            if chord_length <= 1.0e-12:
+                return False, "Mesh has no usable alignment direction"
+            direction = chord / chord_length
+            if not stem_is_min:
+                direction = -direction
         right = Vector((direction.y, -direction.x))
         for index, position in source_positions.items():
             new_positions[index] = Vector(
@@ -744,19 +1627,38 @@ def straighten_mesh_by_uv(obj, end_window_pct=0.015, unbend_deviation_pct=0.02):
                     position.z,
                 )
             )
-        mode = "align"
+        mode = "shape-preserving align" if shape_guard_fallback else "align"
 
-    anchor_x = (
-        min(new_positions[index].x for index in stem_indices) + max(new_positions[index].x for index in stem_indices)
-    ) * 0.5
-    anchor_y = (
-        min(new_positions[index].y for index in stem_indices) + max(new_positions[index].y for index in stem_indices)
-    ) * 0.5
+    preserve_existing_pivot = is_branching_plate
+    if preserve_existing_pivot:
+        if use_unbend:
+            pivot_y, pivot_x = project_to_centerline(profile, 0.0, 0.0)
+            if not stem_is_min:
+                pivot_y = total_arc - pivot_y
+                pivot_x = -pivot_x
+            anchor_x, anchor_y = pivot_x, pivot_y
+        else:
+            anchor_x, anchor_y = 0.0, 0.0
+    else:
+        anchor_y = min(position.y for position in new_positions.values())
+        root_window = max(total_arc * end_window_pct, 1.0e-6)
+        root_indices = [
+            index for index, position in new_positions.items()
+            if position.y <= anchor_y + root_window
+        ]
+        anchor_x = (
+            min(new_positions[index].x for index in root_indices)
+            + max(new_positions[index].x for index in root_indices)
+        ) * 0.5
 
     for index, position in new_positions.items():
         mesh.vertices[index].co = Vector((position.x - anchor_x, position.y - anchor_y, position.z))
     mesh.update()
-    return True, f"{long_axis} axis aligned to local Y, {mode}, stem {'min' if stem_is_min else 'max'}"
+    classification = "branching plate" if is_branching_plate else "strand"
+    return True, (
+        f"{analysis['long_axis']} axis aligned to local Y, {mode}, {classification}, "
+        f"stem {'min' if stem_is_min else 'max'}, geometry preserved"
+    )
 
 
 class ATLASLEAF_OT_check_dependencies(Operator):
@@ -875,7 +1777,7 @@ class ATLASLEAF_OT_build_label_preview(Operator):
         if not ok:
             self.report({"ERROR"}, "Missing external Python dependencies. Run Install Dependencies.")
             return {"CANCELLED"}
-        pair_json = pair_items_to_json(props)
+        pair_json = generation_pair_json(props)
 
         args = [
             str(HELPER_PATH),
@@ -936,7 +1838,7 @@ class ATLASLEAF_OT_generate(Operator):
         if not ok:
             self.report({"ERROR"}, "Missing external Python dependencies. Run Install Dependencies.")
             return {"CANCELLED"}
-        pair_json = pair_items_to_json(props)
+        pair_json = generation_pair_json(props)
 
         args = [
             str(HELPER_PATH),
@@ -986,10 +1888,110 @@ class ATLASLEAF_OT_generate(Operator):
         return {"FINISHED"}
 
 
+class ATLASLEAF_OT_set_projected_shell_front(Operator):
+    bl_idname = "atlas_leaf.set_projected_shell_front"
+    bl_label = "Set Front"
+    bl_description = "Use the active one-plate mesh as the projected shell's geometry and front UV source"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        obj = context.view_layer.objects.active
+        if obj is None or obj.type != "MESH":
+            self.report({"ERROR"}, "Make a mesh object active before setting Front.")
+            return {"CANCELLED"}
+        if obj.get(PROJECTED_SOURCE_BACKUP_FLAG):
+            self.report({"ERROR"}, "Archived Projected Shell sources cannot be reused.")
+            return {"CANCELLED"}
+        context.scene.atlas_leaf_builder.projected_shell_front = obj
+        self.report({"INFO"}, f"Projected shell Front: {obj.name}")
+        return {"FINISHED"}
+
+
+class ATLASLEAF_OT_set_projected_shell_back(Operator):
+    bl_idname = "atlas_leaf.set_projected_shell_back"
+    bl_label = "Set Back"
+    bl_description = "Use the active one-plate mesh as the manually aligned back UV projection source"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        obj = context.view_layer.objects.active
+        if obj is None or obj.type != "MESH":
+            self.report({"ERROR"}, "Make a mesh object active before setting Back Projection.")
+            return {"CANCELLED"}
+        if obj.get(PROJECTED_SOURCE_BACKUP_FLAG):
+            self.report({"ERROR"}, "Archived Projected Shell sources cannot be reused.")
+            return {"CANCELLED"}
+        context.scene.atlas_leaf_builder.projected_shell_back = obj
+        self.report({"INFO"}, f"Projected shell Back Projection: {obj.name}")
+        return {"FINISHED"}
+
+
+class ATLASLEAF_OT_build_projected_shell(Operator):
+    bl_idname = "atlas_leaf.build_projected_shell"
+    bl_label = "Build Projected Shell"
+    bl_description = "Duplicate the Front topology, project its back UVs from the aligned Back Projection plate, and bridge the boundary"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        props = getattr(context.scene, "atlas_leaf_builder", None)
+        return bool(
+            props
+            and props.projected_shell_front is not None
+            and props.projected_shell_back is not None
+        )
+
+    def execute(self, context):
+        props = context.scene.atlas_leaf_builder
+        front_obj = props.projected_shell_front
+        back_obj = props.projected_shell_back
+        try:
+            output_obj, boundary_count = build_projected_shell_object(
+                context,
+                front_obj,
+                back_obj,
+                props,
+            )
+        except BackProjectionCoverageError as exc:
+            select_back_projection_vertices(context, back_obj, exc.back_vertex_indices)
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+        except Exception as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+
+        try:
+            backup_collection = archive_projected_shell_sources(
+                context,
+                front_obj,
+                back_obj,
+                output_obj,
+            )
+        except Exception as exc:
+            remove_mesh_object_and_data(output_obj)
+            self.report({"ERROR"}, f"Could not archive source plates; build was rolled back: {exc}")
+            return {"CANCELLED"}
+
+        props.projected_shell_front = None
+        props.projected_shell_back = None
+
+        bpy.ops.object.select_all(action="DESELECT")
+        output_obj.select_set(True)
+        context.view_layer.objects.active = output_obj
+        context.view_layer.update()
+        self.report(
+            {"INFO"},
+            f"Built {output_obj.name} from {front_obj.name}; projected back UVs from "
+            f"{back_obj.name}; bridged {boundary_count if not props.no_shell else 0} boundary edges; "
+            f"archived both sources in {backup_collection.name}.",
+        )
+        return {"FINISHED"}
+
+
 class ATLASLEAF_OT_straight_mesh(Operator):
     bl_idname = "atlas_leaf.straight_mesh"
     bl_label = "Straight Mesh"
-    bl_description = "Straighten selected leaf meshes from their UVs while preserving UVs and object transforms"
+    bl_description = "Back up each selected mesh and straighten it without deleting root geometry or folding branching plates"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -999,12 +2001,37 @@ class ATLASLEAF_OT_straight_mesh(Operator):
             return {"CANCELLED"}
 
         straightened = 0
+        backups_created = 0
+        backups_reused = 0
         skipped = []
         for obj in objects:
-            ok, message = straighten_mesh_by_uv(obj)
+            backup, backup_created = create_straight_backup(context, obj)
+            source_data = obj.data
+            source_data_name = source_data.name
+            working_data = source_data.copy()
+            working_data.name = f"{source_data_name}__straight_work"
+            obj.data = working_data
+            try:
+                ok, message = straighten_mesh_by_uv(obj)
+            except Exception as exc:
+                ok, message = False, str(exc)
             if ok:
+                if source_data.users == 0:
+                    bpy.data.meshes.remove(source_data)
+                    working_data.name = source_data_name
+                else:
+                    working_data.name = f"{source_data_name}_straight"
                 straightened += 1
+                if backup_created:
+                    backups_created += 1
+                else:
+                    backups_reused += 1
             else:
+                obj.data = source_data
+                if working_data.users == 0:
+                    bpy.data.meshes.remove(working_data)
+                if backup_created:
+                    remove_straight_backup(obj, backup)
                 skipped.append(f"{obj.name}: {message}")
 
         context.view_layer.update()
@@ -1012,9 +2039,89 @@ class ATLASLEAF_OT_straight_mesh(Operator):
             self.report({"ERROR"}, "; ".join(skipped) or "No meshes were straightened.")
             return {"CANCELLED"}
         if skipped:
-            self.report({"WARNING"}, f"Straightened {straightened}; skipped {len(skipped)}.")
+            self.report(
+                {"WARNING"},
+                f"Straightened {straightened}; skipped {len(skipped)}; backups {backups_created} new, {backups_reused} reused.",
+            )
         else:
-            self.report({"INFO"}, f"Straightened {straightened} selected mesh{'es' if straightened != 1 else ''}.")
+            self.report(
+                {"INFO"},
+                f"Straightened {straightened} selected mesh{'es' if straightened != 1 else ''}; "
+                f"backups {backups_created} new, {backups_reused} reused.",
+            )
+        return {"FINISHED"}
+
+
+class ATLASLEAF_OT_split_below_x_axis(Operator):
+    bl_idname = "atlas_leaf.split_below_x_axis"
+    bl_label = "Split Below X Axis + Center Pivot"
+    bl_description = (
+        "Cut selected meshes at the world X axis, delete world Y below zero, "
+        "then move the bottom-center pivot to the world origin"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        objects = selected_mesh_objects(context)
+        if not objects:
+            self.report({"ERROR"}, "Select one or more mesh objects.")
+            return {"CANCELLED"}
+
+        processed = 0
+        cut_count = 0
+        centered_count = 0
+        skipped = []
+        for obj in objects:
+            source_data = obj.data
+            source_data_name = source_data.name
+            source_matrix = obj.matrix_world.copy()
+            child_world_matrices = {
+                child: child.matrix_world.copy()
+                for child in obj.children
+            }
+            working_data = source_data.copy()
+            working_data.name = f"{source_data_name}__split_work"
+            obj.data = working_data
+            try:
+                ok, message, details = split_below_world_x_axis_and_center(obj)
+            except Exception as exc:
+                ok, message, details = False, str(exc), None
+
+            if ok:
+                if source_data.users == 0:
+                    bpy.data.meshes.remove(source_data)
+                    working_data.name = source_data_name
+                else:
+                    working_data.name = f"{source_data_name}_split"
+                processed += 1
+                if details["cut_applied"]:
+                    cut_count += 1
+                else:
+                    centered_count += 1
+            else:
+                obj.data = source_data
+                obj.matrix_world = source_matrix
+                for child, child_matrix in child_world_matrices.items():
+                    child.matrix_world = child_matrix
+                if working_data.users == 0:
+                    bpy.data.meshes.remove(working_data)
+                skipped.append(f"{obj.name}: {message}")
+
+        context.view_layer.update()
+        if processed == 0:
+            self.report({"ERROR"}, "; ".join(skipped) or "No meshes were split.")
+            return {"CANCELLED"}
+        if skipped:
+            self.report(
+                {"WARNING"},
+                f"Processed {processed}; cut {cut_count}, centered {centered_count}; skipped {len(skipped)}.",
+            )
+        else:
+            self.report(
+                {"INFO"},
+                f"Processed {processed} selected mesh{'es' if processed != 1 else ''}; "
+                f"cut {cut_count}, centered {centered_count} at the world origin.",
+            )
         return {"FINISHED"}
 
 
@@ -1079,6 +2186,7 @@ class ATLASLEAF_OT_build_speedtree_spm(Operator):
     def execute(self, context):
         props = context.scene.atlas_leaf_builder
         try:
+            save_spm_target_registry(props)
             results = export_or_update_speedtree_spm_targets(props)
         except Exception as exc:
             self.report({"ERROR"}, str(exc))
@@ -1101,9 +2209,14 @@ class ATLASLEAF_OT_add_speedtree_spm(Operator):
     def execute(self, context):
         props = context.scene.atlas_leaf_builder
         try:
+            sync_spm_target_registry(props)
             added, path = add_spm_target_item(props, props.speedtree_spm_path)
+            save_spm_target_registry(props)
         except ValueError as exc:
             self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+        except Exception as exc:
+            self.report({"ERROR"}, f"Target removal failed; list and SPM were preserved: {exc}")
             return {"CANCELLED"}
         self.report({"INFO"}, f"{'Added' if added else 'Already listed'} target SPM: {path}")
         return {"FINISHED"}
@@ -1112,29 +2225,74 @@ class ATLASLEAF_OT_add_speedtree_spm(Operator):
 class ATLASLEAF_OT_remove_speedtree_spm(Operator):
     bl_idname = "atlas_leaf.remove_speedtree_spm"
     bl_label = "Remove Target SPM"
-    bl_options = {"REGISTER", "UNDO"}
+    bl_options = {"REGISTER"}
 
     index: IntProperty(default=-1)
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_confirm(self, event)
 
     def execute(self, context):
         props = context.scene.atlas_leaf_builder
         if self.index < 0 or self.index >= len(props.speedtree_spm_items):
             self.report({"ERROR"}, "SPM target index is outside the current list.")
             return {"CANCELLED"}
-        removed = props.speedtree_spm_items[self.index].path
-        props.speedtree_spm_items.remove(self.index)
-        self.report({"INFO"}, f"Removed target SPM: {removed}")
+        previous = [item.path for item in props.speedtree_spm_items]
+        removed = previous[self.index]
+        try:
+            cleanup = remove_blend_target_from_spm(bpy.data.filepath, bpy.path.abspath(removed))
+            props.speedtree_spm_items.remove(self.index)
+            save_spm_target_registry(props)
+        except Exception as exc:
+            props.speedtree_spm_items.clear()
+            for path in previous:
+                item = props.speedtree_spm_items.add()
+                item.path = path
+            backup = locals().get("cleanup", {}).get("backup")
+            if backup and Path(backup).is_file():
+                shutil.copy2(backup, bpy.path.abspath(removed))
+            self.report({"ERROR"}, f"Target registry update failed: {exc}")
+            return {"CANCELLED"}
+        self.report(
+            {"INFO"},
+            f"Removed target SPM and detached managed data ({cleanup['status']}): {removed}",
+        )
         return {"FINISHED"}
 
 
 class ATLASLEAF_OT_clear_speedtree_spms(Operator):
     bl_idname = "atlas_leaf.clear_speedtree_spms"
     bl_label = "Clear Target SPMs"
-    bl_options = {"REGISTER", "UNDO"}
+    bl_options = {"REGISTER"}
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_confirm(self, event)
 
     def execute(self, context):
-        context.scene.atlas_leaf_builder.speedtree_spm_items.clear()
-        self.report({"INFO"}, "Cleared target SPM list.")
+        props = context.scene.atlas_leaf_builder
+        previous = [item.path for item in props.speedtree_spm_items]
+        cleanups = []
+        try:
+            for path in previous:
+                cleanups.append(
+                    remove_blend_target_from_spm(
+                        bpy.data.filepath, bpy.path.abspath(path)
+                    )
+                )
+            props.speedtree_spm_items.clear()
+            save_spm_target_registry(props)
+        except Exception as exc:
+            for cleanup, path in zip(cleanups, previous):
+                backup = cleanup.get("backup")
+                if backup and Path(backup).is_file():
+                    shutil.copy2(backup, bpy.path.abspath(path))
+            props.speedtree_spm_items.clear()
+            for path in previous:
+                item = props.speedtree_spm_items.add()
+                item.path = path
+            self.report({"ERROR"}, f"Target clear failed; list and SPMs were preserved: {exc}")
+            return {"CANCELLED"}
+        self.report({"INFO"}, f"Cleared {len(previous)} target SPMs and detached managed data.")
         return {"FINISHED"}
 
 
@@ -1148,6 +2306,11 @@ class ATLASLEAF_PT_panel(Panel):
     def draw(self, context):
         layout = self.layout
         props = context.scene.atlas_leaf_builder
+        registry_error = ""
+        try:
+            sync_spm_target_registry(props)
+        except Exception as exc:
+            registry_error = str(exc)
         layout.prop(props, "albedo_path")
         layout.prop(props, "alpha_path")
         layout.prop(props, "output_dir")
@@ -1167,35 +2330,27 @@ class ATLASLEAF_PT_panel(Panel):
         layout.prop(props, "place_at_origin")
         layout.prop(props, "collection_name")
         layout.prop(props, "clear_existing")
-        row = layout.row(align=True)
-        row.operator("atlas_leaf.reset_elm01_pairs", icon="FILE_REFRESH")
-        row.operator("atlas_leaf.clear_pairs", icon="TRASH")
-        layout.operator("atlas_leaf.build_label_preview", icon="IMAGE_DATA")
-        box = layout.box()
-        row = box.row(align=True)
-        row.label(text="Front Island Editor")
-        row.label(text=f"{len(props.pair_items)} selected" if len(props.pair_items) else "Auto: all alpha islands")
-        if len(props.pair_items) == 0:
-            box.label(text="Empty list generates every detected alpha island.")
-        add = box.row(align=True)
-        add.prop(props, "new_pair_front")
-        add.operator("atlas_leaf.add_pair", text="", icon="ADD")
-        header = box.row(align=True)
-        header.label(text="#", icon="SORT_ASC")
-        header.label(text="F")
-        header.label(text="")
-        for index, item in enumerate(props.pair_items):
-            row = box.row(align=True)
-            row.label(text=f"{index + 1:02d}")
-            row.prop(item, "front", text="")
-            remove = row.operator("atlas_leaf.remove_pair", text="", icon="X")
-            remove.index = index
         layout.separator()
         layout.operator("atlas_leaf.generate", icon="MESH_DATA")
-        layout.operator("atlas_leaf.straight_mesh", icon="MOD_SIMPLEDEFORM")
+        projected_box = layout.box()
+        projected_box.label(text="Manual Front/Back Projected Shell", icon="UV")
+        row = projected_box.row(align=True)
+        row.prop(props, "projected_shell_front", text="Front")
+        row.operator("atlas_leaf.set_projected_shell_front", text="Set Front")
+        row = projected_box.row(align=True)
+        row.prop(props, "projected_shell_back", text="Back")
+        row.operator("atlas_leaf.set_projected_shell_back", text="Set Back")
+        projected_box.label(text="Align and enlarge Back over Front, then build.")
+        projected_box.operator("atlas_leaf.build_projected_shell", icon="MOD_UVPROJECT")
+        layout.operator("atlas_leaf.straight_mesh", text="Straight Mesh (Backup Original)", icon="MOD_SIMPLEDEFORM")
+        layout.operator("atlas_leaf.split_below_x_axis", icon="MOD_BOOLEAN")
         layout.operator("atlas_leaf.auto_split_material_collections", icon="OUTLINER_COLLECTION")
         layout.separator()
+        layout.prop(props, "speedtree_atlas_asset_name")
+        layout.prop(props, "speedtree_create_missing_spm")
+        layout.prop(props, "speedtree_source_materials_json")
         layout.prop(props, "speedtree_mesh_scale")
+        layout.prop(props, "speedtree_mesh_asset_scale")
         layout.prop(props, "speedtree_anchor_export_mode")
         layout.prop(props, "speedtree_anchor_prefix")
         row = layout.row(align=True)
@@ -1208,8 +2363,12 @@ class ATLASLEAF_PT_panel(Panel):
         box = layout.box()
         header = box.row(align=True)
         header.label(text="Target SPMs")
-        header.label(text=f"{len(props.speedtree_spm_items)} listed")
+        header.label(text=f"{len(props.speedtree_spm_items)} listed · JSON")
         header.operator("atlas_leaf.clear_speedtree_spms", text="", icon="TRASH")
+        if registry_error:
+            row = box.row()
+            row.alert = True
+            row.label(text=f"Target JSON error: {registry_error}", icon="ERROR")
         for index, item in enumerate(props.speedtree_spm_items):
             row = box.row(align=True)
             row.label(text=f"{index + 1:02d}")

@@ -2,10 +2,11 @@ import json
 from pathlib import Path
 
 import bpy
-from bpy.props import BoolProperty, CollectionProperty, EnumProperty, FloatProperty, IntProperty, StringProperty
+from bpy.props import BoolProperty, CollectionProperty, EnumProperty, FloatProperty, IntProperty, PointerProperty, StringProperty
 from bpy.types import PropertyGroup
 
 from .constants import DEFAULT_ALBEDO, DEFAULT_ALPHA, DEFAULT_PAIRS, default_output_dir, default_speedtree_spm_path
+from .target_registry import load_target_registry, save_target_registry
 from .texture_paths import matching_alpha_path
 
 
@@ -60,6 +61,46 @@ def ensure_spm_target_items(props):
         item.path = path
 
 
+def save_spm_target_registry(props):
+    blend_path = bpy.data.filepath
+    if not blend_path or Path(blend_path).suffix.lower() != ".blend":
+        return None
+    targets = [
+        str(Path(bpy.path.abspath(item.path)).absolute())
+        for item in props.speedtree_spm_items
+        if item.path
+    ]
+    return save_target_registry(blend_path, targets)
+
+
+def sync_spm_target_registry(props, initialize_missing=False):
+    """Make the scene list follow its per-blend JSON sidecar when present."""
+    blend_path = bpy.data.filepath
+    if not blend_path or Path(blend_path).suffix.lower() != ".blend":
+        ensure_spm_target_items(props)
+        return None
+
+    registry = load_target_registry(blend_path)
+    if registry is None:
+        ensure_spm_target_items(props)
+        if initialize_missing and len(props.speedtree_spm_items):
+            return save_spm_target_registry(props)
+        return None
+
+    current = [
+        normalized_path_text(item.path)
+        for item in props.speedtree_spm_items
+        if item.path
+    ]
+    target_keys = [normalized_path_text(path) for path in registry["target_spms"]]
+    if current != target_keys:
+        props.speedtree_spm_items.clear()
+        for path in registry["target_spms"]:
+            item = props.speedtree_spm_items.add()
+            item.path = path
+    return registry
+
+
 def add_spm_target_item(props, path_text):
     path = Path(bpy.path.abspath(path_text))
     if path.suffix.lower() != ".spm":
@@ -104,6 +145,14 @@ def sync_alpha_path(props):
 
 def update_alpha_from_albedo(props, _context):
     sync_alpha_path(props)
+
+
+def mesh_object_poll(_self, obj):
+    return (
+        obj is not None
+        and obj.type == "MESH"
+        and not obj.get("atlas_leaf_projected_source_backup")
+    )
 
 
 class ATLASLEAF_PairItem(PropertyGroup):
@@ -206,6 +255,18 @@ class ATLASLEAF_Properties(PropertyGroup):
         default=True,
         description="Move each generated leaf mesh so the stem-side pivot is the object origin at 0,0,0",
     )
+    projected_shell_front: PointerProperty(
+        name="Front",
+        type=bpy.types.Object,
+        poll=mesh_object_poll,
+        description="One-plate mesh whose geometry, topology, pivot, and front UVs define the projected shell",
+    )
+    projected_shell_back: PointerProperty(
+        name="Back Projection",
+        type=bpy.types.Object,
+        poll=mesh_object_poll,
+        description="Manually aligned one-plate mesh used only to project back atlas UVs",
+    )
     clear_existing: BoolProperty(name="Clear Collection", default=True)
     speedtree_spm_path: StringProperty(
         name="SPM To Add",
@@ -217,7 +278,25 @@ class ATLASLEAF_Properties(PropertyGroup):
     speedtree_material_name: StringProperty(
         name="Material Name",
         default="Elm01_Atlas_Leaf",
-        description="Material_v8 name to create or update inside every target SPM",
+        description="Legacy field kept for older blend files",
+    )
+    speedtree_atlas_asset_name: StringProperty(
+        name="Atlas Asset Name",
+        default="",
+        description=(
+            "Explicit base name for newly exported atlas materials; M_cluster_ is canonicalized to M_leaf_. "
+            "Leave blank to preserve a legacy blend/file-derived name"
+        ),
+    )
+    speedtree_source_materials_json: StringProperty(
+        name="Generator Source Mapping",
+        default="{}",
+        description="JSON mapping from absolute target SPM path to source Material_v8 names to replace",
+    )
+    speedtree_create_missing_spm: BoolProperty(
+        name="Create Missing Target SPM",
+        default=False,
+        description="Explicitly allow creating a blank SpeedTree target when a listed SPM does not exist",
     )
     speedtree_mesh_scale: FloatProperty(
         name="FBX Geometry Scale",
@@ -226,6 +305,26 @@ class ATLASLEAF_Properties(PropertyGroup):
         soft_max=1.0,
         precision=6,
         description="Multiplier applied to exported FBX mesh geometry; SpeedTree Mesh Scale stays 1",
+    )
+    speedtree_mesh_asset_scale: FloatProperty(
+        name="SpeedTree Mesh Asset Scale",
+        default=1.0,
+        min=0.000001,
+        soft_max=1.0,
+        precision=6,
+        description=(
+            "Value written to each generated SpeedTree Mesh asset Scale field; "
+            "keep separate from FBX geometry scaling to avoid applying the conversion twice"
+        ),
+    )
+    speedtree_unit_probe_contract_json: StringProperty(
+        name="Verified Unit Probe Contract",
+        default="",
+        description=(
+            "Verified role-independent Blender FBX to SpeedTree unit contract. "
+            "Production physical-capture builds require this receipt and reject "
+            "duplicate geometry, Mesh asset, or generator scaling."
+        ),
     )
     speedtree_anchor_export_mode: EnumProperty(
         name="Anchor Export",
