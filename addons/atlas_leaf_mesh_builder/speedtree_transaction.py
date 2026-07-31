@@ -10,7 +10,6 @@ import json
 import os
 import shutil
 import tempfile
-import uuid
 from pathlib import Path
 
 
@@ -42,6 +41,7 @@ STAGED_HISTORY_PATH_FIELDS = {
     "target_manifest",
     "xml",
 }
+PENDING_TRANSACTION_ROOTS = []
 
 
 def _sha256_bytes(payload):
@@ -97,6 +97,58 @@ def _snapshot(root, relpaths):
 def _copy_file(source, destination):
     destination.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(source, destination)
+
+
+def _atomic_replace_bytes(destination, payload):
+    """Replace one file without extending an already-long asset filename."""
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".atl-",
+        suffix=".tmp",
+        dir=destination.parent,
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            descriptor = None
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, destination)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if temporary.exists():
+            temporary.unlink()
+
+
+def cleanup_pending_transaction_roots():
+    """Release Blender image handles and remove only this process' temp roots."""
+    pending = list(PENDING_TRANSACTION_ROOTS)
+    if not pending:
+        return []
+    try:
+        import bpy
+    except ImportError:
+        bpy = None
+    removed = []
+    for root in pending:
+        root = Path(root)
+        if bpy is not None:
+            for image in list(bpy.data.images):
+                try:
+                    image_path = Path(bpy.path.abspath(image.filepath)).absolute()
+                    image_path.relative_to(root.absolute())
+                except (AttributeError, OSError, RuntimeError, ValueError):
+                    continue
+                image.user_clear()
+                bpy.data.images.remove(image)
+        if root.exists():
+            shutil.rmtree(root)
+        PENDING_TRANSACTION_ROOTS.remove(root)
+        removed.append(str(root))
+    return removed
 
 
 def _copy_stage_inputs(root, stage_root, target_names, managed_relpaths):
@@ -290,16 +342,7 @@ def _restore_state(state, final_relpaths):
             if destination.exists():
                 destination.unlink()
             continue
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        temporary = destination.with_name(
-            f".{destination.name}.atlas-leaf-rollback-{uuid.uuid4().hex}"
-        )
-        try:
-            temporary.write_bytes(entry["bytes"])
-            os.replace(temporary, destination)
-        finally:
-            if temporary.exists():
-                temporary.unlink()
+        _atomic_replace_bytes(destination, entry["bytes"])
 
 
 def _verify_rollback(state):
@@ -355,16 +398,7 @@ def _commit_states(states, referenced_files):
                     replacements.append((relative, payload))
             for relative, payload in sorted(replacements, key=lambda item: _commit_sort_key(item[0])):
                 destination = state["production_root"] / relative
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                temporary = destination.with_name(
-                    f".{destination.name}.atlas-leaf-commit-{uuid.uuid4().hex}"
-                )
-                try:
-                    temporary.write_bytes(payload)
-                    os.replace(temporary, destination)
-                finally:
-                    if temporary.exists():
-                        temporary.unlink()
+                _atomic_replace_bytes(destination, payload)
             root_references = referenced_files.get(
                 _path_key(state["production_root"]),
                 set(),
@@ -426,7 +460,12 @@ def execute_atomic_target_update(
         roots.setdefault(_path_key(root), {"production_root": root, "targets": []})
         roots[_path_key(root)]["targets"].append(target)
 
-    with tempfile.TemporaryDirectory(prefix="atlas-leaf-fleet-") as temporary:
+    transaction_root = None
+    mapped_results = None
+    with tempfile.TemporaryDirectory(
+        prefix="atlas-leaf-fleet-",
+        ignore_cleanup_errors=True,
+    ) as temporary:
         transaction_root = Path(temporary)
         states = []
         target_to_stage = {}
@@ -468,4 +507,7 @@ def execute_atomic_target_update(
             _rewrite_staged_manifests(state)
         referenced_files = validate_staged(staged_targets, states)
         _commit_states(states, referenced_files or {})
-        return _map_result_paths(staged_results, states)
+        mapped_results = _map_result_paths(staged_results, states)
+    if transaction_root is not None and transaction_root.exists():
+        PENDING_TRANSACTION_ROOTS.append(transaction_root)
+    return mapped_results

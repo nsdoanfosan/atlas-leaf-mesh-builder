@@ -54,6 +54,30 @@ def write_managed_fixture(root, targets=("tree_01.spm",)):
 
 
 class AtomicTargetTransactionTests(unittest.TestCase):
+    def test_atomic_temp_name_does_not_extend_long_asset_filename(self):
+        with tempfile.TemporaryDirectory() as folder:
+            parent = Path(folder) / ("nested_" + "x" * 80)
+            parent.mkdir()
+            destination = parent / ("m_leaf_" + "y" * 120 + ".fbx")
+            calls = []
+            real_replace = transaction.os.replace
+
+            def record_replace(source, target):
+                calls.append((Path(source), Path(target)))
+                return real_replace(source, target)
+
+            with mock.patch.object(
+                transaction.os,
+                "replace",
+                side_effect=record_replace,
+            ):
+                transaction._atomic_replace_bytes(destination, b"payload")
+
+            self.assertEqual(destination.read_bytes(), b"payload")
+            self.assertEqual(calls[0][1], destination)
+            self.assertTrue(calls[0][0].name.startswith(".atl-"))
+            self.assertLess(len(calls[0][0].name), 32)
+
     def test_single_target_commits_spm_shared_output_and_all_manifest_classes(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)

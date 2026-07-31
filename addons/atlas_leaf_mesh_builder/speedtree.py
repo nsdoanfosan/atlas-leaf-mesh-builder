@@ -19,7 +19,10 @@ from mathutils import Matrix, Vector
 from .constants import SPEEDTREE_101_BLANK_SPM, SPEEDTREE_101_EXTERNAL_MESH_SAMPLE, SPEEDTREE_101_MATERIAL_SAMPLE
 from .materials import make_speedtree_material
 from .props import speedtree_spm_targets
-from .speedtree_transaction import execute_atomic_target_update
+from .speedtree_transaction import (
+    cleanup_pending_transaction_roots,
+    execute_atomic_target_update,
+)
 from .texture_paths import (
     CANONICAL_OUTPUT_KIND,
     CANONICAL_TEXTURE_STATUS,
@@ -7805,6 +7808,7 @@ def export_or_update_speedtree_spm_targets(
         _validate_staged_speedtree_targets,
         allow_create=allow_create,
     )
+    cleanup_pending_transaction_roots()
     results = []
     for (
         spm_path,
