@@ -4,6 +4,7 @@ import gzip
 import hashlib
 import json
 import math
+import os
 import re
 import shutil
 import uuid
@@ -18,6 +19,7 @@ from mathutils import Matrix, Vector
 from .constants import SPEEDTREE_101_BLANK_SPM, SPEEDTREE_101_EXTERNAL_MESH_SAMPLE, SPEEDTREE_101_MATERIAL_SAMPLE
 from .materials import make_speedtree_material
 from .props import speedtree_spm_targets
+from .speedtree_transaction import execute_atomic_target_update
 from .texture_paths import (
     CANONICAL_OUTPUT_KIND,
     CANONICAL_TEXTURE_STATUS,
@@ -6343,6 +6345,7 @@ def export_speedtree_assets(
     source_material_ids=None,
     canonical_texture_manifest_path=None,
     preserve_explicit_material_name=False,
+    production_target_spm=None,
 ):
     collection = bpy.data.collections.get(props.collection_name)
     if not collection:
@@ -6352,6 +6355,9 @@ def export_speedtree_assets(
             "Production SpeedTree export requires an explicit target SPM so "
             "canonical PCG ST9 texture outputs can be resolved."
         )
+    texture_contract_target_spm = Path(
+        production_target_spm or target_spm
+    )
     source_texture_exports = {
         key: str(path.resolve())
         for key, path in atlas_texture_paths(bpy.path.abspath(props.albedo_path)).items()
@@ -6409,7 +6415,7 @@ def export_speedtree_assets(
             source_material_ids,
         )
         contract = resolve_production_texture_contract(
-            target_spm,
+            texture_contract_target_spm,
             material_name,
             material_id,
             source_paths=source_texture_exports,
@@ -6452,7 +6458,7 @@ def export_speedtree_assets(
                 group["blender_cluster_bake_texture"] = serialized
             else:
                 serialized = serializable_source_texture_fallback(
-                    target_spm,
+                    texture_contract_target_spm,
                     material_name,
                     fallback_paths,
                     source_origin=source_origin,
@@ -7248,11 +7254,13 @@ def _export_or_update_speedtree_spm_path_impl(
     source_binding_repairs=None,
     allow_create=False,
     preserve_explicit_material_name=False,
+    production_target_spm=None,
 ):
     generator_variant_policy = normalize_generator_variant_policy(
         generator_variant_policy
     )
     target_spm = Path(target_spm)
+    production_target_spm = Path(production_target_spm or target_spm)
     if not target_spm.name:
         raise RuntimeError("Target SPM is not set.")
     if target_spm.suffix.lower() != ".spm":
@@ -7287,6 +7295,7 @@ def _export_or_update_speedtree_spm_path_impl(
             or None
         ),
         preserve_explicit_material_name=preserve_explicit_material_name,
+        production_target_spm=production_target_spm,
     )
     manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
     fallback_manifest = previous_target_manifest or previous_global_manifest
@@ -7643,6 +7652,113 @@ def export_or_update_speedtree_spm_path(
         raise
 
 
+def _external_mesh_filenames(mesh):
+    filenames = [str(mesh.findtext("Filename") or "").strip()]
+    for lod_tag in ("Lod_1", "Lod_2"):
+        lod = mesh.find(lod_tag)
+        if lod is not None:
+            filenames.append(str(lod.findtext("Filename") or "").strip())
+    return [filename for filename in filenames if filename]
+
+
+def _validate_staged_speedtree_targets(staged_targets, states):
+    """Validate the complete staged SPM/file graph before fleet commit."""
+    selected = {
+        normalized_target_key(path): path
+        for path in staged_targets
+    }
+    referenced_by_root = {}
+    for state in states:
+        stage_root = Path(state["stage_root"])
+        production_root = Path(state["production_root"])
+        production_references = set()
+        for spm_path in sorted(stage_root.glob("*.spm")):
+            root = read_spm_xml(spm_path)
+            assets = root.find("Assets")
+            if assets is None:
+                raise RuntimeError(
+                    f"SpeedTree SPM validation failed: Assets missing in {spm_path.name}."
+                )
+            mesh_ids = {
+                positive_int(mesh.attrib.get("ID"))
+                for mesh in assets.findall("Mesh")
+            }
+            mesh_ids.discard(None)
+            for material in assets.findall("Material_v8"):
+                missing_cutouts = [
+                    mesh_id
+                    for mesh_id in spm_material_mesh_ids(material)
+                    if mesh_id not in mesh_ids
+                ]
+                if missing_cutouts:
+                    raise RuntimeError(
+                        "SpeedTree SPM validation failed: material "
+                        f"{material.attrib.get('Name')!r} in {spm_path.name} "
+                        f"references missing cutout Mesh IDs {missing_cutouts}."
+                    )
+            for mesh in assets.findall("Mesh"):
+                embedded = str(mesh.findtext("Embedded") or "").strip().casefold()
+                if embedded in {"1", "true", "yes"}:
+                    continue
+                filenames = _external_mesh_filenames(mesh)
+                if not filenames:
+                    raise RuntimeError(
+                        "SpeedTree SPM validation failed: external Mesh "
+                        f"ID {mesh.attrib.get('ID')} in {spm_path.name} has no Filename."
+                    )
+                for filename in filenames:
+                    candidate = Path(filename)
+                    resolved = (
+                        candidate
+                        if candidate.is_absolute()
+                        else spm_path.parent / candidate
+                    ).absolute()
+                    if not resolved.is_file():
+                        raise RuntimeError(
+                            "SpeedTree SPM validation failed: external Mesh "
+                            f"Filename is absent for {spm_path.name}: {filename}"
+                        )
+                    try:
+                        relative = resolved.relative_to(stage_root)
+                    except ValueError:
+                        production_path = resolved
+                    else:
+                        production_path = production_root / relative
+                    production_references.add(
+                        os.path.normcase(str(production_path.absolute())).casefold()
+                    )
+
+            if normalized_target_key(spm_path) not in selected:
+                continue
+            manifest = read_json_file(target_manifest_path(spm_path), {})
+            connection = manifest.get("generator_connection") or {}
+            for ordinal, binding in enumerate(connection.get("bindings") or []):
+                identity = resolve_generator_binding(
+                    root,
+                    binding,
+                    context=(
+                        f"Staged Generator binding {ordinal + 1} in {spm_path.name}"
+                    ),
+                    allow_missing=False,
+                )
+                actual = _generator_slot_pair(
+                    identity["generator"],
+                    str(binding.get("slot_prefix") or ""),
+                )
+                expected = (
+                    integer_value(binding.get("target_material_id")),
+                    integer_value(binding.get("target_mesh_id")),
+                )
+                if actual != expected:
+                    raise RuntimeError(
+                        "SpeedTree SPM validation failed: staged Generator "
+                        f"binding in {spm_path.name} is {actual}, expected {expected}."
+                    )
+        root_key = os.path.normcase(str(production_root.absolute())).casefold()
+        referenced_by_root[root_key] = production_references
+    return referenced_by_root
+
+
 def export_or_update_speedtree_spm_targets(
     props,
     *,
@@ -7655,12 +7771,19 @@ def export_or_update_speedtree_spm_targets(
     source_mapping = speedtree_source_material_mapping(props)
     atlas_asset_name = str(getattr(props, "speedtree_atlas_asset_name", "") or "").strip() or None
     allow_create = bool(getattr(props, "speedtree_create_missing_spm", False))
-    results = []
-    for target_spm in targets:
-        source_request = source_mapping.get(normalized_target_key(target_spm), {})
-        spm_path, manifest_path, exported_meshes, action, material_id, mesh_ids, material_groups, cleanup = export_or_update_speedtree_spm_path(
+    requests = {
+        normalized_target_key(target_spm): source_mapping.get(
+            normalized_target_key(target_spm),
+            {},
+        )
+        for target_spm in targets
+    }
+
+    def build_staged_target(staged_target, production_target):
+        source_request = requests.get(normalized_target_key(production_target), {})
+        return _export_or_update_speedtree_spm_path_impl(
             props,
-            target_spm,
+            staged_target,
             atlas_asset_name=atlas_asset_name,
             source_material_names=source_request.get("source_material_names"),
             source_material_ids=source_request.get("source_material_ids"),
@@ -7673,7 +7796,26 @@ def export_or_update_speedtree_spm_targets(
             ),
             allow_create=allow_create,
             preserve_explicit_material_name=preserve_explicit_material_name,
+            production_target_spm=production_target,
         )
+
+    staged_results = execute_atomic_target_update(
+        targets,
+        build_staged_target,
+        _validate_staged_speedtree_targets,
+        allow_create=allow_create,
+    )
+    results = []
+    for (
+        spm_path,
+        manifest_path,
+        exported_meshes,
+        action,
+        material_id,
+        mesh_ids,
+        material_groups,
+        cleanup,
+    ) in staged_results:
         manifest = read_json_file(manifest_path, {})
         results.append(
             {
