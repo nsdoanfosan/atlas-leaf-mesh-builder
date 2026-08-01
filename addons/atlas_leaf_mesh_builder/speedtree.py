@@ -172,7 +172,9 @@ def write_speedtree_readme(export_dir, manifest):
     )
     for key, value in sorted((manifest.get("source_textures") or {}).items()):
         lines.append(f"- {key}: `{Path(value).name}`")
-    path.write_text("\n".join(lines), encoding="utf-8")
+    content = "\n".join(lines)
+    if not path.is_file() or path.read_text(encoding="utf-8") != content:
+        path.write_text(content, encoding="utf-8")
     return path
 
 
@@ -772,7 +774,7 @@ def write_scope_manifest(export_dir, manifest, target_spm=None):
         manifest,
         production_root=export_dir,
     )
-    path.write_text(json.dumps(safe_manifest, indent=2), encoding="utf-8")
+    _write_json_if_changed(path, safe_manifest)
     return path
 
 
@@ -825,6 +827,71 @@ def texture_path_signature(texture_exports):
         payload[str(key)] = row
     encoded = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def speedtree_handoff_material_name(export_scope_id, material_name):
+    """Return a stable, collision-resistant temporary FBX material name."""
+    payload = json.dumps(
+        {
+            "export_scope_id": str(export_scope_id or ""),
+            "material": str(material_name or ""),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return "_AtlasLeaf_SpeedTree_Handoff_" + hashlib.sha256(payload).hexdigest()[:12]
+
+
+SOURCE_REFRESH_BUILDER_CONTRACT = (
+    "atlas_leaf_speedtree_deleted_lifecycle_atomic_fleet_v2"
+)
+
+
+def source_refresh_receipt(blend_path, texture_signature, texture_inputs):
+    """Capture immutable source inputs used to decide a later fleet no-op."""
+    blend = Path(blend_path)
+    return {
+        "kind": "atlas_leaf_source_refresh_receipt",
+        "version": 2,
+        "builder_contract": SOURCE_REFRESH_BUILDER_CONTRACT,
+        "blend_file": str(blend),
+        "blend_sha256": file_sha256(blend) if blend.is_file() else None,
+        "texture_signature": str(texture_signature or ""),
+        "texture_inputs": {
+            str(key): str(value)
+            for key, value in sorted((texture_inputs or {}).items())
+        },
+    }
+
+
+def source_refresh_receipt_is_current(receipt, blend_path):
+    """Verify a no-op receipt without trusting recorded hashes alone."""
+    if not isinstance(receipt, dict):
+        return False
+    if (
+        receipt.get("kind") != "atlas_leaf_source_refresh_receipt"
+        or receipt.get("version") != 2
+        or receipt.get("builder_contract") != SOURCE_REFRESH_BUILDER_CONTRACT
+    ):
+        return False
+    blend = Path(blend_path)
+    recorded_blend = str(receipt.get("blend_file") or "")
+    recorded_sha = str(receipt.get("blend_sha256") or "")
+    if (
+        not blend.is_file()
+        or not recorded_blend
+        or not blend_paths_equal(recorded_blend, blend)
+        or not recorded_sha
+        or file_sha256(blend) != recorded_sha
+    ):
+        return False
+    texture_inputs = receipt.get("texture_inputs")
+    if not isinstance(texture_inputs, dict) or not texture_inputs:
+        return False
+    return texture_path_signature(texture_inputs) == str(
+        receipt.get("texture_signature") or ""
+    )
 
 
 def collection_scope_is_duplicated(collection, scope_id, existing_manifest=None):
@@ -1419,6 +1486,34 @@ def _generator_slot_pair(generator, slot_prefix):
     return values[material_name], values[mesh_name]
 
 
+def _generator_slot_pairs(generator):
+    properties = generator.find("Properties")
+    if properties is None:
+        return {}
+    values = {
+        str(prop.findtext("Name") or "").strip(): integer_value(
+            prop.findtext("Value")
+        )
+        for prop in list(properties)
+    }
+    prefixes = {
+        name.rsplit(":", 1)[0]
+        for name in values
+        if name.endswith(":Material") or name.endswith(":Mesh")
+    }
+    return {
+        prefix: (
+            values[f"{prefix}:Material"],
+            values[f"{prefix}:Mesh"],
+        )
+        for prefix in prefixes
+        if (
+            f"{prefix}:Material" in values
+            and f"{prefix}:Mesh" in values
+        )
+    }
+
+
 def resolve_generator_binding(
     root,
     binding,
@@ -1566,11 +1661,52 @@ def resolve_generator_binding(
             f"Generator '{actual_name}' type {actual_type!r} "
             f"(expected {expected_parent!r})."
         )
-    names = _generator_slot_property_names(generator)
-    if slot_prefix and (
-        f"{slot_prefix}:Material" not in names
-        or f"{slot_prefix}:Mesh" not in names
+    resolved_slot_prefix = slot_prefix
+    slot_pairs = _generator_slot_pairs(generator)
+    expected_target_pair = (
+        integer_value(binding.get("target_material_id")),
+        integer_value(binding.get("target_mesh_id")),
+    )
+    expected_source_pair = (
+        integer_value(binding.get("source_material_id")),
+        integer_value(binding.get("source_mesh_id")),
+    )
+    expected_pair = next(
+        (
+            pair
+            for pair in (expected_target_pair, expected_source_pair)
+            if None not in pair
+        ),
+        None,
+    )
+    if (
+        slot_prefix
+        and binding.get("created_slot")
+        and expected_pair is not None
     ):
+        if slot_pairs.get(slot_prefix) != expected_pair:
+            pair_matches = [
+                prefix
+                for prefix, pair in slot_pairs.items()
+                if pair == expected_pair
+            ]
+            if len(pair_matches) == 1:
+                resolved_slot_prefix = pair_matches[0]
+                resolution = f"{resolution}_unique_slot_pair"
+            elif len(pair_matches) == 0 and allow_missing:
+                # A normalized Cluster rewrite can contract a generated tail,
+                # shifting each surviving pair to a lower slot.  Absence of
+                # this exact persisted pair is an idempotent tombstone; never
+                # attach its provenance to whichever pair reused the index.
+                return None
+            else:
+                raise RuntimeError(
+                    f"{context} resolved Generator '{actual_name}', but "
+                    f"recorded slot {slot_prefix!r} no longer contains exact "
+                    f"pair {expected_pair}; found {len(pair_matches)} matching "
+                    "slots in that Generator."
+                )
+    elif slot_prefix and slot_prefix not in slot_pairs:
         if allow_missing:
             # The Generator can survive a normalized Cluster rewrite while a
             # previously Atlas-managed tail slot is removed.  Treat that
@@ -1587,6 +1723,7 @@ def resolve_generator_binding(
         "generator_name": actual_name,
         "generator_guid": generator_guid(generator),
         "generator_type": actual_type,
+        "slot_prefix": resolved_slot_prefix,
         "resolution": resolution,
     }
 
@@ -1617,6 +1754,32 @@ def normalize_generator_bindings(
         row["generator_type"] = identity["generator_type"]
         if identity["generator_guid"]:
             row["generator_guid"] = identity["generator_guid"]
+        old_slot_prefix = str(row.get("slot_prefix") or "").strip()
+        new_slot_prefix = str(identity.get("slot_prefix") or "").strip()
+        if new_slot_prefix and new_slot_prefix != old_slot_prefix:
+            row["slot_prefix"] = new_slot_prefix
+            for key in (
+                "created_material_property",
+                "created_mesh_property",
+            ):
+                property_name = str(row.get(key) or "")
+                if property_name.startswith(f"{old_slot_prefix}:"):
+                    row[key] = (
+                        new_slot_prefix + property_name[len(old_slot_prefix):]
+                    )
+            created_property_names = row.get("created_property_names")
+            if isinstance(created_property_names, list):
+                row["created_property_names"] = [
+                    (
+                        new_slot_prefix + name[len(old_slot_prefix):]
+                        if (
+                            isinstance(name, str)
+                            and name.startswith(f"{old_slot_prefix}:")
+                        )
+                        else name
+                    )
+                    for name in created_property_names
+                ]
         normalized.append(row)
     return normalized
 
@@ -2009,27 +2172,47 @@ def repair_created_generator_variant_slots(root, bindings):
             )
         generator = generators[generator_index]
         state = generator_variant_parent_state(generator, parent_name)
-        if state["child_count"] < after_count:
-            raise RuntimeError(
-                f"Cannot repair created Generator variants on "
-                f"'{generator.findtext('Name') or ''}': {parent_name} has "
-                f"{state['child_count']} children, expected at least "
-                f"{after_count}."
-            )
-        expected_prefixes = {
-            f"{parent_name}:{index}"
-            for index in range(before_count, after_count)
+        recorded_indices = {
+            int(slot_prefix.rsplit(":", 1)[1])
+            for slot_prefix in records_by_slot
+            if slot_prefix.startswith(f"{parent_name}:")
+            and slot_prefix.rsplit(":", 1)[1].isdigit()
         }
-        if set(records_by_slot) != expected_prefixes:
+        if len(recorded_indices) != len(records_by_slot):
             raise RuntimeError(
-                "Cannot repair created Generator variants: recorded tail slots "
-                "are incomplete."
+                "Cannot repair created Generator variants: recorded slot "
+                "prefixes do not match their parent."
+            )
+        effective_after_count = after_count
+        rebased_contracted_interval = False
+        if state["child_count"] < after_count:
+            surviving_tail = set(
+                range(before_count, state["child_count"])
+            )
+            if not surviving_tail or recorded_indices != surviving_tail:
+                raise RuntimeError(
+                    f"Cannot repair created Generator variants on "
+                    f"'{generator.findtext('Name') or ''}': {parent_name} "
+                    f"contracted from {after_count} to "
+                    f"{state['child_count']} children without an exact "
+                    "surviving Atlas-created tail interval; recorded indices "
+                    f"are {sorted(recorded_indices)}, expected "
+                    f"{sorted(surviving_tail)}."
+                )
+            effective_after_count = state["child_count"]
+            rebased_contracted_interval = True
+        elif not recorded_indices.issubset(
+            set(range(before_count, after_count))
+        ):
+            raise RuntimeError(
+                "Cannot repair created Generator variants: recorded slots are "
+                "outside their created tail interval."
             )
         template_nodes = state["slot_nodes"][before_count - 1]
         template_suffixes = [item["suffix"] for item in template_nodes]
         properties = state["properties"]
         added_names = []
-        for slot_index in range(before_count, after_count):
+        for slot_index in sorted(recorded_indices):
             slot_prefix = f"{parent_name}:{slot_index}"
             binding = records_by_slot[slot_prefix]
             current_pair = (
@@ -2076,10 +2259,10 @@ def repair_created_generator_variant_slots(root, bindings):
         reordered = reorder_generator_variant_owned_slots(
             generator,
             parent_name,
-            range(before_count - 1, after_count),
+            [before_count - 1, *sorted(recorded_indices)],
             reference_index=before_count - 1,
         )
-        for slot_index in range(before_count, after_count):
+        for slot_index in sorted(recorded_indices):
             slot_prefix = f"{parent_name}:{slot_index}"
             repairs.append(
                 {
@@ -2088,6 +2271,11 @@ def repair_created_generator_variant_slots(root, bindings):
                     "generator_guid": generator_guid(generator),
                     "generator_type": generator_type_name(generator),
                     "slot_prefix": slot_prefix,
+                    "variant_parent_children_before": before_count,
+                    "variant_parent_children_after": effective_after_count,
+                    "rebased_contracted_interval": (
+                        rebased_contracted_interval
+                    ),
                     "created_property_names": [
                         item["name"]
                         for item in state["slot_nodes"][slot_index]
@@ -2167,17 +2355,29 @@ def remove_created_generator_variant_slots(root, bindings):
             )
         generator = generators[generator_index]
         state = generator_variant_parent_state(generator, parent_name)
+        effective_after_count = after_count
+        rebased_contracted_interval = False
         if state["child_count"] < after_count:
-            raise RuntimeError(
-                f"Cannot remove created Generator variants from "
-                f"'{generator.findtext('Name') or ''}': {parent_name} has "
-                f"{state['child_count']} children, expected at least "
-                f"{after_count}."
-            )
-        has_later_scope_slots = state["child_count"] > after_count
+            surviving_prefixes = {
+                f"{parent_name}:{index}"
+                for index in range(before_count, state["child_count"])
+            }
+            if not surviving_prefixes or set(records_by_slot) != surviving_prefixes:
+                raise RuntimeError(
+                    f"Cannot remove created Generator variants from "
+                    f"'{generator.findtext('Name') or ''}': {parent_name} "
+                    f"contracted from {after_count} to "
+                    f"{state['child_count']} children without an exact "
+                    "surviving Atlas-created tail interval; recorded slots "
+                    f"are {sorted(records_by_slot)}, expected "
+                    f"{sorted(surviving_prefixes)}."
+                )
+            effective_after_count = state["child_count"]
+            rebased_contracted_interval = True
+        has_later_scope_slots = state["child_count"] > effective_after_count
         expected_prefixes = {
             f"{parent_name}:{index}"
-            for index in range(before_count, after_count)
+            for index in range(before_count, effective_after_count)
         }
         if set(records_by_slot) != expected_prefixes:
             raise RuntimeError(
@@ -2258,6 +2458,9 @@ def remove_created_generator_variant_slots(root, bindings):
                         "slot_prefix": slot_prefix,
                         "material_id": source_pair[0],
                         "mesh_id": source_pair[1],
+                        "rebased_contracted_interval": (
+                            rebased_contracted_interval
+                        ),
                         "mode": (
                             "restored_created_variant_slot_"
                             "preserving_later_scope_interval"
@@ -2278,6 +2481,9 @@ def remove_created_generator_variant_slots(root, bindings):
                         binding.get("source_material_id")
                     ),
                     "mesh_id": integer_value(binding.get("source_mesh_id")),
+                    "rebased_contracted_interval": (
+                        rebased_contracted_interval
+                    ),
                     "mode": "removed_created_variant_slot",
                 }
             )
@@ -2475,6 +2681,338 @@ def atlas_output_bindings(assets, material_groups):
     if not bindings:
         raise RuntimeError("No generated atlas mesh bindings were available for Generator connection.")
     return bindings
+
+
+def retire_deleted_generator_bindings(
+    root,
+    previous_bindings,
+    output_bindings,
+    source_records,
+    *,
+    ownership_manifest=None,
+    spm_path=None,
+):
+    """Tombstone slots whose exact previous generated output disappeared.
+
+    Persisted provenance restores an authored source pair. A proven managed
+    legacy pair without reversible provenance is detached. Ambiguous or drifted
+    slots fail closed instead of being guessed from names or ordinals.
+    """
+    normalized = normalize_generator_bindings(
+        root,
+        previous_bindings,
+        context="Deleted Atlas output retirement binding",
+        allow_missing=True,
+    )
+    active_pairs = {
+        (
+            positive_int(item.get("target_material_id")),
+            positive_int(item.get("target_mesh_id")),
+        )
+        for item in (output_bindings or {}).values()
+        if isinstance(item, dict)
+    }
+    retired_keys = set()
+    retired = []
+
+    def binding_still_has_output(binding):
+        target_pair = (
+            positive_int(binding.get("target_material_id")),
+            positive_int(binding.get("target_mesh_id")),
+        )
+        leaf_ordinal = positive_int(binding.get("leaf_ordinal"))
+        if leaf_ordinal is None:
+            source_material_id = positive_int(
+                binding.get("source_material_id")
+            )
+            source_mesh_id = integer_value(binding.get("source_mesh_id"))
+            source = source_records.get(source_material_id)
+            source_mesh_ids = list((source or {}).get("mesh_ids") or [])
+            if source_mesh_id == -10:
+                leaf_ordinal = 1
+            elif source_mesh_id in source_mesh_ids:
+                leaf_ordinal = source_mesh_ids.index(source_mesh_id) + 1
+        if leaf_ordinal is not None:
+            return leaf_ordinal in output_bindings
+        return None not in target_pair and target_pair in active_pairs
+
+    created_groups = {}
+    for binding in normalized:
+        if not binding.get("created_slot"):
+            continue
+        group_key = (
+            binding.get("generator_index"),
+            str(binding.get("variant_parent_property") or ""),
+            integer_value(binding.get("variant_parent_children_before")),
+            integer_value(binding.get("variant_parent_children_after")),
+        )
+        created_groups.setdefault(group_key, []).append(binding)
+    for (
+        generator_index,
+        parent_name,
+        before_count,
+        after_count,
+    ), group_bindings in created_groups.items():
+        if (
+            not parent_name
+            or before_count is None
+            or after_count is None
+            or set(
+                str(binding.get("slot_prefix") or "")
+                for binding in group_bindings
+            )
+            != {
+                f"{parent_name}:{index}"
+                for index in range(before_count, after_count)
+            }
+            or any(binding_still_has_output(binding) for binding in group_bindings)
+        ):
+            continue
+        removed_slots = remove_created_generator_variant_slots(
+            root,
+            group_bindings,
+        )
+        for binding in group_bindings:
+            retired_keys.add(
+                (binding.get("generator_index"), binding.get("slot_prefix"))
+            )
+        retired.extend(
+            {
+                **item,
+                "target_material_id": positive_int(
+                    next(
+                        binding.get("target_material_id")
+                        for binding in group_bindings
+                        if binding.get("slot_prefix") == item.get("slot_prefix")
+                    )
+                ),
+                "target_mesh_id": positive_int(
+                    next(
+                        binding.get("target_mesh_id")
+                        for binding in group_bindings
+                        if binding.get("slot_prefix") == item.get("slot_prefix")
+                    )
+                ),
+            }
+            for item in removed_slots
+        )
+
+    pairs = {
+        (pair["generator_index"], pair["slot_prefix"]): pair
+        for pair in spm_generator_property_pairs(root, {"Leaf Mesh", "Frond"})
+    }
+    active_binding_keys = {
+        (binding.get("generator_index"), binding.get("slot_prefix"))
+        for binding in normalized
+        if binding_still_has_output(binding)
+    }
+
+    for binding in normalized:
+        key = (binding.get("generator_index"), binding.get("slot_prefix"))
+        if key in retired_keys:
+            continue
+        leaf_ordinal = positive_int(binding.get("leaf_ordinal"))
+        target_pair = (
+            positive_int(binding.get("target_material_id")),
+            positive_int(binding.get("target_mesh_id")),
+        )
+        if None in target_pair or binding_still_has_output(binding):
+            continue
+        pair = pairs.get(key)
+        if pair is None:
+            retired_keys.add(key)
+            retired.append(
+                {
+                    "generator_index": key[0],
+                    "slot_prefix": key[1],
+                    "mode": "already_missing_generator_slot_tombstone",
+                    "target_material_id": target_pair[0],
+                    "target_mesh_id": target_pair[1],
+                }
+            )
+            continue
+        mesh_property = pair.get("mesh_property")
+        if mesh_property is None:
+            raise RuntimeError(
+                f"Cannot retire deleted Atlas output from Generator "
+                f"'{pair['generator_name']}' slot '{pair['slot_prefix']}': "
+                "Mesh property is missing."
+            )
+        current_pair = (
+            positive_int(pair["material_property"].findtext("Value")),
+            integer_value(mesh_property.findtext("Value")),
+        )
+        if current_pair != target_pair:
+            raise RuntimeError(
+                f"Cannot retire deleted Atlas output from Generator "
+                f"'{pair['generator_name']}' slot '{pair['slot_prefix']}': "
+                f"current pair {current_pair} drifted from recorded target "
+                f"{target_pair}."
+            )
+
+        source_material_id = positive_int(binding.get("source_material_id"))
+        source_mesh_id = integer_value(binding.get("source_mesh_id"))
+        source = source_records.get(source_material_id)
+        source_mesh_ids = {
+            integer_value(value) for value in (source or {}).get("mesh_ids") or []
+        }
+        source_mesh_ids.discard(None)
+        restored_source_mesh = False
+        source_mesh_available = source_mesh_id == -10
+        if source_mesh_id is not None and source_mesh_id != -10:
+            assets = root.find("Assets")
+            live_mesh_ids = {
+                positive_int(node.attrib.get("ID"))
+                for node in (assets.findall("Mesh") if assets is not None else [])
+            }
+            source_mesh_available = source_mesh_id in live_mesh_ids
+            if not source_mesh_available and ownership_manifest:
+                adoption = ownership_manifest.get("source_material_adoption") or {}
+                if positive_int(adoption.get("material_id")) == source_material_id:
+                    snapshot_row = next(
+                        (
+                            item
+                            for item in adoption.get("original_mesh_snapshots") or []
+                            if positive_int(item.get("mesh_id")) == source_mesh_id
+                        ),
+                        None,
+                    )
+                    if snapshot_row is not None and assets is not None:
+                        restored_mesh = decode_spm_node_snapshot(
+                            snapshot_row.get("snapshot")
+                        )
+                        if positive_int(restored_mesh.attrib.get("ID")) != source_mesh_id:
+                            raise RuntimeError(
+                                "Deleted Atlas output retirement Mesh snapshot identity mismatch."
+                            )
+                        assets.append(restored_mesh)
+                        source_mesh_available = True
+                        restored_source_mesh = True
+        if (
+            source is not None
+            and source_material_id is not None
+            and source_mesh_id is not None
+            and (source_mesh_id == -10 or source_mesh_id in source_mesh_ids)
+            and source_mesh_available
+        ):
+            child_text(pair["material_property"], "Value", source_material_id)
+            child_text(mesh_property, "Value", source_mesh_id)
+            mode = (
+                "restored_original_binding_and_mesh_snapshot"
+                if restored_source_mesh
+                else "restored_original_binding"
+            )
+            material_id = source_material_id
+            mesh_id = source_mesh_id
+        else:
+            child_text(pair["material_property"], "Value", -1)
+            child_text(mesh_property, "Value", -10)
+            mode = "detached_unassigned_incomplete_original_binding"
+            material_id = -1
+            mesh_id = -10
+        retired_keys.add(key)
+        retired.append(
+            {
+                "generator_index": pair["generator_index"],
+                "generator_name": pair["generator_name"],
+                "generator_guid": pair["generator_guid"],
+                "generator_type": pair["generator_type"],
+                "slot_prefix": pair["slot_prefix"],
+                "material_id": material_id,
+                "mesh_id": mesh_id,
+                "target_material_id": target_pair[0],
+                "target_mesh_id": target_pair[1],
+                "mode": mode,
+            }
+        )
+
+    if ownership_manifest:
+        assets = root.find("Assets")
+        if assets is None:
+            raise RuntimeError("Target SPM has no Assets node.")
+        mesh_nodes_by_id = {
+            node.attrib.get("ID"): node for node in assets.findall("Mesh")
+        }
+        owned_material_ids = set()
+        owned_mesh_ids = set()
+        previous_names = manifest_material_names(ownership_manifest)
+        for material in assets.findall("Material_v8"):
+            if material_is_atlas_leaf_owned(
+                material,
+                ownership_manifest,
+                previous_names,
+                mesh_nodes_by_id,
+                spm_path or ".",
+            ):
+                material_id = positive_int(material.attrib.get("ID"))
+                if material_id is not None:
+                    owned_material_ids.add(material_id)
+                    owned_mesh_ids.update(spm_material_mesh_ids(material))
+        manifest_ids = manifest_mesh_ids(ownership_manifest)
+        manifest_paths = manifest_mesh_asset_paths(ownership_manifest)
+        ownership_scope = spm_export_scope(ownership_manifest)
+        for mesh_id_text, mesh in mesh_nodes_by_id.items():
+            mesh_id = positive_int(mesh_id_text)
+            if mesh_id is None:
+                continue
+            marker = parse_atlas_leaf_spm_user_data(
+                mesh.findtext("UserData")
+            )
+            mesh_path = spm_mesh_filename_path(spm_path or ".", mesh)
+            if (
+                (marker and marker.get("scope") == ownership_scope)
+                or (
+                    mesh_id in manifest_ids
+                    and mesh_path is not None
+                    and mesh_path in manifest_paths
+                )
+            ):
+                owned_mesh_ids.add(mesh_id)
+
+        for key, pair in pairs.items():
+            if key in retired_keys or key in active_binding_keys:
+                continue
+            mesh_property = pair.get("mesh_property")
+            if mesh_property is None:
+                continue
+            current_pair = (
+                positive_int(pair["material_property"].findtext("Value")),
+                integer_value(mesh_property.findtext("Value")),
+            )
+            if current_pair in active_pairs:
+                continue
+            if (
+                current_pair[0] not in owned_material_ids
+                or current_pair[1] not in owned_mesh_ids
+            ):
+                continue
+            child_text(pair["material_property"], "Value", -1)
+            child_text(mesh_property, "Value", -10)
+            retired_keys.add(key)
+            retired.append(
+                {
+                    "generator_index": pair["generator_index"],
+                    "generator_name": pair["generator_name"],
+                    "generator_guid": pair["generator_guid"],
+                    "generator_type": pair["generator_type"],
+                    "slot_prefix": pair["slot_prefix"],
+                    "material_id": -1,
+                    "mesh_id": -10,
+                    "target_material_id": current_pair[0],
+                    "target_mesh_id": current_pair[1],
+                    "mode": "detached_unassigned_missing_original_binding",
+                }
+            )
+
+    return {
+        "active_bindings": [
+            binding
+            for binding in normalized
+            if (binding.get("generator_index"), binding.get("slot_prefix"))
+            not in retired_keys
+        ],
+        "retired_bindings": retired,
+    }
 
 
 def previous_generated_binding_retarget(
@@ -2780,6 +3318,7 @@ def connect_atlas_generators_in_spm(
     source_mesh_ids_by_name=None,
     generator_variant_policy=None,
     source_binding_repairs=None,
+    ownership_manifest=None,
 ):
     """Connect source Leaf Mesh/Frond slots to generated atlas assets.
 
@@ -2817,13 +3356,25 @@ def connect_atlas_generators_in_spm(
         )
     )
     output_bindings = atlas_output_bindings(assets, material_groups)
+    deleted_retirement = retire_deleted_generator_bindings(
+        root,
+        previous_bindings,
+        output_bindings,
+        source_records,
+        ownership_manifest=ownership_manifest,
+        spm_path=spm_path,
+    )
+    retired_slot_keys = {
+        (item.get("generator_index"), item.get("slot_prefix"))
+        for item in deleted_retirement["retired_bindings"]
+    }
     generated_pair_to_binding = {
         (item["target_material_id"], item["target_mesh_id"]): item
         for item in output_bindings.values()
     }
     normalized_previous_bindings = normalize_generator_bindings(
         root,
-        previous_bindings,
+        deleted_retirement["active_bindings"],
         context="Previous Atlas Generator binding",
         allow_missing=True,
     )
@@ -2867,6 +3418,8 @@ def connect_atlas_generators_in_spm(
         for pair in spm_generator_property_pairs(
             root, {"Leaf Mesh", "Frond"}
         ):
+            if (pair["generator_index"], pair["slot_prefix"]) in retired_slot_keys:
+                continue
             descriptor = generator_variant_slot_descriptor(pair)
             if descriptor is None:
                 continue
@@ -2881,19 +3434,21 @@ def connect_atlas_generators_in_spm(
                 else None
             )
             ordinal = None
-            target = generated_pair_to_binding.get((material_id, mesh_id))
-            if target is not None:
-                ordinal = target["leaf_ordinal"]
+            previous_retarget = previous_generated_binding_retarget(
+                pair,
+                previous_by_slot,
+                source_records,
+                output_bindings,
+                variant_policy,
+            )
+            if previous_retarget is not None:
+                ordinal = previous_retarget["leaf_ordinal"]
             else:
-                previous_retarget = previous_generated_binding_retarget(
-                    pair,
-                    previous_by_slot,
-                    source_records,
-                    output_bindings,
-                    variant_policy,
+                target = generated_pair_to_binding.get(
+                    (material_id, mesh_id)
                 )
-                if previous_retarget is not None:
-                    ordinal = previous_retarget["leaf_ordinal"]
+                if target is not None:
+                    ordinal = target["leaf_ordinal"]
             if ordinal is None:
                 if material_id == source_material_id:
                     if mesh_property is None:
@@ -3025,6 +3580,8 @@ def connect_atlas_generators_in_spm(
     staged = []
     already = []
     for pair in spm_generator_property_pairs(root, {"Leaf Mesh", "Frond"}):
+        if (pair["generator_index"], pair["slot_prefix"]) in retired_slot_keys:
+            continue
         material_property = pair["material_property"]
         mesh_property = pair["mesh_property"]
         material_id = positive_int(material_property.findtext("Value"))
@@ -3032,10 +3589,6 @@ def connect_atlas_generators_in_spm(
         previous = previous_by_slot.get(
             (pair["generator_index"], pair["slot_prefix"])
         )
-        target = generated_pair_to_binding.get((material_id, mesh_id))
-        if target is not None:
-            already.append((pair, target))
-            continue
         previous_retarget = previous_generated_binding_retarget(
             pair,
             previous_by_slot,
@@ -3044,14 +3597,25 @@ def connect_atlas_generators_in_spm(
             variant_policy,
         )
         if previous_retarget is not None:
-            staged.append((
-                pair,
-                previous_retarget["source"],
-                previous_retarget["source_mesh_id"],
-                previous_retarget["target"],
-                previous_retarget["sentinel_policy"],
-                previous_retarget["previous"],
-            ))
+            previous_target = previous_retarget["target"]
+            if (
+                previous_target["target_material_id"],
+                previous_target["target_mesh_id"],
+            ) == (material_id, mesh_id):
+                already.append((pair, previous_target))
+            else:
+                staged.append((
+                    pair,
+                    previous_retarget["source"],
+                    previous_retarget["source_mesh_id"],
+                    previous_target,
+                    previous_retarget["sentinel_policy"],
+                    previous_retarget["previous"],
+                ))
+            continue
+        target = generated_pair_to_binding.get((material_id, mesh_id))
+        if target is not None:
+            already.append((pair, target))
             continue
         created = created_by_slot.get(
             (pair["generator_index"], pair["slot_prefix"])
@@ -3182,12 +3746,6 @@ def connect_atlas_generators_in_spm(
             for field in provenance_fields:
                 if field in previous:
                     binding[field] = previous[field]
-            parent_key = (
-                pair["generator_index"],
-                str(binding.get("variant_parent_property") or ""),
-            )
-            if parent_key in expanded_parent_provenance:
-                binding.update(expanded_parent_provenance[parent_key])
             repair = repair_by_slot.get(
                 (pair["generator_index"], pair["slot_prefix"])
             )
@@ -3195,6 +3753,18 @@ def connect_atlas_generators_in_spm(
                 binding["created_property_names"] = repair[
                     "created_property_names"
                 ]
+                binding["variant_parent_children_before"] = repair[
+                    "variant_parent_children_before"
+                ]
+                binding["variant_parent_children_after"] = repair[
+                    "variant_parent_children_after"
+                ]
+            parent_key = (
+                pair["generator_index"],
+                str(binding.get("variant_parent_property") or ""),
+            )
+            if parent_key in expanded_parent_provenance:
+                binding.update(expanded_parent_provenance[parent_key])
         bindings.append(binding)
     for pair, target in already:
         previous = previous_by_slot.get(
@@ -3236,12 +3806,6 @@ def connect_atlas_generators_in_spm(
             for field in provenance_fields:
                 if field in previous:
                     binding[field] = previous[field]
-            parent_key = (
-                pair["generator_index"],
-                str(binding.get("variant_parent_property") or ""),
-            )
-            if parent_key in expanded_parent_provenance:
-                binding.update(expanded_parent_provenance[parent_key])
             repair = repair_by_slot.get(
                 (pair["generator_index"], pair["slot_prefix"])
             )
@@ -3249,9 +3813,21 @@ def connect_atlas_generators_in_spm(
                 binding["created_property_names"] = repair[
                     "created_property_names"
                 ]
+                binding["variant_parent_children_before"] = repair[
+                    "variant_parent_children_before"
+                ]
+                binding["variant_parent_children_after"] = repair[
+                    "variant_parent_children_after"
+                ]
+            parent_key = (
+                pair["generator_index"],
+                str(binding.get("variant_parent_property") or ""),
+            )
+            if parent_key in expanded_parent_provenance:
+                binding.update(expanded_parent_provenance[parent_key])
         bindings.append(binding)
 
-    if staged or applied_source_binding_repairs or any(
+    if deleted_retirement["retired_bindings"] or staged or applied_source_binding_repairs or any(
         item["added_property_names"] or item["reordered"]
         for item in variant_schema_repairs
     ):
@@ -3345,6 +3921,7 @@ def connect_atlas_generators_in_spm(
         "created_slot_pairs": len(created_by_slot),
         "repaired_variant_slot_schemas": variant_schema_repairs,
         "applied_source_binding_repairs": applied_source_binding_repairs,
+        "retired_deleted_bindings": deleted_retirement["retired_bindings"],
         "bindings": bindings,
     }
 
@@ -4073,6 +4650,9 @@ def target_scope_manifests_for_blend(spm_path, blend_path):
         payload = read_json_file(path, {})
         if not isinstance(payload, dict):
             continue
+        lifecycle = payload.get("atlas_scope_lifecycle") or {}
+        if lifecycle.get("state") == "retired":
+            continue
         if not payload.get("blend_file") or not blend_paths_equal(
             payload["blend_file"], blend_path
         ):
@@ -4086,6 +4666,152 @@ def target_scope_manifests_for_blend(spm_path, blend_path):
         payload["_scope_manifest_path"] = str(path)
         manifests.append(payload)
     return manifests
+
+
+def manifest_asset_lineage_tokens(manifest):
+    """Return explicit producer lineage tokens, never material-name guesses."""
+    tokens = set()
+    if not isinstance(manifest, dict):
+        return tokens
+
+    def collect(meshes):
+        for item in meshes or []:
+            if not isinstance(item, dict):
+                continue
+            source_object = str(item.get("source_object") or "").strip()
+            if source_object:
+                tokens.add(("source_object", source_object.casefold()))
+            skeletal_asset = str(item.get("skeletal_asset_name") or "").strip()
+            if skeletal_asset:
+                tokens.add(("skeletal_asset", skeletal_asset.casefold()))
+            prototype_index = positive_int(item.get("source_prototype_index"))
+            if prototype_index is not None:
+                tokens.add(("prototype_index", prototype_index))
+            for field in ("asset", "fbx", "xml", "assembly_plan_fbx"):
+                value = str(item.get(field) or "").strip()
+                if value:
+                    tokens.add(
+                        (
+                            field,
+                            value.replace("\\", "/").casefold(),
+                        )
+                    )
+
+    collect(manifest.get("meshes"))
+    for group in manifest.get("material_groups") or []:
+        if isinstance(group, dict):
+            collect(group.get("meshes"))
+    return tokens
+
+
+def superseded_scope_manifests_for_update(spm_path, manifest):
+    """Select same-source predecessor scopes only with explicit asset lineage."""
+    spm_path = Path(spm_path).expanduser().absolute()
+    blend_path = str(manifest.get("blend_file") or "").strip()
+    source_collection = str(manifest.get("source_collection") or "").strip()
+    current_scope = spm_export_scope(manifest)
+    current_lineage = manifest_asset_lineage_tokens(manifest)
+    if not blend_path or not source_collection:
+        return [], []
+
+    selected = []
+    diagnostics = []
+    for previous in target_scope_manifests_for_blend(spm_path, blend_path):
+        previous_scope = spm_export_scope(previous)
+        if previous_scope == current_scope:
+            continue
+        if str(previous.get("source_collection") or "") != source_collection:
+            continue
+        previous_lineage = manifest_asset_lineage_tokens(previous)
+        shared_lineage = sorted(current_lineage.intersection(previous_lineage))
+        if not shared_lineage:
+            diagnostics.append(
+                {
+                    "scope": previous_scope,
+                    "reason": "asset_lineage_unproven",
+                    "manifest_path": previous.get("_scope_manifest_path"),
+                }
+            )
+            continue
+        previous = dict(previous)
+        previous["_shared_asset_lineage"] = [list(item) for item in shared_lineage]
+        selected.append(previous)
+    return selected, diagnostics
+
+
+def _write_json_if_changed(path, payload):
+    path = Path(path)
+    content = json.dumps(payload, indent=2).encode("utf-8")
+    if path.is_file() and path.read_bytes() == content:
+        return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content)
+    return True
+
+
+def retire_scope_manifest_records(manifests, successor_manifest):
+    """Persist non-operational tombstones for proven predecessor scopes."""
+    successor_scope = spm_export_scope(successor_manifest)
+    retired = []
+    for manifest in manifests or []:
+        path_value = manifest.get("_scope_manifest_path")
+        if not path_value:
+            continue
+        path = Path(path_value).expanduser().absolute()
+        payload = read_json_file(path, {})
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"Cannot retire invalid Atlas scope manifest: {path}")
+        lifecycle = payload.get("atlas_scope_lifecycle") or {}
+        if lifecycle.get("state") != "retired":
+            payload = copy.deepcopy(payload)
+            payload["retired_asset_lineage"] = sorted(
+                [list(item) for item in manifest_asset_lineage_tokens(payload)]
+            )
+            payload["atlas_scope_lifecycle"] = {
+                "state": "retired",
+                "successor_export_scope_id": successor_scope,
+                "reason": "superseded_same_source_asset_lineage",
+            }
+            payload["generator_connection"] = {
+                "requested": False,
+                "complete": False,
+                "bindings": [],
+            }
+            payload["material_groups"] = []
+            payload["speedtree_material_groups"] = []
+            payload["meshes"] = []
+            payload["mesh_ids"] = []
+            payload["material_id"] = None
+            payload["material_name"] = None
+        _write_json_if_changed(path, payload)
+
+        identity_path = scope_manifest_path(
+            path.parent.parent,
+            manifest,
+        )
+        if identity_path.is_file():
+            identity_payload = read_json_file(identity_path, {})
+            if (
+                isinstance(identity_payload, dict)
+                and spm_export_scope(identity_payload) == spm_export_scope(manifest)
+                and identity_payload.get("blend_file")
+                and blend_paths_equal(
+                    identity_payload["blend_file"],
+                    manifest.get("blend_file"),
+                )
+            ):
+                identity_payload = copy.deepcopy(payload)
+                identity_payload.pop("spm", None)
+                identity_payload.pop("target_manifest", None)
+                _write_json_if_changed(identity_path, identity_payload)
+        retired.append(
+            {
+                "scope": spm_export_scope(manifest),
+                "successor_scope": successor_scope,
+                "manifest_path": str(path),
+            }
+        )
+    return retired
 
 
 def blend_target_contract_manifest_paths(spm_path, blend_path, manifests):
@@ -4425,6 +5151,144 @@ def restore_adopted_source_nodes(assets, adoptions):
     return restored
 
 
+def created_interval_scope_cleanup_bindings(
+    root,
+    bindings,
+    owned_material_ids,
+    owned_mesh_ids,
+    *,
+    context="Atlas scope cleanup created interval",
+):
+    """Resolve a complete created interval by structure for scope retirement.
+
+    A later Cluster normalization can move this scope's target pairs between
+    slots in the same Generator. Pair-based normalization then deliberately
+    tombstones the missing pair, but complete creation provenance still proves
+    ownership of the slot structure. Structural cleanup is safe only while
+    every surviving slot in that complete interval still references an asset
+    owned by the retiring scope.
+    """
+    if not owned_material_ids and not owned_mesh_ids:
+        return []
+
+    groups = {}
+    for ordinal, binding in enumerate(bindings or []):
+        if not isinstance(binding, dict) or not binding.get("created_slot"):
+            continue
+        parent_name = str(binding.get("variant_parent_property") or "")
+        before_count = integer_value(
+            binding.get("variant_parent_children_before")
+        )
+        after_count = integer_value(
+            binding.get("variant_parent_children_after")
+        )
+        slot_prefix = str(binding.get("slot_prefix") or "")
+        material_property = str(
+            binding.get("created_material_property") or ""
+        )
+        mesh_property = str(binding.get("created_mesh_property") or "")
+        if (
+            not parent_name
+            or before_count is None
+            or before_count <= 0
+            or after_count is None
+            or after_count <= before_count
+            or not slot_prefix
+            or not material_property
+            or not mesh_property
+        ):
+            raise RuntimeError(
+                "Created Generator variant provenance is incomplete."
+            )
+        probe = copy.deepcopy(binding)
+        probe["created_slot"] = False
+        probe["slot_prefix"] = ""
+        identity = resolve_generator_binding(
+            root,
+            probe,
+            context=f"{context} #{ordinal + 1}",
+            allow_missing=True,
+        )
+        if identity is None:
+            continue
+        row = copy.deepcopy(binding)
+        row["generator_index"] = identity["generator_index"]
+        row["generator_name"] = identity["generator_name"]
+        row["generator_type"] = identity["generator_type"]
+        if identity["generator_guid"]:
+            row["generator_guid"] = identity["generator_guid"]
+        key = (
+            identity["generator_index"],
+            parent_name,
+            before_count,
+            after_count,
+        )
+        records = groups.setdefault(key, {})
+        previous = records.get(slot_prefix)
+        if previous is not None and previous != row:
+            raise RuntimeError(
+                "Created Generator variant provenance conflicts for one slot."
+            )
+        records[slot_prefix] = row
+
+    generators = list(root.iter("Generator"))
+    resolved = []
+    for (
+        generator_index,
+        parent_name,
+        before_count,
+        after_count,
+    ), records_by_slot in sorted(groups.items()):
+        expected_recorded = {
+            f"{parent_name}:{index}"
+            for index in range(before_count, after_count)
+        }
+        if set(records_by_slot) != expected_recorded:
+            raise RuntimeError(
+                "Cannot structurally retire Atlas-created Generator variants: "
+                "the recorded creation interval is incomplete."
+            )
+        generator = generators[generator_index]
+        state = generator_variant_parent_state(generator, parent_name)
+        if state["child_count"] < before_count:
+            raise RuntimeError(
+                "Cannot structurally retire Atlas-created Generator variants: "
+                "the Generator contracted below its authored child count."
+            )
+        effective_after_count = min(after_count, state["child_count"])
+        for slot_index in range(before_count, effective_after_count):
+            slot_prefix = f"{parent_name}:{slot_index}"
+            binding = copy.deepcopy(records_by_slot[slot_prefix])
+            slot = state["slots"][slot_index]
+            material_id = positive_int(slot["material"].findtext("Value"))
+            mesh_id = positive_int(slot["mesh"].findtext("Value"))
+            if (
+                material_id not in owned_material_ids
+                and mesh_id not in owned_mesh_ids
+            ):
+                raise RuntimeError(
+                    f"Cannot structurally retire Atlas-created Generator slot "
+                    f"'{slot_prefix}': current pair "
+                    f"{(material_id, mesh_id)} is outside the retiring scope."
+                )
+            if material_id is None or mesh_id is None:
+                raise RuntimeError(
+                    f"Cannot structurally retire Atlas-created Generator slot "
+                    f"'{slot_prefix}': its owned target pair is incomplete."
+                )
+            binding["recorded_target_material_id"] = binding.get(
+                "target_material_id"
+            )
+            binding["recorded_target_mesh_id"] = binding.get(
+                "target_mesh_id"
+            )
+            binding["target_material_id"] = material_id
+            binding["target_mesh_id"] = mesh_id
+            binding["structural_created_interval_cleanup"] = True
+            resolved.append(binding)
+    return resolved
+
+
 def remove_atlas_scope_assets_from_spm(spm_path, manifests):
     """Restore Generator slots and remove only assets proven to belong to scopes."""
     spm_path = Path(spm_path).expanduser().absolute()
@@ -4496,15 +5360,46 @@ def remove_atlas_scope_assets_from_spm(spm_path, manifests):
     reversible = {}
     for manifest_index, manifest in enumerate(manifests):
         connection = manifest.get("generator_connection") or {}
+        raw_bindings = connection.get("bindings") or []
         normalized_bindings = normalize_generator_bindings(
             root,
-            connection.get("bindings") or [],
+            raw_bindings,
             context=(
                 f"Atlas scope removal manifest #{manifest_index + 1} binding"
             ),
             allow_missing=True,
         )
-        for binding in normalized_bindings:
+        structural_created_bindings = (
+            created_interval_scope_cleanup_bindings(
+                root,
+                raw_bindings,
+                owned_material_ids,
+                owned_mesh_ids,
+                context=(
+                    "Atlas scope removal manifest "
+                    f"#{manifest_index + 1} created interval"
+                ),
+            )
+        )
+        structural_by_key = {
+            (binding.get("generator_index"), binding.get("slot_prefix")): (
+                binding
+            )
+            for binding in structural_created_bindings
+        }
+        cleanup_bindings = [
+            binding
+            for binding in normalized_bindings
+            if not (
+                binding.get("created_slot")
+                and (
+                    binding.get("generator_index"),
+                    binding.get("slot_prefix"),
+                ) in structural_by_key
+            )
+        ]
+        cleanup_bindings.extend(structural_created_bindings)
+        for binding in cleanup_bindings:
             if not isinstance(binding, dict):
                 continue
             target_material_id = positive_int(binding.get("target_material_id"))
@@ -4516,7 +5411,9 @@ def remove_atlas_scope_assets_from_spm(spm_path, manifests):
                 continue
             key = (binding.get("generator_index"), binding.get("slot_prefix"))
             previous = reversible.get(key)
-            if previous is None or (
+            if binding.get("structural_created_interval_cleanup"):
+                reversible[key] = binding
+            elif previous is None or (
                 previous.get("source_material_id") in {None, ""}
                 and binding.get("source_material_id") not in {None, ""}
             ):
@@ -6376,7 +7273,59 @@ def export_speedtree_assets(
         preserve_explicit_material_name=preserve_explicit_material_name,
     )
     if not any(group["objects"] for group in source_groups):
-        raise RuntimeError(f"No mesh objects in collection: {props.collection_name}")
+        export_dir = Path(export_dir)
+        export_scope_id = resolve_export_scope_id(
+            collection,
+            export_dir,
+            texture_path_signature(source_texture_exports),
+        )
+        manifest = {
+            "source_collection": props.collection_name,
+            "export_scope_id": export_scope_id,
+            "blend_file": bpy.data.filepath,
+            "texture_signature": texture_path_signature(source_texture_exports),
+            "requested_atlas_asset_name": str(atlas_asset_name or ""),
+            "atlas_asset_name": blender_material_base_name(
+                collection,
+                atlas_asset_name,
+                preserve_explicit_material_name=preserve_explicit_material_name,
+            ),
+            "speedtree_version_target": "10.1.0",
+            "material": None,
+            "material_groups": [],
+            "single_material_per_mesh": True,
+            "mesh_geometry_scale": max(
+                float(props.speedtree_mesh_scale), 0.000001
+            ),
+            "mesh_asset_scale": max(
+                float(getattr(props, "speedtree_mesh_asset_scale", 1.0)),
+                0.000001,
+            ),
+            "anchor_export_mode": getattr(
+                props, "speedtree_anchor_export_mode", "OFF"
+            ),
+            "anchor_count": 0,
+            "mesh_count": 0,
+            "meshes": [],
+            "removed_stale_mesh_exports": [],
+            "source_textures": source_texture_exports,
+            "textures": {},
+            "texture_contract_status": "collection_tombstone",
+            "canonical_texture_outputs": [],
+            "source_texture_fallbacks": [],
+            "blender_cluster_bake_textures": [],
+            "collection_tombstone": {
+                "state": "empty",
+                "reason": "no_live_mesh_objects",
+            },
+            "notes": [
+                "The Blender source collection is empty; this manifest retires its previous SpeedTree outputs."
+            ],
+        }
+        manifest_path = export_dir / "speedtree_import_manifest.json"
+        _write_json_if_changed(manifest_path, manifest)
+        readme_path = write_speedtree_readme(export_dir, manifest)
+        return manifest_path, readme_path, []
     physical_hashes = {
         str(obj.get("speedtree_cluster_physical_capture_contract_sha256"))
         for group in source_groups
@@ -6563,9 +7512,9 @@ def export_speedtree_assets(
         for group in source_groups:
             if not group["objects"]:
                 continue
-            handoff_name = (
-                "_AtlasLeaf_SpeedTree_Handoff_"
-                + uuid.uuid4().hex[:12]
+            handoff_name = speedtree_handoff_material_name(
+                export_scope_id,
+                group["material"],
             )
             production_maps = production_texture_maps[group["material"]]
             if group["texture_contract_status"] == CANONICAL_TEXTURE_STATUS:
@@ -6794,6 +7743,11 @@ def export_speedtree_assets(
         "export_scope_id": export_scope_id,
         "blend_file": bpy.data.filepath,
         "texture_signature": texture_signature,
+        "source_refresh_receipt": source_refresh_receipt(
+            bpy.data.filepath,
+            texture_signature,
+            production_signature_paths,
+        ),
         "requested_atlas_asset_name": str(atlas_asset_name or ""),
         "atlas_asset_name": blender_material_base_name(
             collection,
@@ -7308,6 +8262,25 @@ def _export_or_update_speedtree_spm_path_impl(
         fallback_manifest,
         target_spm,
     )
+    superseded_manifests, superseded_scope_diagnostics = (
+        superseded_scope_manifests_for_update(target_spm, manifest)
+    )
+    superseded_scope_cleanup = (
+        remove_atlas_scope_assets_from_spm(
+            target_spm,
+            superseded_manifests,
+        )
+        if target_spm.exists() and superseded_manifests
+        else {
+            "changed": False,
+            "restored_generator_slots": [],
+            "restored_generator_scales": [],
+            "restored_adopted_materials": [],
+            "removed_materials": [],
+            "removed_mesh_ids": [],
+            "removed_mesh_files": [],
+        }
+    )
     unit_scale_migration = {
         "mode": "legacy",
         "restored_generator_properties": [],
@@ -7339,17 +8312,25 @@ def _export_or_update_speedtree_spm_path_impl(
                 "mode": "verified_contract_no_legacy_frond_state",
                 "restored_generator_properties": [],
             }
-    material_groups = manifest.get("material_groups") or [
-        {
-            "collection": manifest.get("source_collection", props.collection_name),
-            "material": manifest.get("source_collection", props.collection_name),
-            "meshes": manifest.get("meshes", []),
-        }
-    ]
+    material_groups = manifest.get("material_groups") or (
+        []
+        if manifest.get("collection_tombstone")
+        else [
+            {
+                "collection": manifest.get(
+                    "source_collection", props.collection_name
+                ),
+                "material": manifest.get(
+                    "source_collection", props.collection_name
+                ),
+                "meshes": manifest.get("meshes", []),
+            }
+        ]
+    )
 
     adoption = None
     adoption_migration = None
-    if adopt_source_material:
+    if adopt_source_material and not manifest.get("collection_tombstone"):
         if allow_create:
             raise RuntimeError("Source-material adoption requires an existing target SPM.")
         if len(source_material_names or []) != 1 or len(material_groups) != 1:
@@ -7495,7 +8476,94 @@ def _export_or_update_speedtree_spm_path_impl(
         )
 
     if not group_results:
-        raise RuntimeError("No SpeedTree material groups contained meshes.")
+        if not manifest.get("collection_tombstone"):
+            raise RuntimeError("No SpeedTree material groups contained meshes.")
+        if not target_spm.exists():
+            raise RuntimeError(
+                "An empty Atlas collection can retire only an existing target SPM."
+            )
+        tombstone_cleanup = remove_atlas_scope_assets_from_spm(
+            target_spm,
+            [previous_manifest] if previous_manifest else [],
+        )
+        previous_tombstone = (
+            previous_manifest.get("collection_tombstone")
+            if isinstance(previous_manifest, dict)
+            else None
+        )
+        if previous_tombstone and not tombstone_cleanup["changed"]:
+            tombstone_cleanup = copy.deepcopy(
+                previous_manifest.get("removed_stale_spm_assets")
+                or tombstone_cleanup
+            )
+        previous_tombstone_connection = (
+            previous_manifest.get("generator_connection") or {}
+            if previous_tombstone
+            else {}
+        )
+        manifest["spm"] = str(target_spm)
+        manifest["spm_action"] = "tombstoned"
+        manifest["material_name"] = None
+        manifest["speedtree_material_groups"] = []
+        manifest["material_id"] = None
+        manifest["mesh_ids"] = []
+        manifest["generator_variant_policy"] = generator_variant_policy
+        manifest["generator_connection"] = {
+            "requested": bool(source_material_names),
+            "complete": True,
+            "generator_variant_policy": generator_variant_policy,
+            "source_material_names": list(source_material_names or []),
+            "matched_generators": 0,
+            "changed_slot_pairs": 0,
+            "already_connected_slot_pairs": 0,
+            "created_slot_pairs": 0,
+            "repaired_variant_slot_schemas": [],
+            "applied_source_binding_repairs": [],
+            "retired_deleted_bindings": tombstone_cleanup[
+                "restored_generator_slots"
+            ] or copy.deepcopy(
+                previous_tombstone_connection.get(
+                    "retired_deleted_bindings"
+                )
+                or []
+            ),
+            "bindings": [],
+        }
+        manifest["generator_scale_normalization"] = {
+            "mode": "collection_tombstone",
+            "changed": bool(
+                tombstone_cleanup["restored_generator_scales"]
+            ),
+            "generators": tombstone_cleanup[
+                "restored_generator_scales"
+            ],
+        }
+        manifest["unit_scale_migration"] = unit_scale_migration
+        manifest["source_material_adoption"] = None
+        manifest["removed_stale_spm_assets"] = tombstone_cleanup
+        manifest["superseded_scope_cleanup"] = superseded_scope_cleanup
+        manifest["superseded_scope_diagnostics"] = (
+            superseded_scope_diagnostics
+        )
+        manifest["retired_scope_generations"] = (
+            retire_scope_manifest_records(superseded_manifests, manifest)
+        )
+        manifest["target_manifest"] = str(target_manifest_path(target_spm))
+        _write_json_if_changed(manifest_path, manifest)
+        per_target_manifest_path = target_manifest_path(target_spm)
+        _write_json_if_changed(per_target_manifest_path, manifest)
+        write_scope_manifest(target_spm.parent, manifest, target_spm)
+        write_scope_manifest(target_spm.parent, manifest)
+        return (
+            target_spm,
+            per_target_manifest_path,
+            exported_meshes,
+            "tombstoned",
+            None,
+            [],
+            [],
+            tombstone_cleanup,
+        )
 
     if source_material_names:
         generator_connection = connect_atlas_generators_in_spm(
@@ -7514,6 +8582,7 @@ def _export_or_update_speedtree_spm_path_impl(
             ),
             generator_variant_policy=generator_variant_policy,
             source_binding_repairs=source_binding_repairs,
+            ownership_manifest=previous_manifest,
         )
     else:
         generator_connection = {
@@ -7527,6 +8596,7 @@ def _export_or_update_speedtree_spm_path_impl(
             "created_slot_pairs": 0,
             "repaired_variant_slot_schemas": [],
             "applied_source_binding_repairs": [],
+            "retired_deleted_bindings": [],
             "bindings": [],
         }
     if manifest.get("unit_probe_contract"):
@@ -7591,11 +8661,16 @@ def _export_or_update_speedtree_spm_path_impl(
         manifest["manual_art_direction_adjustment_required"] = True
     manifest["source_material_adoption"] = adoption
     manifest["removed_stale_spm_assets"] = cleanup
+    manifest["superseded_scope_cleanup"] = superseded_scope_cleanup
+    manifest["superseded_scope_diagnostics"] = superseded_scope_diagnostics
+    manifest["retired_scope_generations"] = retire_scope_manifest_records(
+        superseded_manifests,
+        manifest,
+    )
     manifest["target_manifest"] = str(target_manifest_path(target_spm))
-    Path(manifest_path).write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    _write_json_if_changed(manifest_path, manifest)
     per_target_manifest_path = target_manifest_path(target_spm)
-    per_target_manifest_path.parent.mkdir(parents=True, exist_ok=True)
-    per_target_manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    _write_json_if_changed(per_target_manifest_path, manifest)
     write_scope_manifest(target_spm.parent, manifest, target_spm)
     # Keep a scope identity record without a target suffix so copied blends can
     # be detected before any particular target's update begins.
@@ -7662,6 +8737,188 @@ def _external_mesh_filenames(mesh):
         if lod is not None:
             filenames.append(str(lod.findtext("Filename") or "").strip())
     return [filename for filename in filenames if filename]
+
+
+def _spm_receipt_mesh_claims(spm_path):
+    """Return exact ID+asset claims from current and legacy receipts.
+
+    Old SPM generations predate builder ``UserData``.  They are audit-visible
+    only when a sibling receipt proves both the Mesh ID and its resolved asset
+    path.  This is classification evidence, never deletion authority.
+    """
+    spm_path = Path(spm_path).absolute()
+    receipt_paths = sorted(spm_path.parent.glob("speedtree_import_manifest*.json"))
+    scope_dir = spm_path.parent / ".atlas_leaf_speedtree_scopes"
+    if scope_dir.is_dir():
+        receipt_paths.extend(sorted(scope_dir.glob("*.json")))
+    claims = {}
+    target_key = normalized_target_key(spm_path)
+    for receipt_path in receipt_paths:
+        manifest = read_json_file(receipt_path, {})
+        if not isinstance(manifest, dict):
+            continue
+        scope = str(manifest.get("export_scope_id") or "").strip()
+        manifest_spm = str(manifest.get("spm") or "").strip()
+        if scope and manifest_spm and normalized_target_key(manifest_spm) != target_key:
+            continue
+        for group in manifest.get("material_groups") or []:
+            if not isinstance(group, dict):
+                continue
+            mesh_ids = [positive_int(value) for value in group.get("mesh_ids") or []]
+            meshes = [item for item in group.get("meshes") or [] if isinstance(item, dict)]
+            if len(mesh_ids) != len(meshes) or any(value is None for value in mesh_ids):
+                continue
+            claimed_group = str(
+                group.get("collection") or group.get("material") or ""
+            ).strip()
+            for mesh_id, item in zip(mesh_ids, meshes):
+                asset = str(item.get("asset") or item.get("fbx") or "").strip()
+                if not asset:
+                    continue
+                candidate = Path(asset)
+                resolved = (
+                    candidate
+                    if candidate.is_absolute()
+                    else receipt_path.parent / candidate
+                ).absolute()
+                key = (
+                    mesh_id,
+                    os.path.normcase(str(resolved)).casefold(),
+                )
+                claims.setdefault(key, []).append(
+                    {
+                        "scope": scope,
+                        "group": claimed_group if scope else "",
+                        "legacy_group": claimed_group if not scope else "",
+                        "evidence": (
+                            "scope_manifest" if scope else "legacy_shadow_manifest"
+                        ),
+                        "receipt": str(receipt_path),
+                    }
+                )
+    return claims
+
+
+def spm_managed_reference_audit(spm_path):
+    """Report managed external Mesh ownership and Generator usage.
+
+    A managed Mesh can be present and readable while no Generator references
+    it.  Keep that state distinct from a missing file: authoritative Atlas
+    sources may deliberately retain currently-unbound outputs, while old
+    groupless markers need lineage/tombstone evidence before cleanup.
+    """
+    spm_path = Path(spm_path).absolute()
+    root = read_spm_xml(spm_path)
+    assets = root.find("Assets")
+    if assets is None:
+        raise RuntimeError(
+            f"SpeedTree SPM reference audit failed: Assets missing in {spm_path.name}."
+        )
+    referenced_mesh_ids = spm_generator_referenced_mesh_ids(root)
+    receipt_claims = _spm_receipt_mesh_claims(spm_path)
+    rows = []
+    by_scope = {}
+    for mesh in assets.findall("Mesh"):
+        marker = parse_atlas_leaf_spm_user_data(mesh.findtext("UserData"))
+        mesh_id = positive_int(mesh.attrib.get("ID"))
+        filenames = _external_mesh_filenames(mesh)
+        receipt_matches = []
+        for filename in filenames:
+            candidate = Path(filename)
+            resolved = (
+                candidate
+                if candidate.is_absolute()
+                else spm_path.parent / candidate
+            ).absolute()
+            receipt_matches.extend(
+                receipt_claims.get(
+                    (
+                        mesh_id,
+                        os.path.normcase(str(resolved)).casefold(),
+                    ),
+                    [],
+                )
+            )
+        if not marker and not receipt_matches:
+            continue
+        if not marker:
+            receipt_matches.sort(
+                key=lambda item: (bool(item["scope"]), item["receipt"]),
+                reverse=True,
+            )
+            marker = receipt_matches[0]
+        embedded = str(mesh.findtext("Embedded") or "").strip().casefold()
+        missing_filenames = []
+        if embedded not in {"1", "true", "yes"}:
+            if not filenames:
+                missing_filenames.append("<missing Filename>")
+            for filename in filenames:
+                candidate = Path(filename)
+                resolved = (
+                    candidate
+                    if candidate.is_absolute()
+                    else spm_path.parent / candidate
+                ).absolute()
+                if not resolved.is_file():
+                    missing_filenames.append(filename)
+        usage = "active" if mesh_id in referenced_mesh_ids else "managed_orphan"
+        scope = str(marker.get("scope") or "").strip()
+        group = str(marker.get("group") or "").strip()
+        row = {
+            "mesh_id": mesh_id,
+            "name": str(mesh.attrib.get("Name") or ""),
+            "scope": scope,
+            "group": group,
+            "groupless": not bool(group),
+            "ownership_evidence": (
+                "user_data" if mesh.findtext("UserData") else marker.get("evidence")
+            ),
+            "legacy_group": str(marker.get("legacy_group") or ""),
+            "receipt_claims": sorted(
+                {item["receipt"] for item in receipt_matches}
+            ),
+            "usage": usage,
+            "embedded": embedded in {"1", "true", "yes"},
+            "filenames": filenames,
+            "missing_filenames": missing_filenames,
+        }
+        rows.append(row)
+        bucket = by_scope.setdefault(
+            scope,
+            {
+                "scope": scope,
+                "checked": 0,
+                "active": 0,
+                "managed_orphan": 0,
+                "missing": 0,
+                "orphan_missing": 0,
+                "groupless": 0,
+            },
+        )
+        bucket["checked"] += 1
+        bucket[usage] += 1
+        if missing_filenames:
+            bucket["missing"] += 1
+            if usage == "managed_orphan":
+                bucket["orphan_missing"] += 1
+        if not group:
+            bucket["groupless"] += 1
+    rows.sort(key=lambda row: (row["mesh_id"] is None, row["mesh_id"] or 0))
+    return {
+        "spm": str(spm_path),
+        "checked": len(rows),
+        "active": sum(row["usage"] == "active" for row in rows),
+        "managed_orphan": sum(
+            row["usage"] == "managed_orphan" for row in rows
+        ),
+        "missing": sum(bool(row["missing_filenames"]) for row in rows),
+        "orphan_missing": sum(
+            row["usage"] == "managed_orphan" and bool(row["missing_filenames"])
+            for row in rows
+        ),
+        "by_scope": sorted(by_scope.values(), key=lambda row: row["scope"]),
+        "meshes": rows,
+    }
 
 
 def _validate_staged_speedtree_targets(staged_targets, states):
