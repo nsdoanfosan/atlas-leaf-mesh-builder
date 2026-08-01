@@ -1416,6 +1416,34 @@ def _generator_slot_pair(generator, slot_prefix):
     return values[material_name], values[mesh_name]
 
 
+def _generator_slot_pairs(generator):
+    properties = generator.find("Properties")
+    if properties is None:
+        return {}
+    values = {
+        str(prop.findtext("Name") or "").strip(): integer_value(
+            prop.findtext("Value")
+        )
+        for prop in list(properties)
+    }
+    prefixes = {
+        name.rsplit(":", 1)[0]
+        for name in values
+        if name.endswith(":Material") or name.endswith(":Mesh")
+    }
+    return {
+        prefix: (
+            values[f"{prefix}:Material"],
+            values[f"{prefix}:Mesh"],
+        )
+        for prefix in prefixes
+        if (
+            f"{prefix}:Material" in values
+            and f"{prefix}:Mesh" in values
+        )
+    }
+
+
 def resolve_generator_binding(
     root,
     binding,
@@ -1563,11 +1591,52 @@ def resolve_generator_binding(
             f"Generator '{actual_name}' type {actual_type!r} "
             f"(expected {expected_parent!r})."
         )
-    names = _generator_slot_property_names(generator)
-    if slot_prefix and (
-        f"{slot_prefix}:Material" not in names
-        or f"{slot_prefix}:Mesh" not in names
+    resolved_slot_prefix = slot_prefix
+    slot_pairs = _generator_slot_pairs(generator)
+    expected_target_pair = (
+        integer_value(binding.get("target_material_id")),
+        integer_value(binding.get("target_mesh_id")),
+    )
+    expected_source_pair = (
+        integer_value(binding.get("source_material_id")),
+        integer_value(binding.get("source_mesh_id")),
+    )
+    expected_pair = next(
+        (
+            pair
+            for pair in (expected_target_pair, expected_source_pair)
+            if None not in pair
+        ),
+        None,
+    )
+    if (
+        slot_prefix
+        and binding.get("created_slot")
+        and expected_pair is not None
     ):
+        if slot_pairs.get(slot_prefix) != expected_pair:
+            pair_matches = [
+                prefix
+                for prefix, pair in slot_pairs.items()
+                if pair == expected_pair
+            ]
+            if len(pair_matches) == 1:
+                resolved_slot_prefix = pair_matches[0]
+                resolution = f"{resolution}_unique_slot_pair"
+            elif len(pair_matches) == 0 and allow_missing:
+                # A normalized Cluster rewrite can contract a generated tail,
+                # shifting each surviving pair to a lower slot.  Absence of
+                # this exact persisted pair is an idempotent tombstone; never
+                # attach its provenance to whichever pair reused the index.
+                return None
+            else:
+                raise RuntimeError(
+                    f"{context} resolved Generator '{actual_name}', but "
+                    f"recorded slot {slot_prefix!r} no longer contains exact "
+                    f"pair {expected_pair}; found {len(pair_matches)} matching "
+                    "slots in that Generator."
+                )
+    elif slot_prefix and slot_prefix not in slot_pairs:
         if allow_missing:
             # The Generator can survive a normalized Cluster rewrite while a
             # previously Atlas-managed tail slot is removed.  Treat that
@@ -1584,6 +1653,7 @@ def resolve_generator_binding(
         "generator_name": actual_name,
         "generator_guid": generator_guid(generator),
         "generator_type": actual_type,
+        "slot_prefix": resolved_slot_prefix,
         "resolution": resolution,
     }
 
@@ -1614,6 +1684,32 @@ def normalize_generator_bindings(
         row["generator_type"] = identity["generator_type"]
         if identity["generator_guid"]:
             row["generator_guid"] = identity["generator_guid"]
+        old_slot_prefix = str(row.get("slot_prefix") or "").strip()
+        new_slot_prefix = str(identity.get("slot_prefix") or "").strip()
+        if new_slot_prefix and new_slot_prefix != old_slot_prefix:
+            row["slot_prefix"] = new_slot_prefix
+            for key in (
+                "created_material_property",
+                "created_mesh_property",
+            ):
+                property_name = str(row.get(key) or "")
+                if property_name.startswith(f"{old_slot_prefix}:"):
+                    row[key] = (
+                        new_slot_prefix + property_name[len(old_slot_prefix):]
+                    )
+            created_property_names = row.get("created_property_names")
+            if isinstance(created_property_names, list):
+                row["created_property_names"] = [
+                    (
+                        new_slot_prefix + name[len(old_slot_prefix):]
+                        if (
+                            isinstance(name, str)
+                            and name.startswith(f"{old_slot_prefix}:")
+                        )
+                        else name
+                    )
+                    for name in created_property_names
+                ]
         normalized.append(row)
     return normalized
 
@@ -2006,27 +2102,47 @@ def repair_created_generator_variant_slots(root, bindings):
             )
         generator = generators[generator_index]
         state = generator_variant_parent_state(generator, parent_name)
-        if state["child_count"] < after_count:
-            raise RuntimeError(
-                f"Cannot repair created Generator variants on "
-                f"'{generator.findtext('Name') or ''}': {parent_name} has "
-                f"{state['child_count']} children, expected at least "
-                f"{after_count}."
-            )
-        expected_prefixes = {
-            f"{parent_name}:{index}"
-            for index in range(before_count, after_count)
+        recorded_indices = {
+            int(slot_prefix.rsplit(":", 1)[1])
+            for slot_prefix in records_by_slot
+            if slot_prefix.startswith(f"{parent_name}:")
+            and slot_prefix.rsplit(":", 1)[1].isdigit()
         }
-        if set(records_by_slot) != expected_prefixes:
+        if len(recorded_indices) != len(records_by_slot):
             raise RuntimeError(
-                "Cannot repair created Generator variants: recorded tail slots "
-                "are incomplete."
+                "Cannot repair created Generator variants: recorded slot "
+                "prefixes do not match their parent."
+            )
+        effective_after_count = after_count
+        rebased_contracted_interval = False
+        if state["child_count"] < after_count:
+            surviving_tail = set(
+                range(before_count, state["child_count"])
+            )
+            if not surviving_tail or recorded_indices != surviving_tail:
+                raise RuntimeError(
+                    f"Cannot repair created Generator variants on "
+                    f"'{generator.findtext('Name') or ''}': {parent_name} "
+                    f"contracted from {after_count} to "
+                    f"{state['child_count']} children without an exact "
+                    "surviving Atlas-created tail interval; recorded indices "
+                    f"are {sorted(recorded_indices)}, expected "
+                    f"{sorted(surviving_tail)}."
+                )
+            effective_after_count = state["child_count"]
+            rebased_contracted_interval = True
+        elif not recorded_indices.issubset(
+            set(range(before_count, after_count))
+        ):
+            raise RuntimeError(
+                "Cannot repair created Generator variants: recorded slots are "
+                "outside their created tail interval."
             )
         template_nodes = state["slot_nodes"][before_count - 1]
         template_suffixes = [item["suffix"] for item in template_nodes]
         properties = state["properties"]
         added_names = []
-        for slot_index in range(before_count, after_count):
+        for slot_index in sorted(recorded_indices):
             slot_prefix = f"{parent_name}:{slot_index}"
             binding = records_by_slot[slot_prefix]
             current_pair = (
@@ -2073,10 +2189,10 @@ def repair_created_generator_variant_slots(root, bindings):
         reordered = reorder_generator_variant_owned_slots(
             generator,
             parent_name,
-            range(before_count - 1, after_count),
+            [before_count - 1, *sorted(recorded_indices)],
             reference_index=before_count - 1,
         )
-        for slot_index in range(before_count, after_count):
+        for slot_index in sorted(recorded_indices):
             slot_prefix = f"{parent_name}:{slot_index}"
             repairs.append(
                 {
@@ -2085,6 +2201,11 @@ def repair_created_generator_variant_slots(root, bindings):
                     "generator_guid": generator_guid(generator),
                     "generator_type": generator_type_name(generator),
                     "slot_prefix": slot_prefix,
+                    "variant_parent_children_before": before_count,
+                    "variant_parent_children_after": effective_after_count,
+                    "rebased_contracted_interval": (
+                        rebased_contracted_interval
+                    ),
                     "created_property_names": [
                         item["name"]
                         for item in state["slot_nodes"][slot_index]
@@ -2164,17 +2285,29 @@ def remove_created_generator_variant_slots(root, bindings):
             )
         generator = generators[generator_index]
         state = generator_variant_parent_state(generator, parent_name)
+        effective_after_count = after_count
+        rebased_contracted_interval = False
         if state["child_count"] < after_count:
-            raise RuntimeError(
-                f"Cannot remove created Generator variants from "
-                f"'{generator.findtext('Name') or ''}': {parent_name} has "
-                f"{state['child_count']} children, expected at least "
-                f"{after_count}."
-            )
-        has_later_scope_slots = state["child_count"] > after_count
+            surviving_prefixes = {
+                f"{parent_name}:{index}"
+                for index in range(before_count, state["child_count"])
+            }
+            if not surviving_prefixes or set(records_by_slot) != surviving_prefixes:
+                raise RuntimeError(
+                    f"Cannot remove created Generator variants from "
+                    f"'{generator.findtext('Name') or ''}': {parent_name} "
+                    f"contracted from {after_count} to "
+                    f"{state['child_count']} children without an exact "
+                    "surviving Atlas-created tail interval; recorded slots "
+                    f"are {sorted(records_by_slot)}, expected "
+                    f"{sorted(surviving_prefixes)}."
+                )
+            effective_after_count = state["child_count"]
+            rebased_contracted_interval = True
+        has_later_scope_slots = state["child_count"] > effective_after_count
         expected_prefixes = {
             f"{parent_name}:{index}"
-            for index in range(before_count, after_count)
+            for index in range(before_count, effective_after_count)
         }
         if set(records_by_slot) != expected_prefixes:
             raise RuntimeError(
@@ -2255,6 +2388,9 @@ def remove_created_generator_variant_slots(root, bindings):
                         "slot_prefix": slot_prefix,
                         "material_id": source_pair[0],
                         "mesh_id": source_pair[1],
+                        "rebased_contracted_interval": (
+                            rebased_contracted_interval
+                        ),
                         "mode": (
                             "restored_created_variant_slot_"
                             "preserving_later_scope_interval"
@@ -2275,6 +2411,9 @@ def remove_created_generator_variant_slots(root, bindings):
                         binding.get("source_material_id")
                     ),
                     "mesh_id": integer_value(binding.get("source_mesh_id")),
+                    "rebased_contracted_interval": (
+                        rebased_contracted_interval
+                    ),
                     "mode": "removed_created_variant_slot",
                 }
             )
@@ -2523,16 +2662,9 @@ def retire_deleted_generator_bindings(
                 leaf_ordinal = 1
             elif source_mesh_id in source_mesh_ids:
                 leaf_ordinal = source_mesh_ids.index(source_mesh_id) + 1
-        return bool(
-            None not in target_pair
-            and (
-                target_pair in active_pairs
-                or (
-                    leaf_ordinal is not None
-                    and leaf_ordinal in output_bindings
-                )
-            )
-        )
+        if leaf_ordinal is not None:
+            return leaf_ordinal in output_bindings
+        return None not in target_pair and target_pair in active_pairs
 
     created_groups = {}
     for binding in normalized:
@@ -2598,6 +2730,11 @@ def retire_deleted_generator_bindings(
     pairs = {
         (pair["generator_index"], pair["slot_prefix"]): pair
         for pair in spm_generator_property_pairs(root, {"Leaf Mesh", "Frond"})
+    }
+    active_binding_keys = {
+        (binding.get("generator_index"), binding.get("slot_prefix"))
+        for binding in normalized
+        if binding_still_has_output(binding)
     }
 
     for binding in normalized:
@@ -2763,7 +2900,7 @@ def retire_deleted_generator_bindings(
                 owned_mesh_ids.add(mesh_id)
 
         for key, pair in pairs.items():
-            if key in retired_keys:
+            if key in retired_keys or key in active_binding_keys:
                 continue
             mesh_property = pair.get("mesh_property")
             if mesh_property is None:
@@ -3227,19 +3364,21 @@ def connect_atlas_generators_in_spm(
                 else None
             )
             ordinal = None
-            target = generated_pair_to_binding.get((material_id, mesh_id))
-            if target is not None:
-                ordinal = target["leaf_ordinal"]
+            previous_retarget = previous_generated_binding_retarget(
+                pair,
+                previous_by_slot,
+                source_records,
+                output_bindings,
+                variant_policy,
+            )
+            if previous_retarget is not None:
+                ordinal = previous_retarget["leaf_ordinal"]
             else:
-                previous_retarget = previous_generated_binding_retarget(
-                    pair,
-                    previous_by_slot,
-                    source_records,
-                    output_bindings,
-                    variant_policy,
+                target = generated_pair_to_binding.get(
+                    (material_id, mesh_id)
                 )
-                if previous_retarget is not None:
-                    ordinal = previous_retarget["leaf_ordinal"]
+                if target is not None:
+                    ordinal = target["leaf_ordinal"]
             if ordinal is None:
                 if material_id == source_material_id:
                     if mesh_property is None:
@@ -3380,10 +3519,6 @@ def connect_atlas_generators_in_spm(
         previous = previous_by_slot.get(
             (pair["generator_index"], pair["slot_prefix"])
         )
-        target = generated_pair_to_binding.get((material_id, mesh_id))
-        if target is not None:
-            already.append((pair, target))
-            continue
         previous_retarget = previous_generated_binding_retarget(
             pair,
             previous_by_slot,
@@ -3392,14 +3527,25 @@ def connect_atlas_generators_in_spm(
             variant_policy,
         )
         if previous_retarget is not None:
-            staged.append((
-                pair,
-                previous_retarget["source"],
-                previous_retarget["source_mesh_id"],
-                previous_retarget["target"],
-                previous_retarget["sentinel_policy"],
-                previous_retarget["previous"],
-            ))
+            previous_target = previous_retarget["target"]
+            if (
+                previous_target["target_material_id"],
+                previous_target["target_mesh_id"],
+            ) == (material_id, mesh_id):
+                already.append((pair, previous_target))
+            else:
+                staged.append((
+                    pair,
+                    previous_retarget["source"],
+                    previous_retarget["source_mesh_id"],
+                    previous_target,
+                    previous_retarget["sentinel_policy"],
+                    previous_retarget["previous"],
+                ))
+            continue
+        target = generated_pair_to_binding.get((material_id, mesh_id))
+        if target is not None:
+            already.append((pair, target))
             continue
         created = created_by_slot.get(
             (pair["generator_index"], pair["slot_prefix"])
@@ -3530,12 +3676,6 @@ def connect_atlas_generators_in_spm(
             for field in provenance_fields:
                 if field in previous:
                     binding[field] = previous[field]
-            parent_key = (
-                pair["generator_index"],
-                str(binding.get("variant_parent_property") or ""),
-            )
-            if parent_key in expanded_parent_provenance:
-                binding.update(expanded_parent_provenance[parent_key])
             repair = repair_by_slot.get(
                 (pair["generator_index"], pair["slot_prefix"])
             )
@@ -3543,6 +3683,18 @@ def connect_atlas_generators_in_spm(
                 binding["created_property_names"] = repair[
                     "created_property_names"
                 ]
+                binding["variant_parent_children_before"] = repair[
+                    "variant_parent_children_before"
+                ]
+                binding["variant_parent_children_after"] = repair[
+                    "variant_parent_children_after"
+                ]
+            parent_key = (
+                pair["generator_index"],
+                str(binding.get("variant_parent_property") or ""),
+            )
+            if parent_key in expanded_parent_provenance:
+                binding.update(expanded_parent_provenance[parent_key])
         bindings.append(binding)
     for pair, target in already:
         previous = previous_by_slot.get(
@@ -3584,12 +3736,6 @@ def connect_atlas_generators_in_spm(
             for field in provenance_fields:
                 if field in previous:
                     binding[field] = previous[field]
-            parent_key = (
-                pair["generator_index"],
-                str(binding.get("variant_parent_property") or ""),
-            )
-            if parent_key in expanded_parent_provenance:
-                binding.update(expanded_parent_provenance[parent_key])
             repair = repair_by_slot.get(
                 (pair["generator_index"], pair["slot_prefix"])
             )
@@ -3597,6 +3743,18 @@ def connect_atlas_generators_in_spm(
                 binding["created_property_names"] = repair[
                     "created_property_names"
                 ]
+                binding["variant_parent_children_before"] = repair[
+                    "variant_parent_children_before"
+                ]
+                binding["variant_parent_children_after"] = repair[
+                    "variant_parent_children_after"
+                ]
+            parent_key = (
+                pair["generator_index"],
+                str(binding.get("variant_parent_property") or ""),
+            )
+            if parent_key in expanded_parent_provenance:
+                binding.update(expanded_parent_provenance[parent_key])
         bindings.append(binding)
 
     if deleted_retirement["retired_bindings"] or staged or applied_source_binding_repairs or any(
@@ -4923,6 +5081,144 @@ def restore_adopted_source_nodes(assets, adoptions):
     return restored
 
 
+def created_interval_scope_cleanup_bindings(
+    root,
+    bindings,
+    owned_material_ids,
+    owned_mesh_ids,
+    *,
+    context="Atlas scope cleanup created interval",
+):
+    """Resolve a complete created interval by structure for scope retirement.
+
+    A later Cluster normalization can move this scope's target pairs between
+    slots in the same Generator. Pair-based normalization then deliberately
+    tombstones the missing pair, but complete creation provenance still proves
+    ownership of the slot structure. Structural cleanup is safe only while
+    every surviving slot in that complete interval still references an asset
+    owned by the retiring scope.
+    """
+    if not owned_material_ids and not owned_mesh_ids:
+        return []
+
+    groups = {}
+    for ordinal, binding in enumerate(bindings or []):
+        if not isinstance(binding, dict) or not binding.get("created_slot"):
+            continue
+        parent_name = str(binding.get("variant_parent_property") or "")
+        before_count = integer_value(
+            binding.get("variant_parent_children_before")
+        )
+        after_count = integer_value(
+            binding.get("variant_parent_children_after")
+        )
+        slot_prefix = str(binding.get("slot_prefix") or "")
+        material_property = str(
+            binding.get("created_material_property") or ""
+        )
+        mesh_property = str(binding.get("created_mesh_property") or "")
+        if (
+            not parent_name
+            or before_count is None
+            or before_count <= 0
+            or after_count is None
+            or after_count <= before_count
+            or not slot_prefix
+            or not material_property
+            or not mesh_property
+        ):
+            raise RuntimeError(
+                "Created Generator variant provenance is incomplete."
+            )
+        probe = copy.deepcopy(binding)
+        probe["created_slot"] = False
+        probe["slot_prefix"] = ""
+        identity = resolve_generator_binding(
+            root,
+            probe,
+            context=f"{context} #{ordinal + 1}",
+            allow_missing=True,
+        )
+        if identity is None:
+            continue
+        row = copy.deepcopy(binding)
+        row["generator_index"] = identity["generator_index"]
+        row["generator_name"] = identity["generator_name"]
+        row["generator_type"] = identity["generator_type"]
+        if identity["generator_guid"]:
+            row["generator_guid"] = identity["generator_guid"]
+        key = (
+            identity["generator_index"],
+            parent_name,
+            before_count,
+            after_count,
+        )
+        records = groups.setdefault(key, {})
+        previous = records.get(slot_prefix)
+        if previous is not None and previous != row:
+            raise RuntimeError(
+                "Created Generator variant provenance conflicts for one slot."
+            )
+        records[slot_prefix] = row
+
+    generators = list(root.iter("Generator"))
+    resolved = []
+    for (
+        generator_index,
+        parent_name,
+        before_count,
+        after_count,
+    ), records_by_slot in sorted(groups.items()):
+        expected_recorded = {
+            f"{parent_name}:{index}"
+            for index in range(before_count, after_count)
+        }
+        if set(records_by_slot) != expected_recorded:
+            raise RuntimeError(
+                "Cannot structurally retire Atlas-created Generator variants: "
+                "the recorded creation interval is incomplete."
+            )
+        generator = generators[generator_index]
+        state = generator_variant_parent_state(generator, parent_name)
+        if state["child_count"] < before_count:
+            raise RuntimeError(
+                "Cannot structurally retire Atlas-created Generator variants: "
+                "the Generator contracted below its authored child count."
+            )
+        effective_after_count = min(after_count, state["child_count"])
+        for slot_index in range(before_count, effective_after_count):
+            slot_prefix = f"{parent_name}:{slot_index}"
+            binding = copy.deepcopy(records_by_slot[slot_prefix])
+            slot = state["slots"][slot_index]
+            material_id = positive_int(slot["material"].findtext("Value"))
+            mesh_id = positive_int(slot["mesh"].findtext("Value"))
+            if (
+                material_id not in owned_material_ids
+                and mesh_id not in owned_mesh_ids
+            ):
+                raise RuntimeError(
+                    f"Cannot structurally retire Atlas-created Generator slot "
+                    f"'{slot_prefix}': current pair "
+                    f"{(material_id, mesh_id)} is outside the retiring scope."
+                )
+            if material_id is None or mesh_id is None:
+                raise RuntimeError(
+                    f"Cannot structurally retire Atlas-created Generator slot "
+                    f"'{slot_prefix}': its owned target pair is incomplete."
+                )
+            binding["recorded_target_material_id"] = binding.get(
+                "target_material_id"
+            )
+            binding["recorded_target_mesh_id"] = binding.get(
+                "target_mesh_id"
+            )
+            binding["target_material_id"] = material_id
+            binding["target_mesh_id"] = mesh_id
+            binding["structural_created_interval_cleanup"] = True
+            resolved.append(binding)
+    return resolved
+
+
 def remove_atlas_scope_assets_from_spm(spm_path, manifests):
     """Restore Generator slots and remove only assets proven to belong to scopes."""
     spm_path = Path(spm_path).expanduser().absolute()
@@ -4994,15 +5290,46 @@ def remove_atlas_scope_assets_from_spm(spm_path, manifests):
     reversible = {}
     for manifest_index, manifest in enumerate(manifests):
         connection = manifest.get("generator_connection") or {}
+        raw_bindings = connection.get("bindings") or []
         normalized_bindings = normalize_generator_bindings(
             root,
-            connection.get("bindings") or [],
+            raw_bindings,
             context=(
                 f"Atlas scope removal manifest #{manifest_index + 1} binding"
             ),
             allow_missing=True,
         )
-        for binding in normalized_bindings:
+        structural_created_bindings = (
+            created_interval_scope_cleanup_bindings(
+                root,
+                raw_bindings,
+                owned_material_ids,
+                owned_mesh_ids,
+                context=(
+                    "Atlas scope removal manifest "
+                    f"#{manifest_index + 1} created interval"
+                ),
+            )
+        )
+        structural_by_key = {
+            (binding.get("generator_index"), binding.get("slot_prefix")): (
+                binding
+            )
+            for binding in structural_created_bindings
+        }
+        cleanup_bindings = [
+            binding
+            for binding in normalized_bindings
+            if not (
+                binding.get("created_slot")
+                and (
+                    binding.get("generator_index"),
+                    binding.get("slot_prefix"),
+                ) in structural_by_key
+            )
+        ]
+        cleanup_bindings.extend(structural_created_bindings)
+        for binding in cleanup_bindings:
             if not isinstance(binding, dict):
                 continue
             target_material_id = positive_int(binding.get("target_material_id"))
@@ -5014,7 +5341,9 @@ def remove_atlas_scope_assets_from_spm(spm_path, manifests):
                 continue
             key = (binding.get("generator_index"), binding.get("slot_prefix"))
             previous = reversible.get(key)
-            if previous is None or (
+            if binding.get("structural_created_interval_cleanup"):
+                reversible[key] = binding
+            elif previous is None or (
                 previous.get("source_material_id") in {None, ""}
                 and binding.get("source_material_id") not in {None, ""}
             ):
@@ -7919,7 +8248,7 @@ def _export_or_update_speedtree_spm_path_impl(
 
     adoption = None
     adoption_migration = None
-    if adopt_source_material:
+    if adopt_source_material and not manifest.get("collection_tombstone"):
         if allow_create:
             raise RuntimeError("Source-material adoption requires an existing target SPM.")
         if len(source_material_names or []) != 1 or len(material_groups) != 1:
