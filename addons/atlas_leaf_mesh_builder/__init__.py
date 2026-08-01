@@ -18,6 +18,7 @@ from bpy.app.handlers import persistent
 _SUBMODULE_NAMES = (
     "constants",
     "utils",
+    "generator_delivery_scope",
     "texture_paths",
     "target_registry",
     "props",

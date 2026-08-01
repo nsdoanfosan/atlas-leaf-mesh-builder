@@ -135,6 +135,7 @@ def configure_external_plan_target(
     generator_variant_policy=None,
     unit_probe_contract=None,
     connect_generators=True,
+    generator_delivery_scope_intent=None,
 ):
     """Configure Atlas' existing public scene contract for an external plan collection.
 
@@ -152,6 +153,15 @@ def configure_external_plan_target(
         raise ValueError("Source SpeedTree material name cannot be empty.")
     adopt_source_material = bool(adopt_source_material)
     connect_generators = bool(connect_generators)
+    if (
+        generator_delivery_scope_intent is not None
+        and not isinstance(generator_delivery_scope_intent, dict)
+    ):
+        raise ValueError("Generator delivery scope intent must be a JSON object.")
+    if generator_delivery_scope_intent is not None and not connect_generators:
+        raise ValueError(
+            "Generator delivery scope intent requires Generator connection."
+        )
     if (
         connect_generators
         and generated_material_name == source_material_name
@@ -264,6 +274,10 @@ def configure_external_plan_target(
                 request["source_material_ids"] = [int(source_material_id)]
             if adopt_source_material:
                 request["adopt_source_material"] = True
+            if generator_delivery_scope_intent is not None:
+                request["generator_delivery_scope_intent"] = (
+                    generator_delivery_scope_intent
+                )
             mapping[str(target)] = request
         props.speedtree_source_materials_json = json.dumps(mapping, ensure_ascii=False)
         save_spm_target_registry(props)
@@ -295,6 +309,9 @@ def configure_external_plan_target(
         "adopt_source_material": adopt_source_material,
         "connect_generators": connect_generators,
         "generator_variant_policy": generator_variant_policy,
+        "generator_delivery_scope_intent": (
+            generator_delivery_scope_intent
+        ),
         "export_scope_id": export_scope_id,
         "build_operator": "atlas_leaf.build_speedtree_spm",
     }

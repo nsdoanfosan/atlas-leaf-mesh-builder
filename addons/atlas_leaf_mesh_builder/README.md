@@ -122,6 +122,24 @@ Removing a listed target is transactional. The add-on first writes an `_spm_back
 
 `Generator Source Mapping` is a JSON object keyed by absolute target SPM path. Each value is a list of exact source `Material_v8` names (or an object with `source_material_names` and optional same-order `source_material_ids`). After asset upsert, matching `Leaf Mesh`/`LeafMesh` and `Frond` Generator `:Material`/`:Mesh` slot pairs are replaced together. An exported mesh can provide an explicit `source_ordinal`; otherwise the `leaf_NN` suffix is used. SpeedTree's `Mesh=-10` sentinel maps deterministically to ordinal 1. The optional per-target `generator_variant_policy` accepts `preserve_existing_slots` (default) or `ensure_all_material_cutouts`. The opt-in policy checks coverage across all matching Generators, preserves authored duplicate/weight slots, and creates only missing tail slots on an existing `Leaves:Type` or `Material:Frond` multi-property parent; creation provenance is stored for idempotent rebuild and exact target removal. Setting `adopt_source_material` replaces the source material's cutout list in place while preserving its other authored fields: the original material and embedded meshes are stored in the managed manifest, Generator slots move before the now-unreferenced embedded meshes are removed, and target removal restores the captured source state. The target SPM is restored byte-for-byte if any group or connection validation fails.
 
+An orchestration caller can add `generator_delivery_scope_intent` to one
+per-target mapping row. The version-1 intent seals `authority`, exact target
+SPM/provider blend/provider scope/material identity, canonical `authored_slots`,
+the exact `required_live_slot_identities` subset, its complete
+`continuity_only_slots` complement, `runtime_inactive_policy`, and
+`intent_sha256`. Atlas validates this intent against a deterministic canonical
+slot plan before the first target SPM write. After all SPM mutations, every
+planned slot must resolve to the exact declared Material/Mesh pair. The final
+manifest receipt is stored at
+`generator_connection.delivery_scope.{intent,resolved}`; `resolved` echoes the
+intent hash and seals the canonical binding hash plus
+`target_spm_postwrite_sha256` over the decompressed SPM UTF-8 text. Any partial,
+tampered, foreign, stale, or non-exact explicit scope fails closed and uses the
+existing byte rollback. A manifest without `delivery_scope` remains legacy and
+therefore means authored equals required-live. Neither Atlas nor its consumers
+derive intent from Generator visibility, Node counts, export participation, or
+live survivors.
+
 Persisted Generator bindings use the Generator `GUID` as their stable identity.
 `generator_index` is current-run diagnostic data only because SpeedTree may reorder
 Generators when an SPM is regenerated. A legacy binding without `generator_guid`
