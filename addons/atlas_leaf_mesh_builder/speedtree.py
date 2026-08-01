@@ -8739,6 +8739,66 @@ def _external_mesh_filenames(mesh):
     return [filename for filename in filenames if filename]
 
 
+def _spm_receipt_mesh_claims(spm_path):
+    """Return exact ID+asset claims from current and legacy receipts.
+
+    Old SPM generations predate builder ``UserData``.  They are audit-visible
+    only when a sibling receipt proves both the Mesh ID and its resolved asset
+    path.  This is classification evidence, never deletion authority.
+    """
+    spm_path = Path(spm_path).absolute()
+    receipt_paths = sorted(spm_path.parent.glob("speedtree_import_manifest*.json"))
+    scope_dir = spm_path.parent / ".atlas_leaf_speedtree_scopes"
+    if scope_dir.is_dir():
+        receipt_paths.extend(sorted(scope_dir.glob("*.json")))
+    claims = {}
+    target_key = normalized_target_key(spm_path)
+    for receipt_path in receipt_paths:
+        manifest = read_json_file(receipt_path, {})
+        if not isinstance(manifest, dict):
+            continue
+        scope = str(manifest.get("export_scope_id") or "").strip()
+        manifest_spm = str(manifest.get("spm") or "").strip()
+        if scope and manifest_spm and normalized_target_key(manifest_spm) != target_key:
+            continue
+        for group in manifest.get("material_groups") or []:
+            if not isinstance(group, dict):
+                continue
+            mesh_ids = [positive_int(value) for value in group.get("mesh_ids") or []]
+            meshes = [item for item in group.get("meshes") or [] if isinstance(item, dict)]
+            if len(mesh_ids) != len(meshes) or any(value is None for value in mesh_ids):
+                continue
+            claimed_group = str(
+                group.get("collection") or group.get("material") or ""
+            ).strip()
+            for mesh_id, item in zip(mesh_ids, meshes):
+                asset = str(item.get("asset") or item.get("fbx") or "").strip()
+                if not asset:
+                    continue
+                candidate = Path(asset)
+                resolved = (
+                    candidate
+                    if candidate.is_absolute()
+                    else receipt_path.parent / candidate
+                ).absolute()
+                key = (
+                    mesh_id,
+                    os.path.normcase(str(resolved)).casefold(),
+                )
+                claims.setdefault(key, []).append(
+                    {
+                        "scope": scope,
+                        "group": claimed_group if scope else "",
+                        "legacy_group": claimed_group if not scope else "",
+                        "evidence": (
+                            "scope_manifest" if scope else "legacy_shadow_manifest"
+                        ),
+                        "receipt": str(receipt_path),
+                    }
+                )
+    return claims
+
+
 def spm_managed_reference_audit(spm_path):
     """Report managed external Mesh ownership and Generator usage.
 
@@ -8755,14 +8815,38 @@ def spm_managed_reference_audit(spm_path):
             f"SpeedTree SPM reference audit failed: Assets missing in {spm_path.name}."
         )
     referenced_mesh_ids = spm_generator_referenced_mesh_ids(root)
+    receipt_claims = _spm_receipt_mesh_claims(spm_path)
     rows = []
     by_scope = {}
     for mesh in assets.findall("Mesh"):
         marker = parse_atlas_leaf_spm_user_data(mesh.findtext("UserData"))
-        if not marker:
-            continue
         mesh_id = positive_int(mesh.attrib.get("ID"))
         filenames = _external_mesh_filenames(mesh)
+        receipt_matches = []
+        for filename in filenames:
+            candidate = Path(filename)
+            resolved = (
+                candidate
+                if candidate.is_absolute()
+                else spm_path.parent / candidate
+            ).absolute()
+            receipt_matches.extend(
+                receipt_claims.get(
+                    (
+                        mesh_id,
+                        os.path.normcase(str(resolved)).casefold(),
+                    ),
+                    [],
+                )
+            )
+        if not marker and not receipt_matches:
+            continue
+        if not marker:
+            receipt_matches.sort(
+                key=lambda item: (bool(item["scope"]), item["receipt"]),
+                reverse=True,
+            )
+            marker = receipt_matches[0]
         embedded = str(mesh.findtext("Embedded") or "").strip().casefold()
         missing_filenames = []
         if embedded not in {"1", "true", "yes"}:
@@ -8786,6 +8870,13 @@ def spm_managed_reference_audit(spm_path):
             "scope": scope,
             "group": group,
             "groupless": not bool(group),
+            "ownership_evidence": (
+                "user_data" if mesh.findtext("UserData") else marker.get("evidence")
+            ),
+            "legacy_group": str(marker.get("legacy_group") or ""),
+            "receipt_claims": sorted(
+                {item["receipt"] for item in receipt_matches}
+            ),
             "usage": usage,
             "embedded": embedded in {"1", "true", "yes"},
             "filenames": filenames,

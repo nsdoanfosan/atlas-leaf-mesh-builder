@@ -557,6 +557,67 @@ class ManagedReferenceAuditTests(unittest.TestCase):
                 ["<missing Filename>"],
             )
 
+    def test_audit_recovers_untagged_legacy_and_scoped_receipt_claims(self):
+        with tempfile.TemporaryDirectory() as folder:
+            folder = Path(folder)
+            target = folder / "SK_tree_01.spm"
+            mesh_dir = folder / "meshes"
+            mesh_dir.mkdir()
+            root = ET.Element("SpeedTreeModel")
+            assets = ET.SubElement(root, "Assets")
+            for mesh_id in (7, 51, 106, 200):
+                (mesh_dir / f"{mesh_id}.fbx").write_bytes(str(mesh_id).encode())
+                add_mesh(assets, mesh_id)
+            add_generator(root, "Leaf Mesh", "Leaf", [(8, 106)])
+            write_spm(target, root)
+
+            legacy = {
+                "spm": str(folder / "SK_tree_03.spm"),
+                "material_groups": [{
+                    "collection": "Legacy_Leaves",
+                    "mesh_ids": [7, 51],
+                    "meshes": [
+                        {"asset": str(mesh_dir / "7.fbx")},
+                        {"asset": str(mesh_dir / "51.fbx")},
+                    ],
+                }],
+            }
+            (folder / "speedtree_import_manifest_M_leaf.json").write_text(
+                json.dumps(legacy), encoding="utf-8"
+            )
+            scope_dir = folder / ".atlas_leaf_speedtree_scopes"
+            scope_dir.mkdir()
+            scoped = {
+                "export_scope_id": "scope-current",
+                "spm": str(target),
+                "material_groups": [{
+                    "collection": "Current_Cards",
+                    "mesh_ids": [51, 106],
+                    "meshes": [
+                        {"asset": str(mesh_dir / "51.fbx")},
+                        {"asset": str(mesh_dir / "106.fbx")},
+                    ],
+                }],
+            }
+            (scope_dir / "scope-current__SK_tree_01.json").write_text(
+                json.dumps(scoped), encoding="utf-8"
+            )
+
+            audit = speedtree.spm_managed_reference_audit(target)
+            rows = {row["mesh_id"]: row for row in audit["meshes"]}
+
+            self.assertEqual(audit["checked"], 3)
+            self.assertEqual(audit["active"], 1)
+            self.assertEqual(audit["managed_orphan"], 2)
+            self.assertEqual(rows[7]["ownership_evidence"], "legacy_shadow_manifest")
+            self.assertTrue(rows[7]["groupless"])
+            self.assertEqual(rows[7]["legacy_group"], "Legacy_Leaves")
+            self.assertEqual(rows[51]["ownership_evidence"], "scope_manifest")
+            self.assertEqual(rows[51]["scope"], "scope-current")
+            self.assertFalse(rows[51]["groupless"])
+            self.assertEqual(rows[106]["usage"], "active")
+            self.assertNotIn(200, rows)
+
 
 class FrondGeneratorGeometryScaleTests(unittest.TestCase):
     def setUp(self):
