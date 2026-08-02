@@ -46,9 +46,16 @@ if ($InstallDependencies) {
 
 $previousDontWriteBytecode = $env:PYTHONDONTWRITEBYTECODE
 $previousPycachePrefix = $env:PYTHONPYCACHEPREFIX
-$bytecodeRoot = Join-Path -Path ([System.IO.Path]::GetTempPath()) -ChildPath (
+$previousTemp = $env:TEMP
+$previousTmp = $env:TMP
+$tempParent = $env:RUNNER_TEMP
+if ([string]::IsNullOrWhiteSpace($tempParent)) {
+    $tempParent = [System.IO.Path]::GetTempPath()
+}
+$ciTempRoot = Join-Path -Path $tempParent -ChildPath (
     'atlas-producer-ci-' + [System.Guid]::NewGuid().ToString('N')
 )
+$bytecodeRoot = Join-Path -Path $ciTempRoot -ChildPath 'pycache'
 [System.IO.Directory]::CreateDirectory($bytecodeRoot) | Out-Null
 $pythonSourceRoots = @('addons', 'scripts', 'tests')
 if (Test-Path -LiteralPath 'tools' -PathType Container) {
@@ -56,6 +63,8 @@ if (Test-Path -LiteralPath 'tools' -PathType Container) {
 }
 
 try {
+    $env:TEMP = $ciTempRoot
+    $env:TMP = $ciTempRoot
     $env:PYTHONDONTWRITEBYTECODE = '1'
     Invoke-NativeCommand 'Run the complete producer test suite' {
         python -m pytest -q -p no:cacheprovider
@@ -67,10 +76,12 @@ try {
     }
 }
 finally {
+    $env:TEMP = $previousTemp
+    $env:TMP = $previousTmp
     $env:PYTHONDONTWRITEBYTECODE = $previousDontWriteBytecode
     $env:PYTHONPYCACHEPREFIX = $previousPycachePrefix
-    if ([System.IO.Directory]::Exists($bytecodeRoot)) {
-        [System.IO.Directory]::Delete($bytecodeRoot, $true)
+    if ([System.IO.Directory]::Exists($ciTempRoot)) {
+        [System.IO.Directory]::Delete($ciTempRoot, $true)
     }
 }
 
