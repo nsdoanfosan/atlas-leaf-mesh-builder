@@ -72,8 +72,11 @@ Implemented:
 - geometry-preserving Straight Mesh behavior that never automatically deletes root or below-pivot geometry,
 - branching-plate detection with a deformation guard: safe main-stem unbend when possible, automatic shape-preserving alignment when plate edges would stretch, and nonlinear unbend for strand-like meshes,
 - same-atlas front/back material slots using the same UVs,
-- SpeedTree 10.1 `.spm` create/update with one named atlas material linked to all 12 mesh variants,
+- SpeedTree 10.1 `.spm` create/update with named atlas materials linked to every detected live mesh variant,
 - repeat updates that reuse the existing material/mesh IDs when the material name already exists,
+- per-Generator-slot current ownership receipts derived from the live SPM, with no fixed Type/Frond count,
+- immutable slot-creation provenance kept separately from current ownership so multiple Atlas providers can intentionally own disjoint slots in one SPM,
+- fail-closed cross-provider reconciliation and atomic staged rewrites of every affected provider receipt,
 - generation report.
 
 Not implemented yet:
@@ -92,4 +95,13 @@ Validated with Blender 5.1.2:
 - shell bridge side faces have inset UVs inside the front atlas island,
 - generated shell meshes use simple side quads, material-boundary sharp edges, shell-side angle sharp edges, and weighted normals,
 - Chestnut atlas `leaf_04_front_04_single_plate` projected from `leaf_13_front_13_single_plate` creates 270 vertices and 437 faces while preserving both source meshes; the duplicated surfaces contain 169 matching faces each plus 99 side faces,
-- SpeedTree build/update operator creates or updates one target `.spm`, exports 12 FBX files, references the original texture files without creating copies, and records the material/mesh IDs in a manifest.
+- SpeedTree build/update operator creates or updates one target `.spm`, exports the collection's live FBX variants, references the original texture files without creating copies, and records material/mesh IDs plus Generator ownership/provenance contracts in the manifest.
+
+## SpeedTree Generator receipt contracts
+
+Each current target receipt publishes two independent versioned blocks:
+
+- `generator_binding_ownership`: the provider's current live `(Generator GUID, slot prefix) -> (Material ID, Mesh ID)` projection.
+- `generator_slot_creation_provenance`: immutable evidence for slots structurally created by that provider.
+
+`generator_connection.bindings` remains a compatibility view of current ownership only. `generator_connection.authored_bindings` retains the provider's original full binding rows. When the live SPM proves that another provider now owns a slot, fleet updates shrink the former provider's current bindings and append relinquishment history without deleting its creation provenance. Ambiguous or unproven takeovers stop before commit; cross-provider receipt changes require the staged all-or-nothing target transaction.

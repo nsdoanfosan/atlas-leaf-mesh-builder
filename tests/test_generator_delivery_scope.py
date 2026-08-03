@@ -41,13 +41,13 @@ def consumer_repo_path():
     configured = str(os.environ.get("SPEEDTREE_BATCH_TOOLS_REPO") or "").strip()
     candidates = [
         Path(configured) if configured else None,
+        REPO.parent / "speedtree-batch-tools",
         (
             Path.home()
             / "Documents"
             / "CodexWorktrees"
             / "speedtree-issue-96-generator-delivery-scope"
         ),
-        REPO.parent / "speedtree-batch-tools",
     ]
     return next(
         (
@@ -61,6 +61,58 @@ def consumer_repo_path():
 
 
 class GeneratorDeliveryScopeContractTests(unittest.TestCase):
+    def test_guid_and_slot_prefix_are_exact_opaque_identity_parts(self):
+        exact = producer.canonical_slot_identity({
+            "generator_guid": "  AbCdEf==  ",
+            "slot_prefix": "  Custom:Type:MiXeD  ",
+        })
+
+        self.assertEqual(
+            exact,
+            ("guid", "AbCdEf==", "Custom:Type:MiXeD"),
+        )
+        self.assertNotEqual(
+            exact,
+            producer.canonical_slot_identity({
+                "generator_guid": "abcdef==",
+                "slot_prefix": "Custom:Type:mixed",
+            }),
+        )
+        self.assertEqual(
+            producer.generator_guid_key("ABCDEFGHIJKLMNOPQRSTU=="),
+            "ABCDEFGHIJKLMNOPQRSTU==",
+        )
+        self.assertEqual(
+            producer.canonical_slot_identity(
+                ["NAMED", "LEAF MESH", "Leaf One", "Opaque:Slot:X"]
+            ),
+            ("named", "leaf mesh", "leaf one", "Opaque:Slot:X"),
+        )
+
+    def test_material_default_mesh_sentinel_is_valid_but_other_nonpositive_is_not(self):
+        row = {
+            "slot_identity": [
+                "guid",
+                "OpaqueGuid==",
+                "Arbitrary:Prefix:CaseSensitive",
+            ],
+            "target_material_id": 7,
+            "target_mesh_id": producer.MATERIAL_DEFAULT_MESH_ID,
+        }
+
+        self.assertEqual(
+            producer.canonical_authored_slots([row])[0]["target_mesh_id"],
+            producer.MATERIAL_DEFAULT_MESH_ID,
+        )
+        for invalid in (0, -1, -9, -11):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(
+                producer.GeneratorDeliveryScopeError,
+                "positive integer or -10",
+            ):
+                producer.canonical_authored_slots([
+                    {**row, "target_mesh_id": invalid}
+                ])
+
     def test_sanitized_hidden_zero_node_duplicate_mesh_fixture_seals(self):
         payload, intent = fixture()
         observations = payload["runtime_observations_not_authority"]
@@ -206,6 +258,50 @@ class GeneratorDeliveryScopeContractTests(unittest.TestCase):
                 target_spm_postwrite_sha256="b" * 64,
             )
 
+    def test_explicit_authored_history_can_validate_historical_postwrite_proof(self):
+        payload, intent = fixture()
+        authored = copy.deepcopy(payload["bindings"])
+        connection = {
+            "authored_bindings": authored,
+            "bindings": [copy.deepcopy(authored[0])],
+            "delivery_scope": producer.build_resolved_delivery_scope(
+                intent,
+                authored,
+                "a" * 64,
+            ),
+        }
+
+        with self.assertRaisesRegex(
+            producer.GeneratorDeliveryScopeError,
+            "target SPM hash mismatch",
+        ):
+            producer.validate_resolved_delivery_scope(
+                connection,
+                target_spm=intent["target"]["spm"],
+                material_id=4,
+                provider_blend=intent["target"]["provider_blend"],
+                target_spm_postwrite_sha256="b" * 64,
+            )
+
+        validated = producer.validate_resolved_delivery_scope(
+            connection,
+            target_spm=intent["target"]["spm"],
+            material_id=4,
+            provider_blend=intent["target"]["provider_blend"],
+            target_spm_postwrite_sha256="b" * 64,
+            postwrite_validation_mode=(
+                producer.POSTWRITE_MODE_HISTORICAL_PROOF
+            ),
+        )
+
+        self.assertEqual(
+            validated["postwrite_validation_mode"],
+            producer.POSTWRITE_MODE_HISTORICAL_PROOF,
+        )
+        self.assertFalse(validated["target_spm_postwrite_matches_current"])
+        self.assertEqual(validated["target_spm_postwrite_sha256"], "a" * 64)
+        self.assertEqual(validated["current_target_spm_sha256"], "b" * 64)
+
     def test_pr98_consumer_accepts_producer_fixture_without_inference(self):
         consumer_repo = consumer_repo_path()
         if consumer_repo is None:
@@ -249,6 +345,26 @@ class GeneratorDeliveryScopeContractTests(unittest.TestCase):
         self.assertEqual(
             consumer.RUNTIME_INACTIVE_POLICY,
             producer.RUNTIME_INACTIVE_POLICY,
+        )
+        historical_connection = copy.deepcopy(connection)
+        historical_connection["authored_bindings"] = copy.deepcopy(
+            payload["bindings"]
+        )
+        historical_connection["bindings"] = [
+            copy.deepcopy(payload["bindings"][0])
+        ]
+        consumer_historical = consumer.validate_resolved_delivery_scope(
+            historical_connection,
+            target_spm=intent["target"]["spm"],
+            material_id=4,
+            provider_blend=intent["target"]["provider_blend"],
+            target_spm_postwrite_sha256="b" * 64,
+            postwrite_validation_mode=(
+                consumer.POSTWRITE_MODE_HISTORICAL_PROOF
+            ),
+        )
+        self.assertFalse(
+            consumer_historical["target_spm_postwrite_matches_current"]
         )
 
 

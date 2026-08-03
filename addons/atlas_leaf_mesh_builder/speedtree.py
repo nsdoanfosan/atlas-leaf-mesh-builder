@@ -22,8 +22,22 @@ from .generator_delivery_scope import (
     build_resolved_delivery_scope,
     canonical_authored_slots,
     canonical_slot_identity,
+    validate_delivery_scope_intent,
     validate_planned_delivery_scope,
     validate_resolved_delivery_scope,
+)
+from .generator_slot_ownership import (
+    GeneratorSlotOwnershipError,
+    MATERIAL_DEFAULT_MESH_ID,
+    binding_key as generator_ownership_binding_key,
+    build_generator_binding_ownership,
+    canonical_target_mesh_id,
+    manifest_with_binding_contracts,
+    plan_live_binding_reconciliation,
+    provider_identity as generator_ownership_provider_identity,
+    provider_key as generator_ownership_provider_key,
+    validate_generator_binding_ownership,
+    validate_generator_slot_creation_provenance,
 )
 from .materials import make_speedtree_material
 from .props import speedtree_spm_targets
@@ -3529,6 +3543,7 @@ def preflight_generator_delivery_scope(
     spm_path,
     intent,
     *,
+    contract_target_spm=None,
     manifest,
     material_groups,
     source_material_names,
@@ -3538,7 +3553,14 @@ def preflight_generator_delivery_scope(
     generator_variant_policy=None,
     source_binding_repairs=None,
 ):
-    """Validate and plan explicit intent before the first target SPM write."""
+    """Validate and plan explicit intent before the first target SPM write.
+
+    ``spm_path`` is the document being inspected and may live in the private
+    fleet-transaction staging directory.  ``contract_target_spm`` is the
+    production identity sealed by caller intent.  Keeping those paths
+    separate prevents staging from making an otherwise exact intent look as
+    though it belongs to a foreign target.
+    """
     if intent is None:
         return None
     if len(source_material_names or []) != 1:
@@ -3583,7 +3605,7 @@ def preflight_generator_delivery_scope(
     validated = validate_planned_delivery_scope(
         intent,
         planned,
-        target_spm=spm_path,
+        target_spm=contract_target_spm or spm_path,
         material_id=source_material_id,
         provider_blend=manifest.get("blend_file"),
         provider_scope_id=manifest.get("export_scope_id"),
@@ -3609,6 +3631,7 @@ def connect_atlas_generators_in_spm(
     ownership_manifest=None,
     generator_delivery_scope_intent=None,
     delivery_scope_preflight=None,
+    contract_target_spm=None,
 ):
     """Connect source Leaf Mesh/Frond slots to generated atlas assets.
 
@@ -3665,8 +3688,18 @@ def connect_atlas_generators_in_spm(
         delivery_scope_validation = validate_planned_delivery_scope(
             generator_delivery_scope_intent,
             planned_slot_identities,
-            target_spm=spm_path,
+            target_spm=contract_target_spm or spm_path,
             material_id=source_material_id,
+            provider_blend=(
+                delivery_scope_preflight.get("provider_blend")
+                if delivery_scope_preflight is not None
+                else None
+            ),
+            provider_scope_id=(
+                delivery_scope_preflight.get("provider_scope_id")
+                if delivery_scope_preflight is not None
+                else None
+            ),
         )
         if delivery_scope_preflight is not None:
             if (
@@ -5006,6 +5039,504 @@ def target_scope_manifests_for_blend(spm_path, blend_path):
     return manifests
 
 
+def target_scope_generator_ownership_records(
+    spm_path,
+    *,
+    contract_target_spm=None,
+):
+    """Load every operational target-scope receipt for ownership planning."""
+    spm_path = Path(spm_path).expanduser().absolute()
+    contract_target_spm = Path(
+        contract_target_spm or spm_path
+    ).expanduser().absolute()
+    scope_dir = spm_path.parent / ".atlas_leaf_speedtree_scopes"
+    if not scope_dir.is_dir():
+        return []
+    records = []
+    for path in sorted(
+        scope_dir.glob(f"*__{target_manifest_key(spm_path)}.json")
+    ):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise GeneratorSlotOwnershipError(
+                f"Cannot read Atlas ownership receipt {path}: {exc}"
+            ) from exc
+        if not isinstance(payload, dict):
+            raise GeneratorSlotOwnershipError(
+                f"Atlas ownership receipt root is not an object: {path}"
+            )
+        lifecycle = payload.get("atlas_scope_lifecycle") or {}
+        if lifecycle.get("state") == "retired":
+            continue
+        declared_spm = str(payload.get("spm") or "").strip()
+        if not declared_spm or not blend_paths_equal(
+            declared_spm,
+            contract_target_spm,
+        ):
+            continue
+        records.append({"path": str(path), "payload": payload})
+    return records
+
+
+def live_generator_ownership_bindings(spm_path):
+    """Return every positive live Leaf Mesh/Frond Material/Mesh pair."""
+    root = read_spm_xml(spm_path)
+    rows = []
+    for pair in spm_generator_property_pairs(
+        root, {"Leaf Mesh", "Frond"}
+    ):
+        mesh_property = pair.get("mesh_property")
+        material_id = positive_int(
+            pair["material_property"].findtext("Value")
+        )
+        mesh_id = (
+            integer_value(mesh_property.findtext("Value"))
+            if mesh_property is not None
+            else None
+        )
+        if material_id is None or (
+            mesh_id != MATERIAL_DEFAULT_MESH_ID
+            and (mesh_id is None or mesh_id <= 0)
+        ):
+            continue
+        rows.append({
+            "generator_guid": pair["generator_guid"],
+            "generator_index": pair["generator_index"],
+            "generator_name": pair["generator_name"],
+            "generator_type": pair["generator_type"],
+            "slot_prefix": pair["slot_prefix"],
+            "target_material_id": material_id,
+            "target_mesh_id": mesh_id,
+        })
+    return rows
+
+
+def prepare_target_generator_ownership_reconciliation(spm_path):
+    """Seal a read-only live/receipt ownership plan before SPM mutation."""
+    records = target_scope_generator_ownership_records(spm_path)
+    plan = plan_live_binding_reconciliation(
+        records,
+        live_generator_ownership_bindings(spm_path),
+    )
+    if plan.get("status") == "blocked":
+        first = plan["blocking"][0]
+        raise GeneratorSlotOwnershipError(
+            "Atlas Generator ownership cannot be reconciled from the live "
+            f"SPM: {first['reason']} at "
+            f"{first['generator_guid']} / {first['slot_prefix']}"
+        )
+    return plan
+
+
+def validate_target_generator_ownership_receipts(
+    spm_path,
+    *,
+    contract_target_spm=None,
+):
+    """Require every operational receipt to equal the resolved live plan."""
+    records = target_scope_generator_ownership_records(
+        spm_path,
+        contract_target_spm=contract_target_spm,
+    )
+    plan = plan_live_binding_reconciliation(
+        records,
+        live_generator_ownership_bindings(spm_path),
+    )
+    if plan.get("status") != "repairable":
+        first = (plan.get("blocking") or [{}])[0]
+        raise RuntimeError(
+            "SpeedTree SPM validation failed: operational Generator "
+            "ownership receipts remain ambiguous: "
+            f"{first.get('reason') or 'unknown conflict'}"
+        )
+    for update in plan["provider_updates"].values():
+        expected = build_generator_binding_ownership(
+            update["current_bindings"]
+        )
+        for record in update["records"]:
+            payload = record["payload"]
+            contract = payload.get("generator_binding_ownership")
+            if contract is None:
+                raise RuntimeError(
+                    "SpeedTree SPM validation failed: operational provider "
+                    "receipt has no explicit Generator ownership contract: "
+                    f"{record.get('path') or '<current>'}"
+                )
+            validate_generator_binding_ownership(contract)
+            if contract != expected:
+                raise RuntimeError(
+                    "SpeedTree SPM validation failed: operational provider "
+                    "receipts still overlap or differ from the live ownership "
+                    f"plan: {record.get('path') or '<current>'}"
+                )
+    return plan
+
+
+def _ownership_pair(row):
+    return (
+        positive_int(row.get("target_material_id")),
+        canonical_target_mesh_id(row.get("target_mesh_id")),
+    )
+
+
+def _ownership_provider_key(payload, path=None):
+    identity = generator_ownership_provider_identity(
+        payload,
+        relative_to=(Path(path).parent if path else None),
+    )
+    return generator_ownership_provider_key(identity)
+
+
+def ownership_reconciliation_has_relinquishments(
+    plan,
+    *,
+    excluding_provider_key=None,
+):
+    return any(
+        update.get("relinquished_bindings")
+        for provider_key, update in (
+            plan.get("provider_updates") or {}
+        ).items()
+        if provider_key != excluding_provider_key
+    )
+
+
+def validate_generator_ownership_preflight(preflight):
+    """Rebuild and verify the immutable pre-write ownership snapshot."""
+    if not isinstance(preflight, dict):
+        raise GeneratorSlotOwnershipError(
+            "Generator ownership preflight is missing"
+        )
+    if (
+        preflight.get("contract")
+        != "atlas_live_generator_binding_reconciliation_plan"
+        or preflight.get("schema_version") != 1
+        or preflight.get("status") != "repairable"
+    ):
+        raise GeneratorSlotOwnershipError(
+            "Generator ownership preflight is not a repairable sealed plan"
+        )
+    records = []
+    for provider in (preflight.get("providers") or {}).values():
+        for record in provider.get("records") or []:
+            records.append({
+                "path": str(record.get("path") or ""),
+                "payload": copy.deepcopy(record.get("payload")),
+            })
+    rebuilt = plan_live_binding_reconciliation(
+        records,
+        copy.deepcopy(preflight.get("live_bindings") or []),
+    )
+    if (
+        rebuilt.get("status") != "repairable"
+        or rebuilt.get("fingerprint") != preflight.get("fingerprint")
+    ):
+        raise GeneratorSlotOwnershipError(
+            "Generator ownership preflight fingerprint drifted"
+        )
+    return rebuilt
+
+
+def resolved_delivery_successor_authorizations(
+    spm_path,
+    contract_target_spm,
+    manifest,
+    generator_connection,
+):
+    """Validate one writer's resolved delivery seal as exact slot authority."""
+    scope = generator_connection.get("delivery_scope")
+    if not isinstance(scope, dict):
+        raise GeneratorSlotOwnershipError(
+            "Foreign Generator takeover requires a resolved delivery scope"
+        )
+    intent = scope.get("intent")
+    if not isinstance(intent, dict):
+        raise GeneratorSlotOwnershipError(
+            "Foreign Generator takeover delivery intent is missing"
+        )
+    target = intent.get("target") or {}
+    try:
+        target_material_id = int(target.get("material_id"))
+        validated_intent = validate_delivery_scope_intent(
+            intent,
+            target_spm=contract_target_spm,
+            material_id=target_material_id,
+            provider_blend=manifest.get("blend_file"),
+            provider_scope_id=manifest.get("export_scope_id"),
+        )
+        validated_resolved = validate_resolved_delivery_scope(
+            generator_connection,
+            target_spm=contract_target_spm,
+            material_id=target_material_id,
+            provider_blend=manifest.get("blend_file"),
+            target_spm_postwrite_sha256=spm_text_sha256(spm_path),
+        )
+    except (GeneratorDeliveryScopeError, TypeError, ValueError) as exc:
+        raise GeneratorSlotOwnershipError(
+            f"Foreign Generator takeover delivery seal is invalid: {exc}"
+        ) from exc
+    if (
+        validated_intent["intent_sha256"]
+        != validated_resolved["intent_sha256"]
+    ):
+        raise GeneratorSlotOwnershipError(
+            "Foreign Generator takeover delivery intent/resolution drifted"
+        )
+
+    slots = {}
+    for row in validated_resolved["authored_slots"]:
+        identity = tuple(row["slot_identity"])
+        if len(identity) != 3 or identity[0] != "guid":
+            raise GeneratorSlotOwnershipError(
+                "Foreign Generator takeover requires exact GUID slot identities"
+            )
+        key = (identity[1], identity[2])
+        slots[key] = {
+            "target_material_id": row["target_material_id"],
+            "target_mesh_id": row["target_mesh_id"],
+        }
+    resolved = scope.get("resolved") or {}
+    return {
+        "slots": slots,
+        "intent_sha256": validated_resolved["intent_sha256"],
+        "resolved_sha256": str(resolved.get("resolved_sha256") or ""),
+        "target_spm_postwrite_sha256": validated_resolved[
+            "target_spm_postwrite_sha256"
+        ],
+    }
+
+
+def finalize_target_generator_ownership_reconciliation(
+    spm_path,
+    manifest,
+    generator_connection,
+    preflight,
+    *,
+    superseded_manifests=None,
+    contract_target_spm=None,
+    ownership_transaction_is_staged=False,
+):
+    """Validate the final live state and prepare every provider receipt.
+
+    The pre-write live plan owns transfer decisions.  The current writer may
+    refresh slots it already owns, claim an unowned/new slot, or succeed a
+    same-source generation proven by the lifecycle planner.  A different
+    provider's pre-write slot may not become the current writer's slot merely
+    because this invocation wrote last.
+    """
+    preflight = validate_generator_ownership_preflight(preflight)
+    current_manifest = copy.deepcopy(manifest)
+    current_manifest["generator_connection"] = copy.deepcopy(
+        generator_connection
+    )
+    current_key = _ownership_provider_key(current_manifest)
+    authorized_predecessors = {
+        _ownership_provider_key(
+            payload,
+            payload.get("_scope_manifest_path"),
+        )
+        for payload in superseded_manifests or []
+    }
+    prewrite_live = {
+        generator_ownership_binding_key(row): row
+        for row in preflight.get("live_bindings") or []
+    }
+    final_live_rows = live_generator_ownership_bindings(spm_path)
+    final_live = {
+        generator_ownership_binding_key(row): row
+        for row in final_live_rows
+    }
+    writer_rows = list(generator_connection.get("bindings") or [])
+    writer_by_slot = {}
+    successor_delivery = None
+    authorized_takeovers = {}
+    for row in writer_rows:
+        key = generator_ownership_binding_key(row)
+        if key in writer_by_slot:
+            raise GeneratorSlotOwnershipError(
+                f"Current writer duplicates Generator slot {key}"
+            )
+        writer_by_slot[key] = row
+        live = final_live.get(key)
+        if live is None or _ownership_pair(live) != _ownership_pair(row):
+            raise GeneratorSlotOwnershipError(
+                "Current writer binding does not equal the final live SPM at "
+                f"{key}"
+            )
+        previous_owner = (preflight.get("owners") or {}).get(key)
+        if previous_owner is None:
+            continue
+        previous_key = previous_owner["provider_key"]
+        if previous_key not in {current_key, *authorized_predecessors}:
+            if not ownership_transaction_is_staged:
+                raise GeneratorSlotOwnershipError(
+                    "Foreign Generator takeover requires the atomic staged "
+                    f"target transaction at {key}"
+                )
+            if successor_delivery is None:
+                successor_delivery = (
+                    resolved_delivery_successor_authorizations(
+                        spm_path,
+                        contract_target_spm or spm_path,
+                        current_manifest,
+                        generator_connection,
+                    )
+                )
+            authorization = successor_delivery["slots"].get(key)
+            before = prewrite_live.get(key)
+            previous_binding = previous_owner.get("binding") or {}
+            if (
+                authorization is None
+                or before is None
+                or _ownership_pair(previous_binding)
+                != _ownership_pair(before)
+                or _ownership_pair(authorization) != _ownership_pair(row)
+                or _ownership_pair(row) != _ownership_pair(live)
+            ):
+                raise GeneratorSlotOwnershipError(
+                    "Atlas Generator successor authorization does not match "
+                    f"the pre-write owner/live pair and final delivery at {key}"
+                )
+            predecessor_identity = copy.deepcopy(
+                preflight["providers"][previous_key]["identity"]
+            )
+            successor_identity = copy.deepcopy(
+                preflight["providers"].get(current_key, {}).get("identity")
+                or generator_ownership_provider_identity(current_manifest)
+            )
+            authorized_takeovers[key] = {
+                "contract": "atlas_generator_successor_authorization",
+                "version": 1,
+                "basis": (
+                    "sealed_prewrite_owner_plus_resolved_delivery_scope"
+                ),
+                "prewrite_ownership_fingerprint": preflight["fingerprint"],
+                "delivery_intent_sha256": successor_delivery[
+                    "intent_sha256"
+                ],
+                "delivery_resolved_sha256": successor_delivery[
+                    "resolved_sha256"
+                ],
+                "target_spm": str(
+                    Path(contract_target_spm or spm_path).absolute()
+                ),
+                "generator_guid": key[0],
+                "slot_prefix": key[1],
+                "predecessor_provider": predecessor_identity,
+                "successor_provider": successor_identity,
+                "prewrite_target_material_id": before[
+                    "target_material_id"
+                ],
+                "prewrite_target_mesh_id": before["target_mesh_id"],
+                "successor_target_material_id": row[
+                    "target_material_id"
+                ],
+                "successor_target_mesh_id": row["target_mesh_id"],
+            }
+
+    # A foreign provider's pre-write live pair must survive unchanged.  This
+    # catches cleanup or writer drift even when no current-writer binding row
+    # happens to mention the slot afterward.
+    for key, previous_owner in (preflight.get("owners") or {}).items():
+        if previous_owner is None:
+            continue
+        if key in authorized_takeovers:
+            continue
+        previous_key = previous_owner["provider_key"]
+        if previous_key in {current_key, *authorized_predecessors}:
+            continue
+        before = prewrite_live.get(key)
+        after = final_live.get(key)
+        if (
+            before is None
+            or after is None
+            or _ownership_pair(before) != _ownership_pair(after)
+        ):
+            raise GeneratorSlotOwnershipError(
+                "Atlas update changed another provider's live Generator slot "
+                f"without a successor transaction: {key}"
+            )
+
+    records = target_scope_generator_ownership_records(spm_path)
+    records.append({"path": "", "payload": current_manifest})
+    final_plan = plan_live_binding_reconciliation(records, final_live_rows)
+    if final_plan.get("status") == "blocked":
+        first = final_plan["blocking"][0]
+        raise GeneratorSlotOwnershipError(
+            "Final Atlas Generator ownership is ambiguous: "
+            f"{first['reason']} at {first['generator_guid']} / "
+            f"{first['slot_prefix']}"
+        )
+
+    for key, authorization in authorized_takeovers.items():
+        previous_owner = preflight["owners"][key]
+        predecessor_update = final_plan["provider_updates"].get(
+            previous_owner["provider_key"]
+        )
+        if predecessor_update is None:
+            raise GeneratorSlotOwnershipError(
+                f"Final ownership plan omitted predecessor for {key}"
+            )
+        relinquished = next(
+            (
+                row
+                for row in predecessor_update["relinquished_bindings"]
+                if generator_ownership_binding_key(row) == key
+            ),
+            None,
+        )
+        if relinquished is None:
+            raise GeneratorSlotOwnershipError(
+                f"Final ownership plan omitted predecessor relinquishment for {key}"
+            )
+        relinquished["successor_authorization"] = copy.deepcopy(
+            authorization
+        )
+
+    update = final_plan["provider_updates"].get(current_key)
+    if update is None:
+        raise GeneratorSlotOwnershipError(
+            "Final ownership plan omitted the current Atlas provider"
+        )
+    # Prefer the writer's exact full rows over stale same-provider mirrors.
+    update["current_bindings"] = copy.deepcopy(writer_rows)
+    current_payload = manifest_with_binding_contracts(
+        current_manifest,
+        writer_rows,
+        relinquished_rows=update.get("relinquished_bindings"),
+    )
+
+    rewrites = []
+    current_scope_path = scope_manifest_path(
+        spm_path.parent,
+        current_payload,
+        spm_path,
+    ).absolute()
+    for provider_update in final_plan["provider_updates"].values():
+        for record in provider_update["records"]:
+            path_value = str(record.get("path") or "")
+            if not path_value:
+                continue
+            path = Path(path_value).expanduser().absolute()
+            if path == current_scope_path:
+                continue
+            payload = manifest_with_binding_contracts(
+                record["payload"],
+                provider_update["current_bindings"],
+                relinquished_rows=provider_update.get(
+                    "relinquished_bindings"
+                ),
+            )
+            if payload != record["payload"]:
+                rewrites.append({"path": path, "payload": payload})
+    return {
+        "manifest": current_payload,
+        "receipt_rewrites": rewrites,
+        "plan": final_plan,
+    }
+
+
 def manifest_asset_lineage_tokens(manifest):
     """Return explicit producer lineage tokens, never material-name guesses."""
     tokens = set()
@@ -5087,16 +5618,42 @@ def _write_json_if_changed(path, payload):
     return True
 
 
-def retire_scope_manifest_records(manifests, successor_manifest):
+def _receipt_path_key(path):
+    return os.path.normcase(
+        str(Path(path).expanduser().absolute())
+    ).casefold()
+
+
+def retired_scope_receipt_path_keys(manifests):
+    return {
+        _receipt_path_key(manifest["_scope_manifest_path"])
+        for manifest in manifests or []
+        if manifest.get("_scope_manifest_path")
+    }
+
+
+def retire_scope_manifest_records(
+    manifests,
+    successor_manifest,
+    *,
+    prepared_rewrites=None,
+):
     """Persist non-operational tombstones for proven predecessor scopes."""
     successor_scope = spm_export_scope(successor_manifest)
+    prepared_by_path = {
+        _receipt_path_key(rewrite["path"]): copy.deepcopy(rewrite["payload"])
+        for rewrite in prepared_rewrites or []
+    }
     retired = []
     for manifest in manifests or []:
         path_value = manifest.get("_scope_manifest_path")
         if not path_value:
             continue
         path = Path(path_value).expanduser().absolute()
-        payload = read_json_file(path, {})
+        payload = prepared_by_path.get(
+            _receipt_path_key(path),
+            read_json_file(path, {}),
+        )
         if not isinstance(payload, dict):
             raise RuntimeError(f"Cannot retire invalid Atlas scope manifest: {path}")
         lifecycle = payload.get("atlas_scope_lifecycle") or {}
@@ -5110,11 +5667,18 @@ def retire_scope_manifest_records(manifests, successor_manifest):
                 "successor_export_scope_id": successor_scope,
                 "reason": "superseded_same_source_asset_lineage",
             }
-            payload["generator_connection"] = {
-                "requested": False,
-                "complete": False,
-                "bindings": [],
-            }
+            connection = copy.deepcopy(
+                payload.get("generator_connection") or {}
+            )
+            authored = connection.get("authored_bindings")
+            if authored is None:
+                authored = copy.deepcopy(connection.get("bindings") or [])
+            connection["requested"] = False
+            connection["complete"] = False
+            connection["authored_bindings"] = copy.deepcopy(authored)
+            connection["bindings"] = []
+            payload["generator_connection"] = connection
+            payload = manifest_with_binding_contracts(payload, [])
             payload["material_groups"] = []
             payload["speedtree_material_groups"] = []
             payload["meshes"] = []
@@ -8582,6 +9146,10 @@ def _export_or_update_speedtree_spm_path_impl(
     )
     target_spm = Path(target_spm)
     production_target_spm = Path(production_target_spm or target_spm)
+    ownership_transaction_is_staged = not blend_paths_equal(
+        target_spm,
+        production_target_spm,
+    )
     if not target_spm.name:
         raise RuntimeError("Target SPM is not set.")
     if target_spm.suffix.lower() != ".spm":
@@ -8660,6 +9228,7 @@ def _export_or_update_speedtree_spm_path_impl(
     delivery_scope_preflight = preflight_generator_delivery_scope(
         target_spm,
         generator_delivery_scope_intent,
+        contract_target_spm=production_target_spm,
         manifest=manifest,
         material_groups=material_groups,
         source_material_names=source_material_names,
@@ -8669,6 +9238,20 @@ def _export_or_update_speedtree_spm_path_impl(
         generator_variant_policy=generator_variant_policy,
         source_binding_repairs=source_binding_repairs,
     )
+    generator_ownership_preflight = (
+        prepare_target_generator_ownership_reconciliation(target_spm)
+    )
+    if (
+        ownership_reconciliation_has_relinquishments(
+            generator_ownership_preflight,
+            excluding_provider_key=_ownership_provider_key(manifest),
+        )
+        and not ownership_transaction_is_staged
+    ):
+        raise GeneratorSlotOwnershipError(
+            "Cross-provider Generator ownership reconciliation requires the "
+            "atomic staged target transaction."
+        )
     superseded_manifests, superseded_scope_diagnostics = (
         superseded_scope_manifests_for_update(target_spm, manifest)
     )
@@ -8887,8 +9470,13 @@ def _export_or_update_speedtree_spm_path_impl(
                 previous_manifest.get("removed_stale_spm_assets")
                 or tombstone_cleanup
             )
-        previous_tombstone_connection = (
+        previous_connection = (
             previous_manifest.get("generator_connection") or {}
+            if isinstance(previous_manifest, dict)
+            else {}
+        )
+        previous_tombstone_connection = (
+            previous_connection
             if previous_tombstone
             else {}
         )
@@ -8920,6 +9508,46 @@ def _export_or_update_speedtree_spm_path_impl(
             ),
             "bindings": [],
         }
+        prior_authored_bindings = previous_connection.get(
+            "authored_bindings"
+        )
+        if prior_authored_bindings is None:
+            prior_authored_bindings = previous_connection.get(
+                "bindings"
+            )
+        manifest["generator_connection"]["authored_bindings"] = (
+            copy.deepcopy(prior_authored_bindings or [])
+        )
+        if previous_tombstone_connection.get("relinquished_bindings"):
+            manifest["generator_connection"]["relinquished_bindings"] = (
+                copy.deepcopy(
+                    previous_tombstone_connection["relinquished_bindings"]
+                )
+            )
+        if previous_manifest.get("generator_slot_creation_provenance"):
+            manifest["generator_slot_creation_provenance"] = copy.deepcopy(
+                previous_manifest["generator_slot_creation_provenance"]
+            )
+        ownership_result = finalize_target_generator_ownership_reconciliation(
+            target_spm,
+            manifest,
+            manifest["generator_connection"],
+            generator_ownership_preflight,
+            superseded_manifests=superseded_manifests,
+            contract_target_spm=production_target_spm,
+            ownership_transaction_is_staged=(
+                ownership_transaction_is_staged
+            ),
+        )
+        if (
+            ownership_result["receipt_rewrites"]
+            and not ownership_transaction_is_staged
+        ):
+            raise GeneratorSlotOwnershipError(
+                "Prior-provider Generator receipt reconciliation requires "
+                "the atomic staged target transaction."
+            )
+        manifest = ownership_result["manifest"]
         manifest["generator_scale_normalization"] = {
             "mode": "collection_tombstone",
             "changed": bool(
@@ -8937,9 +9565,20 @@ def _export_or_update_speedtree_spm_path_impl(
             superseded_scope_diagnostics
         )
         manifest["retired_scope_generations"] = (
-            retire_scope_manifest_records(superseded_manifests, manifest)
+            retire_scope_manifest_records(
+                superseded_manifests,
+                manifest,
+                prepared_rewrites=ownership_result["receipt_rewrites"],
+            )
         )
         manifest["target_manifest"] = str(target_manifest_path(target_spm))
+        retired_receipt_keys = retired_scope_receipt_path_keys(
+            superseded_manifests
+        )
+        for rewrite in ownership_result["receipt_rewrites"]:
+            if _receipt_path_key(rewrite["path"]) in retired_receipt_keys:
+                continue
+            _write_json_if_changed(rewrite["path"], rewrite["payload"])
         _write_json_if_changed(manifest_path, manifest)
         per_target_manifest_path = target_manifest_path(target_spm)
         _write_json_if_changed(per_target_manifest_path, manifest)
@@ -8975,6 +9614,7 @@ def _export_or_update_speedtree_spm_path_impl(
                 generator_delivery_scope_intent
             ),
             delivery_scope_preflight=delivery_scope_preflight,
+            contract_target_spm=production_target_spm,
         )
     else:
         generator_connection = {
@@ -8991,6 +9631,67 @@ def _export_or_update_speedtree_spm_path_impl(
             "retired_deleted_bindings": [],
             "bindings": [],
         }
+    previous_connection = (
+        previous_manifest.get("generator_connection") or {}
+        if isinstance(previous_manifest, dict)
+        else {}
+    )
+    previous_authored_bindings = previous_connection.get(
+        "authored_bindings"
+    )
+    if previous_authored_bindings is None and "bindings" in previous_connection:
+        previous_authored_bindings = previous_connection.get("bindings")
+    if generator_delivery_scope_intent is not None:
+        delivery_history = copy.deepcopy(
+            previous_connection.get("delivery_scope_history") or []
+        )
+        previous_delivery_scope = previous_connection.get("delivery_scope")
+        if previous_delivery_scope is not None:
+            history_row = {
+                "state": "historical_production_proof",
+                "authored_bindings": copy.deepcopy(
+                    previous_authored_bindings or []
+                ),
+                "delivery_scope": copy.deepcopy(previous_delivery_scope),
+            }
+            history_key = str(
+                (previous_delivery_scope.get("resolved") or {}).get(
+                    "resolved_sha256"
+                )
+                or ""
+            )
+            known_keys = {
+                str(
+                    ((row.get("delivery_scope") or {}).get("resolved") or {}).get(
+                        "resolved_sha256"
+                    )
+                    or ""
+                )
+                for row in delivery_history
+                if isinstance(row, dict)
+            }
+            if history_key not in known_keys:
+                delivery_history.append(history_row)
+        if delivery_history:
+            generator_connection["delivery_scope_history"] = delivery_history
+        # Each explicit delivery intent seals one exact authored generation.
+        # Previous generations remain in delivery_scope_history and
+        # relinquished history rather than contaminating the new seal.
+        generator_connection["authored_bindings"] = copy.deepcopy(
+            generator_connection.get("bindings") or []
+        )
+    elif previous_authored_bindings is not None:
+        generator_connection["authored_bindings"] = copy.deepcopy(
+            previous_authored_bindings
+        )
+    if previous_connection.get("relinquished_bindings"):
+        generator_connection["relinquished_bindings"] = copy.deepcopy(
+            previous_connection["relinquished_bindings"]
+        )
+    if previous_manifest.get("generator_slot_creation_provenance"):
+        manifest["generator_slot_creation_provenance"] = copy.deepcopy(
+            previous_manifest["generator_slot_creation_provenance"]
+        )
     if manifest.get("unit_probe_contract"):
         generator_scale_normalization = {
             "mode": "verified_common_unit_contract_no_generator_scaling",
@@ -9042,11 +9743,30 @@ def _export_or_update_speedtree_spm_path_impl(
         )
         validate_resolved_delivery_scope(
             generator_connection,
-            target_spm=target_spm,
+            target_spm=production_target_spm,
             material_id=delivery_scope_preflight["target_material_id"],
             provider_blend=delivery_scope_preflight["provider_blend"],
             target_spm_postwrite_sha256=postwrite_sha256,
         )
+    ownership_result = finalize_target_generator_ownership_reconciliation(
+        target_spm,
+        manifest,
+        generator_connection,
+        generator_ownership_preflight,
+        superseded_manifests=superseded_manifests,
+        contract_target_spm=production_target_spm,
+        ownership_transaction_is_staged=ownership_transaction_is_staged,
+    )
+    if (
+        ownership_result["receipt_rewrites"]
+        and not ownership_transaction_is_staged
+    ):
+        raise GeneratorSlotOwnershipError(
+            "Prior-provider Generator receipt reconciliation requires the "
+            "atomic staged target transaction."
+        )
+    manifest = ownership_result["manifest"]
+    generator_connection = manifest["generator_connection"]
     action = ",".join(sorted({group["action"] for group in group_results}))
     if cleanup["removed_materials"] or cleanup["removed_mesh_ids"]:
         action = f"{action},cleaned"
@@ -9074,8 +9794,16 @@ def _export_or_update_speedtree_spm_path_impl(
     manifest["retired_scope_generations"] = retire_scope_manifest_records(
         superseded_manifests,
         manifest,
+        prepared_rewrites=ownership_result["receipt_rewrites"],
     )
     manifest["target_manifest"] = str(target_manifest_path(target_spm))
+    retired_receipt_keys = retired_scope_receipt_path_keys(
+        superseded_manifests
+    )
+    for rewrite in ownership_result["receipt_rewrites"]:
+        if _receipt_path_key(rewrite["path"]) in retired_receipt_keys:
+            continue
+        _write_json_if_changed(rewrite["path"], rewrite["payload"])
     _write_json_if_changed(manifest_path, manifest)
     per_target_manifest_path = target_manifest_path(target_spm)
     _write_json_if_changed(per_target_manifest_path, manifest)
@@ -9404,6 +10132,34 @@ def _validate_staged_speedtree_targets(staged_targets, states):
                 continue
             manifest = read_json_file(target_manifest_path(spm_path), {})
             connection = manifest.get("generator_connection") or {}
+            ownership_contract = manifest.get(
+                "generator_binding_ownership"
+            )
+            if ownership_contract is None:
+                raise RuntimeError(
+                    "SpeedTree SPM validation failed: current Generator "
+                    f"ownership contract is missing for {spm_path.name}."
+                )
+            validate_generator_binding_ownership(ownership_contract)
+            expected_ownership = build_generator_binding_ownership(
+                list(connection.get("bindings") or [])
+            )
+            if ownership_contract != expected_ownership:
+                raise RuntimeError(
+                    "SpeedTree SPM validation failed: current Generator "
+                    f"ownership differs from connection bindings in {spm_path.name}."
+                )
+            creation_contract = manifest.get(
+                "generator_slot_creation_provenance"
+            )
+            if creation_contract is None:
+                raise RuntimeError(
+                    "SpeedTree SPM validation failed: Generator slot creation "
+                    f"provenance is missing for {spm_path.name}."
+                )
+            validate_generator_slot_creation_provenance(
+                creation_contract
+            )
             for ordinal, binding in enumerate(connection.get("bindings") or []):
                 identity = resolve_generator_binding(
                     root,
@@ -9426,6 +10182,12 @@ def _validate_staged_speedtree_targets(staged_targets, states):
                         "SpeedTree SPM validation failed: staged Generator "
                         f"binding in {spm_path.name} is {actual}, expected {expected}."
                     )
+            validate_target_generator_ownership_receipts(
+                spm_path,
+                contract_target_spm=(
+                    production_root / spm_path.relative_to(stage_root)
+                ),
+            )
         root_key = os.path.normcase(str(production_root.absolute())).casefold()
         referenced_by_root[root_key] = production_references
     return referenced_by_root

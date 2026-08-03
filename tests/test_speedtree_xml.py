@@ -939,6 +939,65 @@ class GeneratorConnectionTests(unittest.TestCase):
             )
         self.assertEqual(self.spm_path.read_bytes(), before)
 
+    def test_delivery_scope_uses_production_identity_for_staged_spm(self):
+        intent = self.explicit_delivery_scope_intent(required_count=1)
+        staged_spm = (
+            Path(self.temp_dir.name)
+            / "private-transaction-stage"
+            / self.spm_path.name
+        )
+        staged_spm.parent.mkdir()
+        staged_spm.write_bytes(self.spm_path.read_bytes())
+        manifest = {
+            "blend_file": intent["target"]["provider_blend"],
+            "export_scope_id": intent["target"]["provider_scope_id"],
+        }
+
+        with self.assertRaisesRegex(
+            delivery_scope.GeneratorDeliveryScopeError,
+            "another target SPM",
+        ):
+            speedtree.preflight_generator_delivery_scope(
+                staged_spm,
+                intent,
+                manifest=manifest,
+                material_groups=self.groups,
+                source_material_names=["M_leaf_parsley_02"],
+                source_material_ids=[4],
+            )
+
+        preflight = speedtree.preflight_generator_delivery_scope(
+            staged_spm,
+            intent,
+            contract_target_spm=self.spm_path,
+            manifest=manifest,
+            material_groups=self.groups,
+            source_material_names=["M_leaf_parsley_02"],
+            source_material_ids=[4],
+        )
+        result = speedtree.connect_atlas_generators_in_spm(
+            staged_spm,
+            ["M_leaf_parsley_02"],
+            self.groups,
+            [4],
+            generator_delivery_scope_intent=intent,
+            delivery_scope_preflight=preflight,
+            contract_target_spm=self.spm_path,
+        )
+
+        validated = delivery_scope.validate_resolved_delivery_scope(
+            result,
+            target_spm=self.spm_path,
+            material_id=4,
+            provider_blend=intent["target"]["provider_blend"],
+            target_spm_postwrite_sha256=speedtree.spm_text_sha256(
+                staged_spm
+            ),
+        )
+        self.assertEqual(
+            validated["intent_sha256"], intent["intent_sha256"]
+        )
+
     def test_minus9_source_binding_requires_hashed_exact_backup_evidence(self):
         live_root = ET.Element("SpeedTreeModel")
         live_assets = ET.SubElement(live_root, "Assets")
@@ -5769,6 +5828,129 @@ class DeletedMeshLifecycleTests(unittest.TestCase):
             self.assertEqual(payload["atlas_scope_lifecycle"]["state"], "retired")
             self.assertEqual(payload["speedtree_material_groups"], [])
 
+    def test_retirement_merges_ownership_rewrite_without_scope_resurrection(self):
+        with tempfile.TemporaryDirectory() as folder:
+            folder = Path(folder)
+            target = folder / "SK_tree.spm"
+            blend = folder / "atlas.blend"
+            root = ET.Element("SpeedTreeModel")
+            assets = ET.SubElement(root, "Assets")
+            add_material(assets, 9, "M_successor", [20])
+            add_mesh(assets, 20)
+            generator = add_variant_generator(
+                root,
+                "Leaf Mesh",
+                "Leaf",
+                [(9, 20)],
+            )
+            write_spm(target, root)
+            row = self._binding(generator, 0, 1)
+            row.update({
+                "target_material_id": 9,
+                "target_material_name": "M_successor",
+                "target_mesh_id": 20,
+            })
+
+            previous = self._managed_manifest(
+                target,
+                blend,
+                "scope-previous",
+            )
+            previous["generator_connection"] = {
+                "requested": True,
+                "complete": True,
+                "bindings": [copy.deepcopy(row)],
+            }
+            previous = speedtree.manifest_with_binding_contracts(
+                previous,
+                [row],
+            )
+            previous_path = speedtree.write_scope_manifest(
+                folder,
+                previous,
+                target,
+            )
+            selected = copy.deepcopy(previous)
+            selected["_scope_manifest_path"] = str(previous_path)
+
+            relinquished = {
+                **copy.deepcopy(row),
+                "relinquished_reason": "superseded_same_source_generation",
+            }
+            prepared = speedtree.manifest_with_binding_contracts(
+                previous,
+                [],
+                relinquished_rows=[relinquished],
+            )
+            prepared_rewrites = [{
+                "path": previous_path,
+                "payload": prepared,
+            }]
+            successor = self._managed_manifest(
+                target,
+                blend,
+                "scope-current",
+            )
+            successor["generator_connection"] = {
+                "requested": True,
+                "complete": True,
+                "bindings": [copy.deepcopy(row)],
+            }
+            successor = speedtree.manifest_with_binding_contracts(
+                successor,
+                [row],
+            )
+            speedtree.write_scope_manifest(folder, successor, target)
+
+            speedtree.retire_scope_manifest_records(
+                [selected],
+                successor,
+                prepared_rewrites=prepared_rewrites,
+            )
+            retired_keys = speedtree.retired_scope_receipt_path_keys(
+                [selected]
+            )
+            for rewrite in prepared_rewrites:
+                if speedtree._receipt_path_key(
+                    rewrite["path"]
+                ) in retired_keys:
+                    continue
+                speedtree._write_json_if_changed(
+                    rewrite["path"],
+                    rewrite["payload"],
+                )
+
+            retired = json.loads(
+                previous_path.read_text(encoding="utf-8")
+            )
+            connection = retired["generator_connection"]
+            self.assertEqual(
+                retired["atlas_scope_lifecycle"]["state"],
+                "retired",
+            )
+            self.assertEqual(connection["bindings"], [])
+            self.assertEqual(len(connection["authored_bindings"]), 1)
+            self.assertEqual(
+                connection["relinquished_bindings"][0][
+                    "relinquished_reason"
+                ],
+                "superseded_same_source_generation",
+            )
+            self.assertEqual(
+                retired["generator_binding_ownership"]["binding_count"],
+                0,
+            )
+            speedtree.validate_target_generator_ownership_receipts(target)
+
+            resurrected = copy.deepcopy(previous)
+            resurrected.pop("atlas_scope_lifecycle", None)
+            speedtree._write_json_if_changed(previous_path, resurrected)
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "ownership receipts remain ambiguous",
+            ):
+                speedtree.validate_target_generator_ownership_receipts(target)
+
     def test_ambiguous_legacy_scope_is_preserved_with_diagnostic(self):
         with tempfile.TemporaryDirectory() as folder:
             folder = Path(folder)
@@ -5791,6 +5973,1035 @@ class DeletedMeshLifecycleTests(unittest.TestCase):
                 "atlas_scope_lifecycle",
                 json.loads(scope_path.read_text(encoding="utf-8")),
             )
+
+
+class GeneratorSlotOwnershipIntegrationTests(unittest.TestCase):
+    def _binding(
+        self,
+        generator,
+        slot_index,
+        material_id,
+        mesh_id,
+        *,
+        created=False,
+    ):
+        slot_prefix = f"Leaves:Type:{slot_index}"
+        row = {
+            "state": "changed",
+            "generator_index": 0,
+            "generator_name": str(generator.findtext("Name") or ""),
+            "generator_guid": speedtree.generator_guid(generator),
+            "generator_type": "Leaf Mesh",
+            "slot_prefix": slot_prefix,
+            "source_material_id": 4,
+            "source_material_name": "M_source",
+            "source_mesh_id": slot_index + 1,
+            "source_object": f"leaf_{slot_index + 1:02d}",
+            "leaf_ordinal": slot_index + 1,
+            "target_material_id": material_id,
+            "target_material_name": f"M_provider_{material_id}",
+            "target_mesh_id": mesh_id,
+            "created_slot": created,
+        }
+        if created:
+            row.update({
+                "variant_parent_property": "Leaves:Type",
+                "variant_parent_children_before": 1,
+                "variant_parent_children_after": 4,
+                "created_material_property": f"{slot_prefix}:Material",
+                "created_mesh_property": f"{slot_prefix}:Mesh",
+                "created_property_names": [
+                    f"{slot_prefix}:Material",
+                    f"{slot_prefix}:Mesh",
+                ],
+            })
+        return row
+
+    def _manifest(self, target, name, scope, rows):
+        return {
+            "spm": str(target),
+            "blend_file": str(target.parent / f"{name}.blend"),
+            "source_collection": name,
+            "export_scope_id": scope,
+            "generator_connection": {
+                "requested": True,
+                "complete": True,
+                "bindings": copy.deepcopy(rows),
+            },
+        }
+
+    def _seal_delivery_scope(
+        self,
+        target,
+        payload,
+        authored_rows,
+        *,
+        slot_identities=None,
+        target_spm=None,
+        provider_blend=None,
+        provider_scope_id=None,
+    ):
+        authored_rows = copy.deepcopy(authored_rows)
+        identities = slot_identities or [
+            list(delivery_scope.canonical_slot_identity(row))
+            for row in authored_rows
+        ]
+        material_ids = {
+            row["target_material_id"] for row in authored_rows
+        }
+        self.assertEqual(len(material_ids), 1)
+        intent = {
+            "kind": delivery_scope.INTENT_KIND,
+            "schema_version": delivery_scope.SCHEMA_VERSION,
+            "authority": {
+                "kind": "test_recipe",
+                "id": "explicit-successor-delivery",
+                "provenance": {"fixture": "ownership-handoff"},
+            },
+            "target": {
+                "spm": str(target_spm or target),
+                "provider_blend": str(
+                    provider_blend or payload["blend_file"]
+                ),
+                "provider_scope_id": str(
+                    provider_scope_id or payload["export_scope_id"]
+                ),
+                "material_id": next(iter(material_ids)),
+            },
+            "authored_slots": [
+                {
+                    "slot_identity": list(identity),
+                    "target_material_id": row["target_material_id"],
+                    "target_mesh_id": row["target_mesh_id"],
+                }
+                for identity, row in zip(identities, authored_rows)
+            ],
+            "required_live_slot_identities": [
+                list(identity) for identity in identities
+            ],
+            "continuity_only_slots": [],
+            "runtime_inactive_policy": (
+                delivery_scope.RUNTIME_INACTIVE_POLICY
+            ),
+        }
+        intent["intent_sha256"] = delivery_scope.canonical_sha256(intent)
+        connection = payload["generator_connection"]
+        connection["authored_bindings"] = copy.deepcopy(authored_rows)
+        connection["delivery_scope"] = (
+            delivery_scope.build_resolved_delivery_scope(
+                intent,
+                authored_rows,
+                speedtree.spm_text_sha256(target),
+            )
+        )
+        return intent
+
+    def test_staging_gate_ignores_only_the_current_providers_own_cleanup(self):
+        provider_a = ("a.blend", "cards-a", "scope-a")
+        provider_b = ("b.blend", "cards-b", "scope-b")
+        plan = {
+            "provider_updates": {
+                provider_a: {"relinquished_bindings": [{"slot": "Type0"}]},
+                provider_b: {"relinquished_bindings": []},
+            }
+        }
+
+        self.assertFalse(
+            speedtree.ownership_reconciliation_has_relinquishments(
+                plan,
+                excluding_provider_key=provider_a,
+            )
+        )
+        self.assertTrue(
+            speedtree.ownership_reconciliation_has_relinquishments(
+                plan,
+                excluding_provider_key=provider_b,
+            )
+        )
+
+    def test_live_ownership_includes_only_valid_material_default_sentinel(self):
+        with tempfile.TemporaryDirectory() as folder:
+            target = Path(folder) / "SK_tree.spm"
+            root = ET.Element("SpeedTreeModel")
+            assets = ET.SubElement(root, "Assets")
+            add_material(assets, 8, "M_frond", [-10])
+            add_variant_generator(
+                root,
+                "Frond",
+                "Frond sentinel",
+                [(8, -10), (8, -9), (8, 0)],
+            )
+            write_spm(target, root)
+
+            rows = speedtree.live_generator_ownership_bindings(target)
+
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["slot_prefix"], "Material:Frond:0")
+            self.assertEqual(rows[0]["target_mesh_id"], -10)
+            binding_row = {
+                **rows[0],
+                "state": "already_connected",
+                "source_material_id": 8,
+                "source_material_name": "M_frond",
+                "source_mesh_id": -10,
+                "created_slot": False,
+            }
+            provider = self._manifest(
+                target,
+                "provider_sentinel",
+                "scope-sentinel",
+                [binding_row],
+            )
+            speedtree.write_scope_manifest(folder, provider, target)
+            preflight = (
+                speedtree.prepare_target_generator_ownership_reconciliation(
+                    target
+                )
+            )
+            finalized = (
+                speedtree.finalize_target_generator_ownership_reconciliation(
+                    target,
+                    provider,
+                    provider["generator_connection"],
+                    preflight,
+                )
+            )
+            self.assertEqual(
+                finalized["manifest"]["generator_binding_ownership"][
+                    "bindings"
+                ][0]["target_mesh_id"],
+                -10,
+            )
+
+    def test_live_split_rewrites_prior_scope_and_preserves_creator_rows(self):
+        with tempfile.TemporaryDirectory() as folder:
+            folder = Path(folder)
+            target = folder / "SK_tree.spm"
+            root = ET.Element("SpeedTreeModel")
+            assets = ET.SubElement(root, "Assets")
+            for material_id, name, mesh_ids in (
+                (4, "M_source", [1, 2, 3, 4]),
+                (8, "M_provider_a", [89, 90, 91, 92]),
+                (10, "M_provider_b", [93, 94]),
+            ):
+                add_material(assets, material_id, name, mesh_ids)
+            for mesh_id in (1, 2, 3, 4, 89, 90, 91, 92, 93, 94):
+                add_mesh(assets, mesh_id)
+            generator = add_variant_generator(
+                root,
+                "Leaf Mesh",
+                "Leaf 11",
+                [(8, 89), (10, 93), (10, 94), (8, 92)],
+            )
+            write_spm(target, root)
+
+            provider_a_rows = [
+                self._binding(generator, 0, 8, 89),
+                self._binding(generator, 1, 8, 90, created=True),
+                self._binding(generator, 2, 8, 91, created=True),
+                self._binding(generator, 3, 8, 92, created=True),
+            ]
+            provider_b_rows = [
+                self._binding(generator, 1, 10, 93),
+                self._binding(generator, 2, 10, 94),
+            ]
+            provider_a = self._manifest(
+                target, "provider_a", "scope-a", provider_a_rows
+            )
+            provider_b = self._manifest(
+                target, "provider_b", "scope-b", provider_b_rows
+            )
+            provider_a_path = speedtree.write_scope_manifest(
+                folder, provider_a, target
+            )
+            speedtree.write_scope_manifest(folder, provider_b, target)
+
+            preflight = (
+                speedtree.prepare_target_generator_ownership_reconciliation(
+                    target
+                )
+            )
+            result = (
+                speedtree.finalize_target_generator_ownership_reconciliation(
+                    target,
+                    provider_b,
+                    provider_b["generator_connection"],
+                    preflight,
+                )
+            )
+
+            self.assertEqual(
+                result["manifest"]["generator_binding_ownership"][
+                    "binding_count"
+                ],
+                2,
+            )
+            rewrite = next(
+                row
+                for row in result["receipt_rewrites"]
+                if row["path"] == provider_a_path.absolute()
+            )["payload"]
+            self.assertEqual(
+                [
+                    row["slot_prefix"]
+                    for row in rewrite["generator_connection"]["bindings"]
+                ],
+                ["Leaves:Type:0", "Leaves:Type:3"],
+            )
+            self.assertEqual(
+                len(
+                    rewrite["generator_connection"]["authored_bindings"]
+                ),
+                4,
+            )
+            self.assertEqual(
+                {
+                    row["slot_prefix"]
+                    for row in rewrite[
+                        "generator_slot_creation_provenance"
+                    ]["slots"]
+                },
+                {
+                    "Leaves:Type:1",
+                    "Leaves:Type:2",
+                    "Leaves:Type:3",
+                },
+            )
+
+    def test_live_split_receipts_commit_inside_one_staged_transaction(self):
+        with tempfile.TemporaryDirectory() as folder:
+            folder = Path(folder)
+            target = folder / "SK_tree.spm"
+            root = ET.Element("SpeedTreeModel")
+            assets = ET.SubElement(root, "Assets")
+            for material_id, name, mesh_ids in (
+                (4, "M_source", [1, 2, 3, 4]),
+                (8, "M_provider_a", [89, 90, 91, 92]),
+                (10, "M_provider_b", [93, 94]),
+            ):
+                add_material(assets, material_id, name, mesh_ids)
+            for mesh_id in (1, 2, 3, 4, 89, 90, 91, 92, 93, 94):
+                mesh = add_mesh(assets, mesh_id)
+                ET.SubElement(mesh, "Embedded").text = "true"
+            generator = add_variant_generator(
+                root,
+                "Leaf Mesh",
+                "Leaf 11",
+                [(8, 89), (10, 93), (10, 94), (8, 92)],
+            )
+            write_spm(target, root)
+
+            provider_a = self._manifest(
+                target,
+                "provider_a",
+                "scope-a",
+                [
+                    self._binding(generator, 0, 8, 89),
+                    self._binding(generator, 1, 8, 90, created=True),
+                    self._binding(generator, 2, 8, 91, created=True),
+                    self._binding(generator, 3, 8, 92, created=True),
+                ],
+            )
+            provider_b = self._manifest(
+                target,
+                "provider_b",
+                "scope-b",
+                [
+                    self._binding(generator, 1, 10, 93),
+                    self._binding(generator, 2, 10, 94),
+                ],
+            )
+            provider_a_path = speedtree.write_scope_manifest(
+                folder, provider_a, target
+            )
+            provider_b_path = speedtree.write_scope_manifest(
+                folder, provider_b, target
+            )
+
+            def build(staged_target, _production_target):
+                preflight = (
+                    speedtree.prepare_target_generator_ownership_reconciliation(
+                        staged_target
+                    )
+                )
+                staged_records = (
+                    speedtree.target_scope_generator_ownership_records(
+                        staged_target
+                    )
+                )
+                staged_b = next(
+                    record["payload"]
+                    for record in staged_records
+                    if record["payload"]["export_scope_id"] == "scope-b"
+                )
+                result = (
+                    speedtree.finalize_target_generator_ownership_reconciliation(
+                        staged_target,
+                        staged_b,
+                        staged_b["generator_connection"],
+                        preflight,
+                    )
+                )
+                for rewrite in result["receipt_rewrites"]:
+                    speedtree._write_json_if_changed(
+                        rewrite["path"], rewrite["payload"]
+                    )
+                payload = result["manifest"]
+                speedtree._write_json_if_changed(
+                    speedtree.target_manifest_path(staged_target),
+                    payload,
+                )
+                speedtree.write_scope_manifest(
+                    staged_target.parent,
+                    payload,
+                    staged_target,
+                )
+                return result
+
+            speedtree.execute_atomic_target_update(
+                [target],
+                build,
+                speedtree._validate_staged_speedtree_targets,
+            )
+
+            committed_a = json.loads(
+                provider_a_path.read_text(encoding="utf-8")
+            )
+            committed_b = json.loads(
+                provider_b_path.read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                [
+                    row["slot_prefix"]
+                    for row in committed_a["generator_connection"]["bindings"]
+                ],
+                ["Leaves:Type:0", "Leaves:Type:3"],
+            )
+            self.assertEqual(
+                committed_a["generator_binding_ownership"]["binding_count"],
+                2,
+            )
+            self.assertEqual(
+                committed_b["generator_binding_ownership"]["binding_count"],
+                2,
+            )
+            self.assertEqual(
+                len(committed_a["generator_connection"]["authored_bindings"]),
+                4,
+            )
+
+    def test_sealed_delivery_intent_authorizes_exact_staged_foreign_takeover(self):
+        with tempfile.TemporaryDirectory() as folder:
+            folder = Path(folder)
+            target = folder / "SK_tree.spm"
+            root = ET.Element("SpeedTreeModel")
+            assets = ET.SubElement(root, "Assets")
+            add_material(assets, 8, "M_provider_a", [89])
+            add_material(assets, 10, "M_provider_b", [93])
+            add_mesh(assets, 89)
+            add_mesh(assets, 93)
+            generator = add_variant_generator(
+                root, "Leaf Mesh", "Leaf 11", [(8, 89)]
+            )
+            write_spm(target, root)
+            provider_a_rows = [self._binding(generator, 0, 8, 89)]
+            provider_a = self._manifest(
+                target, "provider_a", "scope-a", provider_a_rows
+            )
+            self._seal_delivery_scope(
+                target,
+                provider_a,
+                provider_a_rows,
+            )
+            provider_a_path = speedtree.write_scope_manifest(
+                folder, provider_a, target
+            )
+            # A pre-issued B claim names the intended final pair but is not a
+            # transfer grant from A.  It participates in preflight so this
+            # covers the strongest currently available staged handoff proof.
+            provider_b_rows = [self._binding(generator, 0, 10, 93)]
+            provider_b = self._manifest(
+                target, "provider_b", "scope-b", provider_b_rows
+            )
+            speedtree.write_scope_manifest(folder, provider_b, target)
+            preflight = (
+                speedtree.prepare_target_generator_ownership_reconciliation(
+                    target
+                )
+            )
+
+            changed = speedtree.read_spm_xml(target)
+            pair = speedtree.spm_generator_property_pairs(changed)[0]
+            pair["material_property"].find("Value").text = "10"
+            pair["mesh_property"].find("Value").text = "93"
+            speedtree.write_spm_xml(target, changed)
+            slot_identity = list(
+                delivery_scope.canonical_slot_identity(provider_b_rows[0])
+            )
+            intent = {
+                "kind": delivery_scope.INTENT_KIND,
+                "schema_version": delivery_scope.SCHEMA_VERSION,
+                "authority": {
+                    "kind": "test_recipe",
+                    "id": "foreign-handoff-attempt",
+                    "provenance": {"fixture": "self-declared-authority"},
+                },
+                "target": {
+                    "spm": str(target),
+                    "provider_blend": provider_b["blend_file"],
+                    "provider_scope_id": provider_b["export_scope_id"],
+                    "material_id": 10,
+                },
+                "authored_slots": [{
+                    "slot_identity": slot_identity,
+                    "target_material_id": 10,
+                    "target_mesh_id": 93,
+                }],
+                "required_live_slot_identities": [slot_identity],
+                "continuity_only_slots": [],
+                "runtime_inactive_policy": (
+                    delivery_scope.RUNTIME_INACTIVE_POLICY
+                ),
+            }
+            intent["intent_sha256"] = delivery_scope.canonical_sha256(
+                intent
+            )
+            postwrite_sha256 = speedtree.spm_text_sha256(target)
+            provider_b["generator_connection"]["delivery_scope"] = (
+                delivery_scope.build_resolved_delivery_scope(
+                    intent,
+                    provider_b_rows,
+                    postwrite_sha256,
+                )
+            )
+            delivery_scope.validate_resolved_delivery_scope(
+                provider_b["generator_connection"],
+                target_spm=target,
+                material_id=10,
+                provider_blend=provider_b["blend_file"],
+                target_spm_postwrite_sha256=postwrite_sha256,
+            )
+
+            result = (
+                speedtree.finalize_target_generator_ownership_reconciliation(
+                    target,
+                    provider_b,
+                    provider_b["generator_connection"],
+                    preflight,
+                    contract_target_spm=target,
+                    ownership_transaction_is_staged=True,
+                )
+            )
+
+            predecessor = next(
+                rewrite["payload"]
+                for rewrite in result["receipt_rewrites"]
+                if rewrite["path"] == provider_a_path.absolute()
+            )
+            self.assertEqual(
+                predecessor["generator_connection"]["bindings"],
+                [],
+            )
+            self.assertEqual(
+                len(predecessor["generator_connection"]["authored_bindings"]),
+                1,
+            )
+            authorization = predecessor["generator_connection"][
+                "relinquished_bindings"
+            ][0]["successor_authorization"]
+            self.assertEqual(
+                authorization["basis"],
+                "sealed_prewrite_owner_plus_resolved_delivery_scope",
+            )
+            self.assertEqual(
+                authorization["predecessor_provider"]["export_scope_id"],
+                "scope-a",
+            )
+            self.assertEqual(
+                authorization["successor_provider"]["export_scope_id"],
+                "scope-b",
+            )
+            historical = delivery_scope.validate_resolved_delivery_scope(
+                predecessor["generator_connection"],
+                target_spm=target,
+                material_id=8,
+                provider_blend=provider_a["blend_file"],
+                target_spm_postwrite_sha256=(
+                    speedtree.spm_text_sha256(target)
+                ),
+                postwrite_validation_mode=(
+                    delivery_scope.POSTWRITE_MODE_HISTORICAL_PROOF
+                ),
+            )
+            self.assertFalse(
+                historical["target_spm_postwrite_matches_current"]
+            )
+
+    def test_foreign_takeover_rejects_missing_or_drifted_successor_proof(self):
+        with tempfile.TemporaryDirectory() as folder:
+            folder = Path(folder)
+            target = folder / "SK_tree.spm"
+            root = ET.Element("SpeedTreeModel")
+            assets = ET.SubElement(root, "Assets")
+            add_material(assets, 8, "M_provider_a", [89])
+            add_material(assets, 10, "M_provider_b", [93, 94])
+            add_mesh(assets, 89)
+            add_mesh(assets, 93)
+            add_mesh(assets, 94)
+            generator = add_variant_generator(
+                root, "Leaf Mesh", "Leaf 11", [(8, 89)]
+            )
+            write_spm(target, root)
+            provider_a = self._manifest(
+                target,
+                "provider_a",
+                "scope-a",
+                [self._binding(generator, 0, 8, 89)],
+            )
+            provider_b_row = self._binding(generator, 0, 10, 93)
+            provider_b = self._manifest(
+                target, "provider_b", "scope-b", [provider_b_row]
+            )
+            speedtree.write_scope_manifest(folder, provider_a, target)
+            speedtree.write_scope_manifest(folder, provider_b, target)
+            preflight = (
+                speedtree.prepare_target_generator_ownership_reconciliation(
+                    target
+                )
+            )
+            changed = speedtree.read_spm_xml(target)
+            pair = speedtree.spm_generator_property_pairs(changed)[0]
+            pair["material_property"].find("Value").text = "10"
+            pair["mesh_property"].find("Value").text = "93"
+            speedtree.write_spm_xml(target, changed)
+            self._seal_delivery_scope(target, provider_b, [provider_b_row])
+
+            with self.assertRaisesRegex(
+                speedtree.GeneratorSlotOwnershipError,
+                "atomic staged",
+            ):
+                speedtree.finalize_target_generator_ownership_reconciliation(
+                    target,
+                    provider_b,
+                    provider_b["generator_connection"],
+                    preflight,
+                    contract_target_spm=target,
+                    ownership_transaction_is_staged=False,
+                )
+
+            no_intent = copy.deepcopy(provider_b)
+            no_intent["generator_connection"].pop("delivery_scope")
+            with self.assertRaisesRegex(
+                speedtree.GeneratorSlotOwnershipError,
+                "requires a resolved delivery scope",
+            ):
+                speedtree.finalize_target_generator_ownership_reconciliation(
+                    target,
+                    no_intent,
+                    no_intent["generator_connection"],
+                    preflight,
+                    contract_target_spm=target,
+                    ownership_transaction_is_staged=True,
+                )
+
+            named = copy.deepcopy(provider_b)
+            named_authored = copy.deepcopy(provider_b_row)
+            named_authored["generator_guid"] = ""
+            named_identity = [[
+                "named",
+                named_authored["generator_type"],
+                named_authored["generator_name"],
+                named_authored["slot_prefix"],
+            ]]
+            self._seal_delivery_scope(
+                target,
+                named,
+                [named_authored],
+                slot_identities=named_identity,
+            )
+            with self.assertRaisesRegex(
+                speedtree.GeneratorSlotOwnershipError,
+                "requires exact GUID slot identities",
+            ):
+                speedtree.finalize_target_generator_ownership_reconciliation(
+                    target,
+                    named,
+                    named["generator_connection"],
+                    preflight,
+                    contract_target_spm=target,
+                    ownership_transaction_is_staged=True,
+                )
+
+            pair_drift = copy.deepcopy(provider_b)
+            drifted_authored = {
+                **copy.deepcopy(provider_b_row),
+                "target_mesh_id": 94,
+            }
+            self._seal_delivery_scope(
+                target,
+                pair_drift,
+                [drifted_authored],
+            )
+            with self.assertRaisesRegex(
+                speedtree.GeneratorSlotOwnershipError,
+                "does not match.*final delivery",
+            ):
+                speedtree.finalize_target_generator_ownership_reconciliation(
+                    target,
+                    pair_drift,
+                    pair_drift["generator_connection"],
+                    preflight,
+                    contract_target_spm=target,
+                    ownership_transaction_is_staged=True,
+                )
+
+            provider_drift = copy.deepcopy(provider_b)
+            provider_drift["blend_file"] = str(folder / "provider_c.blend")
+            with self.assertRaisesRegex(
+                speedtree.GeneratorSlotOwnershipError,
+                "delivery seal is invalid",
+            ):
+                speedtree.finalize_target_generator_ownership_reconciliation(
+                    target,
+                    provider_drift,
+                    provider_drift["generator_connection"],
+                    preflight,
+                    contract_target_spm=target,
+                    ownership_transaction_is_staged=True,
+                )
+
+            target_drift = copy.deepcopy(provider_b)
+            self._seal_delivery_scope(
+                target,
+                target_drift,
+                [provider_b_row],
+                target_spm=folder / "foreign.spm",
+            )
+            with self.assertRaisesRegex(
+                speedtree.GeneratorSlotOwnershipError,
+                "delivery seal is invalid",
+            ):
+                speedtree.finalize_target_generator_ownership_reconciliation(
+                    target,
+                    target_drift,
+                    target_drift["generator_connection"],
+                    preflight,
+                    contract_target_spm=target,
+                    ownership_transaction_is_staged=True,
+                )
+
+            preflight_drift = copy.deepcopy(preflight)
+            preflight_drift["fingerprint"] = "0" * 64
+            with self.assertRaisesRegex(
+                speedtree.GeneratorSlotOwnershipError,
+                "preflight fingerprint drifted",
+            ):
+                speedtree.finalize_target_generator_ownership_reconciliation(
+                    target,
+                    provider_b,
+                    provider_b["generator_connection"],
+                    preflight_drift,
+                    contract_target_spm=target,
+                    ownership_transaction_is_staged=True,
+                )
+
+    def test_repeated_foreign_handoffs_preserve_exact_generation_history(self):
+        with tempfile.TemporaryDirectory() as folder:
+            folder = Path(folder)
+            target = folder / "SK_tree.spm"
+            root = ET.Element("SpeedTreeModel")
+            assets = ET.SubElement(root, "Assets")
+            providers = {
+                "a": {
+                    "scope": "scope-a",
+                    "material_id": 8,
+                    "initial_mesh_id": 80,
+                    "return_mesh_id": 110,
+                },
+                "b": {
+                    "scope": "scope-b",
+                    "material_id": 9,
+                    "initial_mesh_id": 90,
+                },
+                "c": {
+                    "scope": "scope-c",
+                    "material_id": 10,
+                    "initial_mesh_id": 100,
+                },
+            }
+            for name, provider in providers.items():
+                mesh_ids = [provider["initial_mesh_id"]]
+                if "return_mesh_id" in provider:
+                    mesh_ids.append(provider["return_mesh_id"])
+                add_material(
+                    assets,
+                    provider["material_id"],
+                    f"M_provider_{name}",
+                    mesh_ids,
+                )
+                for mesh_id in mesh_ids:
+                    add_mesh(assets, mesh_id)
+            generator = add_variant_generator(
+                root,
+                "Leaf Mesh",
+                "Leaf repeated handoff",
+                [(8, 80)],
+            )
+            for prop in generator.iter("Property"):
+                name = prop.find("Name")
+                if name is not None and name.text:
+                    name.text = name.text.replace(
+                        "Leaves:Type:0:",
+                        "Leaves:Type:42:",
+                    )
+            write_spm(target, root)
+
+            def binding(provider_name, mesh_id):
+                provider = providers[provider_name]
+                row = self._binding(
+                    generator,
+                    42,
+                    provider["material_id"],
+                    mesh_id,
+                )
+                row["source_mesh_id"] = 1
+                row["leaf_ordinal"] = 1
+                return row
+
+            initial_a_row = binding("a", 80)
+            initial_a = self._manifest(
+                target,
+                "provider_a",
+                providers["a"]["scope"],
+                [initial_a_row],
+            )
+            self._seal_delivery_scope(
+                target,
+                initial_a,
+                [initial_a_row],
+            )
+            receipt_paths = {
+                "a": speedtree.write_scope_manifest(
+                    folder,
+                    initial_a,
+                    target,
+                )
+            }
+
+            def transition(predecessor_name, successor_name, mesh_id):
+                successor = providers[successor_name]
+                successor_row = binding(successor_name, mesh_id)
+                successor_path = receipt_paths.get(successor_name)
+                if successor_path is not None and successor_path.is_file():
+                    previous_payload = json.loads(
+                        successor_path.read_text(encoding="utf-8")
+                    )
+                else:
+                    previous_payload = self._manifest(
+                        target,
+                        f"provider_{successor_name}",
+                        successor["scope"],
+                        [successor_row],
+                    )
+                previous_connection = copy.deepcopy(
+                    previous_payload.get("generator_connection") or {}
+                )
+                preclaim = speedtree.manifest_with_binding_contracts(
+                    previous_payload,
+                    [successor_row],
+                )
+                receipt_paths[successor_name] = (
+                    speedtree.write_scope_manifest(
+                        folder,
+                        preclaim,
+                        target,
+                    )
+                )
+                preflight = (
+                    speedtree.prepare_target_generator_ownership_reconciliation(
+                        target
+                    )
+                )
+
+                changed = speedtree.read_spm_xml(target)
+                pair = next(
+                    item
+                    for item in speedtree.spm_generator_property_pairs(changed)
+                    if item["slot_prefix"] == "Leaves:Type:42"
+                )
+                pair["material_property"].find("Value").text = str(
+                    successor["material_id"]
+                )
+                pair["mesh_property"].find("Value").text = str(mesh_id)
+                speedtree.write_spm_xml(target, changed)
+
+                current = copy.deepcopy(preclaim)
+                connection = current["generator_connection"]
+                history = copy.deepcopy(
+                    previous_connection.get("delivery_scope_history") or []
+                )
+                previous_scope = previous_connection.get("delivery_scope")
+                if previous_scope is not None:
+                    historical_row = {
+                        "state": "historical_production_proof",
+                        "authored_bindings": copy.deepcopy(
+                            previous_connection.get("authored_bindings")
+                            or previous_connection.get("bindings")
+                            or []
+                        ),
+                        "delivery_scope": copy.deepcopy(previous_scope),
+                    }
+                    previous_hash = str(
+                        (previous_scope.get("resolved") or {}).get(
+                            "resolved_sha256"
+                        )
+                        or ""
+                    )
+                    known_hashes = {
+                        str(
+                            (
+                                (row.get("delivery_scope") or {}).get(
+                                    "resolved"
+                                )
+                                or {}
+                            ).get("resolved_sha256")
+                            or ""
+                        )
+                        for row in history
+                        if isinstance(row, dict)
+                    }
+                    if previous_hash not in known_hashes:
+                        history.append(historical_row)
+                connection["bindings"] = [copy.deepcopy(successor_row)]
+                connection["authored_bindings"] = [
+                    copy.deepcopy(successor_row)
+                ]
+                if history:
+                    connection["delivery_scope_history"] = history
+                self._seal_delivery_scope(
+                    target,
+                    current,
+                    [successor_row],
+                )
+                result = (
+                    speedtree.finalize_target_generator_ownership_reconciliation(
+                        target,
+                        current,
+                        current["generator_connection"],
+                        preflight,
+                        contract_target_spm=target,
+                        ownership_transaction_is_staged=True,
+                    )
+                )
+                for rewrite in result["receipt_rewrites"]:
+                    speedtree._write_json_if_changed(
+                        rewrite["path"],
+                        rewrite["payload"],
+                    )
+                receipt_paths[successor_name] = (
+                    speedtree.write_scope_manifest(
+                        folder,
+                        result["manifest"],
+                        target,
+                    )
+                )
+                predecessor_payload = json.loads(
+                    receipt_paths[predecessor_name].read_text(
+                        encoding="utf-8"
+                    )
+                )
+                self.assertEqual(
+                    predecessor_payload["generator_connection"]["bindings"],
+                    [],
+                )
+                authorization = predecessor_payload[
+                    "generator_connection"
+                ]["relinquished_bindings"][-1][
+                    "successor_authorization"
+                ]
+                self.assertEqual(
+                    authorization["predecessor_provider"][
+                        "export_scope_id"
+                    ],
+                    providers[predecessor_name]["scope"],
+                )
+                self.assertEqual(
+                    authorization["successor_provider"][
+                        "export_scope_id"
+                    ],
+                    successor["scope"],
+                )
+
+            transition("a", "b", 90)
+            transition("b", "c", 100)
+            transition("c", "a", 110)
+
+            current_sha256 = speedtree.spm_text_sha256(target)
+            final_a = json.loads(
+                receipt_paths["a"].read_text(encoding="utf-8")
+            )
+            final_a_connection = final_a["generator_connection"]
+            self.assertEqual(
+                [
+                    (
+                        row["target_material_id"],
+                        row["target_mesh_id"],
+                    )
+                    for row in final_a_connection["authored_bindings"]
+                ],
+                [(8, 110)],
+            )
+            self.assertEqual(
+                final_a_connection["bindings"][0]["slot_prefix"],
+                "Leaves:Type:42",
+            )
+            self.assertEqual(
+                len(final_a_connection["delivery_scope_history"]),
+                1,
+            )
+            current_a = delivery_scope.validate_resolved_delivery_scope(
+                final_a_connection,
+                target_spm=target,
+                material_id=8,
+                provider_blend=final_a["blend_file"],
+                target_spm_postwrite_sha256=current_sha256,
+            )
+            self.assertTrue(
+                current_a["target_spm_postwrite_matches_current"]
+            )
+
+            historical_receipts = [
+                (
+                    final_a_connection["delivery_scope_history"][0],
+                    final_a,
+                    8,
+                )
+            ]
+            for provider_name in ("b", "c"):
+                payload = json.loads(
+                    receipt_paths[provider_name].read_text(encoding="utf-8")
+                )
+                historical_receipts.append(
+                    (
+                        payload["generator_connection"],
+                        payload,
+                        providers[provider_name]["material_id"],
+                    )
+                )
+            for connection, payload, material_id in historical_receipts:
+                validated = delivery_scope.validate_resolved_delivery_scope(
+                    connection,
+                    target_spm=target,
+                    material_id=material_id,
+                    provider_blend=payload["blend_file"],
+                    target_spm_postwrite_sha256=current_sha256,
+                    postwrite_validation_mode=(
+                        delivery_scope.POSTWRITE_MODE_HISTORICAL_PROOF
+                    ),
+                )
+                self.assertFalse(
+                    validated["target_spm_postwrite_matches_current"]
+                )
 
 
 class SpmWriterTests(unittest.TestCase):

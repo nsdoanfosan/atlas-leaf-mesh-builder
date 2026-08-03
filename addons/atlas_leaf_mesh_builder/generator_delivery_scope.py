@@ -22,8 +22,10 @@ SCOPE_KIND = "speedtree_generator_delivery_scope"
 SCHEMA_VERSION = 1
 RUNTIME_INACTIVE_POLICY = "sealed_required_live"
 CONTINUITY_ONLY_POLICY = "relationship_continuity_only"
+MATERIAL_DEFAULT_MESH_ID = -10
+POSTWRITE_MODE_EXACT_CURRENT = "exact_current"
+POSTWRITE_MODE_HISTORICAL_PROOF = "historical_production_proof"
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
-_TRUNCATED_GUID_RE = re.compile(r"^([A-Za-z0-9+/]{21})==$")
 
 
 class GeneratorDeliveryScopeError(ValueError):
@@ -41,12 +43,8 @@ def canonical_sha256(value):
 
 
 def generator_guid_key(value):
-    """Match SpeedTree's two observed spellings of the same 16-byte GUID."""
-    text = str(value or "").strip()
-    match = _TRUNCATED_GUID_RE.match(text)
-    if match:
-        text = match.group(1) + "A=="
-    return text.casefold()
+    """Return an exact opaque SpeedTree GUID with outer whitespace removed."""
+    return str(value or "").strip()
 
 
 def _positive_id(value, label):
@@ -60,6 +58,27 @@ def _positive_id(value, label):
         ) from exc
     if parsed <= 0:
         raise GeneratorDeliveryScopeError(f"{label} must be a positive integer")
+    return parsed
+
+
+def _target_mesh_id(value, label):
+    if isinstance(value, bool):
+        raise GeneratorDeliveryScopeError(
+            f"{label} must be a positive integer or "
+            f"{MATERIAL_DEFAULT_MESH_ID} (material default)"
+        )
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise GeneratorDeliveryScopeError(
+            f"{label} must be a positive integer or "
+            f"{MATERIAL_DEFAULT_MESH_ID} (material default)"
+        ) from exc
+    if parsed != MATERIAL_DEFAULT_MESH_ID and parsed <= 0:
+        raise GeneratorDeliveryScopeError(
+            f"{label} must be a positive integer or "
+            f"{MATERIAL_DEFAULT_MESH_ID} (material default)"
+        )
     return parsed
 
 
@@ -80,7 +99,7 @@ def canonical_slot_identity(value, *, strict=True):
         prefix = str(
             value.get("slot_prefix")
             or str(value.get("material_property") or "").rsplit(":", 1)[0]
-        ).strip().casefold()
+        ).strip()
         guid = generator_guid_key(value.get("generator_guid"))
         if guid and prefix:
             return ("guid", guid, prefix)
@@ -91,9 +110,23 @@ def canonical_slot_identity(value, *, strict=True):
             prefix,
         )
     elif isinstance(value, (list, tuple)):
-        identity = tuple(str(part or "").strip().casefold() for part in value)
-        if identity and identity[0] == "guid" and len(identity) == 3:
-            identity = ("guid", generator_guid_key(identity[1]), identity[2])
+        parts = tuple(str(part or "").strip() for part in value)
+        kind = parts[0].casefold() if parts else ""
+        if kind == "guid" and len(parts) == 3:
+            identity = (
+                "guid",
+                generator_guid_key(parts[1]),
+                parts[2],
+            )
+        elif kind == "named" and len(parts) == 4:
+            identity = (
+                "named",
+                parts[1].casefold(),
+                parts[2].casefold(),
+                parts[3],
+            )
+        else:
+            identity = (kind, *parts[1:])
     else:
         raise GeneratorDeliveryScopeError("slot identity must be an object or list")
     if len(identity) not in {3, 4} or identity[0] not in {"guid", "named"}:
@@ -119,7 +152,7 @@ def canonical_authored_slot(row):
             row.get("target_material_id"),
             "authored slot target_material_id",
         ),
-        "target_mesh_id": _positive_id(
+        "target_mesh_id": _target_mesh_id(
             row.get("target_mesh_id"),
             "authored slot target_mesh_id",
         ),
@@ -338,6 +371,7 @@ def validate_resolved_delivery_scope(
     material_id,
     provider_blend,
     target_spm_postwrite_sha256,
+    postwrite_validation_mode=POSTWRITE_MODE_EXACT_CURRENT,
 ):
     """Consumer-compatible validation retained as a producer self-check."""
     if not isinstance(connection, dict):
@@ -354,7 +388,11 @@ def validate_resolved_delivery_scope(
         material_id=material_id,
         provider_blend=provider_blend,
     )
-    bindings = connection.get("bindings")
+    bindings = (
+        connection.get("authored_bindings")
+        if "authored_bindings" in connection
+        else connection.get("bindings")
+    )
     actual_authored = canonical_authored_slots(bindings)
     if actual_authored != validated["authored_slots"]:
         raise GeneratorDeliveryScopeError(
@@ -375,20 +413,48 @@ def validate_resolved_delivery_scope(
         raise GeneratorDeliveryScopeError("resolved delivery bindings hash mismatch")
     postwrite = str(resolved.get("target_spm_postwrite_sha256") or "").strip().casefold()
     expected_postwrite = str(target_spm_postwrite_sha256 or "").strip().casefold()
-    if _SHA256_RE.fullmatch(postwrite) is None or postwrite != expected_postwrite:
+    if postwrite_validation_mode not in {
+        POSTWRITE_MODE_EXACT_CURRENT,
+        POSTWRITE_MODE_HISTORICAL_PROOF,
+    }:
+        raise GeneratorDeliveryScopeError(
+            "resolved delivery postwrite validation mode is unsupported"
+        )
+    if _SHA256_RE.fullmatch(postwrite) is None:
+        raise GeneratorDeliveryScopeError(
+            "resolved delivery target SPM hash is invalid"
+        )
+    if _SHA256_RE.fullmatch(expected_postwrite) is None:
+        raise GeneratorDeliveryScopeError(
+            "current target SPM hash is invalid"
+        )
+    postwrite_matches_current = postwrite == expected_postwrite
+    if (
+        postwrite_validation_mode == POSTWRITE_MODE_EXACT_CURRENT
+        and not postwrite_matches_current
+    ):
         raise GeneratorDeliveryScopeError("resolved delivery target SPM hash mismatch")
     projection = {key: value for key, value in resolved.items() if key != "resolved_sha256"}
     expected_resolved_hash = canonical_sha256(projection)
     supplied_resolved_hash = str(resolved.get("resolved_sha256") or "").strip().casefold()
     if supplied_resolved_hash != expected_resolved_hash:
         raise GeneratorDeliveryScopeError("resolved delivery receipt hash mismatch")
-    return validated
+    return {
+        **validated,
+        "postwrite_validation_mode": postwrite_validation_mode,
+        "target_spm_postwrite_sha256": postwrite,
+        "current_target_spm_sha256": expected_postwrite,
+        "target_spm_postwrite_matches_current": postwrite_matches_current,
+    }
 
 
 __all__ = [
     "CONTINUITY_ONLY_POLICY",
     "GeneratorDeliveryScopeError",
     "INTENT_KIND",
+    "MATERIAL_DEFAULT_MESH_ID",
+    "POSTWRITE_MODE_EXACT_CURRENT",
+    "POSTWRITE_MODE_HISTORICAL_PROOF",
     "RESOLVED_KIND",
     "RUNTIME_INACTIVE_POLICY",
     "SCHEMA_VERSION",
@@ -397,6 +463,7 @@ __all__ = [
     "canonical_authored_slots",
     "canonical_sha256",
     "canonical_slot_identity",
+    "generator_guid_key",
     "validate_delivery_scope_intent",
     "validate_planned_delivery_scope",
     "validate_resolved_delivery_scope",

@@ -253,6 +253,15 @@ class StagedSpeedTreeValidationTests(unittest.TestCase):
         speedtree.ET.SubElement(material, "CutoutMeshID").text = "1"
         speedtree.write_spm_xml(path, root)
 
+    def _write_empty_generator_contract(self, path):
+        manifest = speedtree.manifest_with_binding_contracts(
+            {"generator_connection": {"bindings": []}},
+            [],
+        )
+        receipt = speedtree.target_manifest_path(path)
+        receipt.parent.mkdir(parents=True, exist_ok=True)
+        receipt.write_text(json.dumps(manifest), encoding="utf-8")
+
     def test_validation_rejects_absent_external_mesh_filename(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
@@ -283,6 +292,7 @@ class StagedSpeedTreeValidationTests(unittest.TestCase):
             sibling = stage / "sibling.spm"
             self._spm_with_external_mesh(selected, "meshes/shared.fbx")
             self._spm_with_external_mesh(sibling, "meshes/shared.fbx")
+            self._write_empty_generator_contract(selected)
             state = {
                 "stage_root": stage,
                 "production_root": production,
