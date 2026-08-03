@@ -17,6 +17,14 @@ import bpy
 from mathutils import Matrix, Vector
 
 from .constants import SPEEDTREE_101_BLANK_SPM, SPEEDTREE_101_EXTERNAL_MESH_SAMPLE, SPEEDTREE_101_MATERIAL_SAMPLE
+from .generator_delivery_scope import (
+    GeneratorDeliveryScopeError,
+    build_resolved_delivery_scope,
+    canonical_authored_slots,
+    canonical_slot_identity,
+    validate_planned_delivery_scope,
+    validate_resolved_delivery_scope,
+)
 from .materials import make_speedtree_material
 from .props import speedtree_spm_targets
 from .speedtree_transaction import (
@@ -379,6 +387,18 @@ def write_speedtree_xml_mesh(xml_path, mesh, material_name, anchors):
 
 def read_spm_xml(path):
     return ET.fromstring(gzip.decompress(Path(path).read_bytes()))
+
+
+def read_spm_text(path):
+    """Read the decompressed SPM text exactly as SpeedTree Batch does."""
+    payload = Path(path).read_bytes()
+    if payload[:2] == b"\x1f\x8b":
+        payload = gzip.decompress(payload)
+    return payload.decode("utf-8", errors="replace")
+
+
+def spm_text_sha256(path):
+    return hashlib.sha256(read_spm_text(path).encode("utf-8")).hexdigest()
 
 
 def strip_spm_layout_whitespace(node):
@@ -3309,6 +3329,274 @@ def apply_authoritative_source_binding_repairs(
     return applied
 
 
+def _generator_delivery_output_ordinals(material_groups):
+    ordinals = set()
+    for group in material_groups or []:
+        for item in group.get("meshes") or []:
+            ordinal = positive_int(item.get("source_ordinal"))
+            source_object = str(item.get("source_object") or "")
+            match = re.search(
+                r"(?:^|[^a-z0-9])leaf[_ -]?(\d+)",
+                source_object,
+                re.IGNORECASE,
+            )
+            if ordinal is None and match:
+                ordinal = int(match.group(1))
+            if ordinal is None:
+                raise RuntimeError(
+                    f"Exported mesh '{item.get('name') or source_object}' has "
+                    "no explicit source ordinal or leaf_NN fallback."
+                )
+            if ordinal in ordinals:
+                raise RuntimeError(
+                    f"Generated atlas output duplicates source ordinal {ordinal}."
+                )
+            ordinals.add(ordinal)
+    if not ordinals:
+        raise RuntimeError("Generator delivery planning found no atlas outputs.")
+    return ordinals
+
+
+def plan_atlas_generator_slot_identities(
+    root,
+    source_material_names,
+    *,
+    source_material_ids=None,
+    previous_bindings=None,
+    source_mesh_ids_by_name=None,
+    generator_variant_policy=None,
+    expected_output_ordinals=None,
+):
+    """Plan the complete semantic Generator slot set without mutating XML."""
+    variant_policy = normalize_generator_variant_policy(
+        generator_variant_policy
+    )
+    assets = root.find("Assets")
+    if assets is None:
+        raise RuntimeError("Target SPM has no Assets node.")
+    _names, source_records = source_materials_by_name(
+        assets,
+        source_material_names,
+        source_material_ids,
+        source_mesh_ids_by_name,
+    )
+    normalized_previous_bindings = normalize_generator_bindings(
+        root,
+        previous_bindings,
+        context="Previous Atlas Generator binding",
+        allow_missing=True,
+    )
+    previous_by_slot = {
+        (integer_value(item.get("generator_index")), item.get("slot_prefix")): item
+        for item in normalized_previous_bindings
+        if isinstance(item, dict)
+    }
+    expected_ordinals = {
+        positive_int(value) for value in expected_output_ordinals or []
+    }
+    if None in expected_ordinals:
+        raise RuntimeError("Generator delivery output ordinals are invalid.")
+    if (
+        variant_policy
+        == GENERATOR_VARIANT_POLICY_ENSURE_ALL_MATERIAL_CUTOUTS
+        and not expected_ordinals
+    ):
+        raise RuntimeError(
+            "Generator variant coverage requires at least one output ordinal."
+        )
+
+    planned_pairs = []
+    generator_groups = {}
+    covered_ordinals = set()
+    for pair in spm_generator_property_pairs(root, {"Leaf Mesh", "Frond"}):
+        material_id = positive_int(
+            pair["material_property"].findtext("Value")
+        )
+        mesh_property = pair.get("mesh_property")
+        mesh_id = (
+            integer_value(mesh_property.findtext("Value"))
+            if mesh_property is not None
+            else None
+        )
+        previous = previous_by_slot.get(
+            (pair["generator_index"], pair["slot_prefix"])
+        )
+        ordinal = (
+            positive_int(previous.get("leaf_ordinal"))
+            if previous is not None
+            else None
+        )
+        if ordinal is None and material_id in source_records:
+            if mesh_property is None:
+                raise RuntimeError(
+                    f"Generator '{pair['generator_name']}' slot "
+                    f"'{pair['slot_prefix']}' has Material but no Mesh property."
+                )
+            source = source_records[material_id]
+            if mesh_id == -10:
+                ordinal = 1
+            elif mesh_id in source["mesh_ids"]:
+                ordinal = source["mesh_ids"].index(mesh_id) + 1
+            else:
+                raise RuntimeError(
+                    f"Generator '{pair['generator_name']}' mesh ID {mesh_id} "
+                    f"is not in source material '{source['name']}' cutout "
+                    f"mesh list {source['mesh_ids']}."
+                )
+        if ordinal is None:
+            continue
+        planned_pairs.append(pair)
+        if (
+            variant_policy
+            != GENERATOR_VARIANT_POLICY_ENSURE_ALL_MATERIAL_CUTOUTS
+        ):
+            continue
+        descriptor = generator_variant_slot_descriptor(pair)
+        if descriptor is None:
+            continue
+        parent_name, _slot_index = descriptor
+        if ordinal not in expected_ordinals:
+            ordinal = min(expected_ordinals)
+        group = generator_groups.setdefault(
+            (pair["generator_index"], parent_name),
+            {
+                "generator": pair["generator"],
+                "generator_index": pair["generator_index"],
+                "parent_name": parent_name,
+                "ordinals": [],
+            },
+        )
+        group["ordinals"].append(ordinal)
+        covered_ordinals.add(ordinal)
+
+    virtual_pairs = []
+    if (
+        variant_policy
+        == GENERATOR_VARIANT_POLICY_ENSURE_ALL_MATERIAL_CUTOUTS
+    ):
+        missing_ordinals = sorted(expected_ordinals - covered_ordinals)
+        if missing_ordinals:
+            if not generator_groups:
+                raise RuntimeError(
+                    "Generator variant coverage found no supported Frond or "
+                    "Leaf Mesh multi-property parent referencing the source "
+                    "material or previous generated atlas."
+                )
+            candidates = []
+            for group in generator_groups.values():
+                state = generator_variant_parent_state(
+                    group["generator"], group["parent_name"]
+                )
+                group = dict(group)
+                group["child_count"] = state["child_count"]
+                candidates.append(group)
+            host = sorted(
+                candidates,
+                key=lambda item: (
+                    0 if 1 in item["ordinals"] else 1,
+                    -len(item["ordinals"]),
+                    item["generator_index"],
+                ),
+            )[0]
+            generator = host["generator"]
+            for offset, _ordinal in enumerate(missing_ordinals):
+                virtual_pairs.append({
+                    "generator_name": str(generator.findtext("Name") or ""),
+                    "generator_guid": generator_guid(generator),
+                    "generator_type": generator_type_name(generator),
+                    "slot_prefix": (
+                        f"{host['parent_name']}:"
+                        f"{host['child_count'] + offset}"
+                    ),
+                })
+
+    identities = [
+        canonical_slot_identity(pair)
+        for pair in [*planned_pairs, *virtual_pairs]
+    ]
+    if not identities:
+        raise RuntimeError(
+            "Generator delivery planning found no slots for the requested source."
+        )
+    if len(identities) != len(set(identities)):
+        raise RuntimeError(
+            "Generator delivery planning produced duplicate canonical identities."
+        )
+    return sorted(identities)
+
+
+def preflight_generator_delivery_scope(
+    spm_path,
+    intent,
+    *,
+    manifest,
+    material_groups,
+    source_material_names,
+    source_material_ids=None,
+    previous_bindings=None,
+    source_mesh_ids_by_name=None,
+    generator_variant_policy=None,
+    source_binding_repairs=None,
+):
+    """Validate and plan explicit intent before the first target SPM write."""
+    if intent is None:
+        return None
+    if len(source_material_names or []) != 1:
+        raise GeneratorDeliveryScopeError(
+            "explicit Generator delivery scope requires exactly one source material"
+        )
+    root = read_spm_xml(spm_path)
+    assets = root.find("Assets")
+    if assets is None:
+        raise RuntimeError("Target SPM has no Assets node.")
+    apply_authoritative_source_binding_repairs(
+        root,
+        source_materials_by_name(
+            assets,
+            source_material_names,
+            source_material_ids,
+            source_mesh_ids_by_name,
+        )[1],
+        source_binding_repairs,
+    )
+    _names, source_records = source_materials_by_name(
+        assets,
+        source_material_names,
+        source_material_ids,
+        source_mesh_ids_by_name,
+    )
+    if len(source_records) != 1:
+        raise GeneratorDeliveryScopeError(
+            "explicit Generator delivery scope requires one exact source material"
+        )
+    source_material_id = next(iter(source_records))
+    output_ordinals = _generator_delivery_output_ordinals(material_groups)
+    planned = plan_atlas_generator_slot_identities(
+        root,
+        source_material_names,
+        source_material_ids=source_material_ids,
+        previous_bindings=previous_bindings,
+        source_mesh_ids_by_name=source_mesh_ids_by_name,
+        generator_variant_policy=generator_variant_policy,
+        expected_output_ordinals=output_ordinals,
+    )
+    validated = validate_planned_delivery_scope(
+        intent,
+        planned,
+        target_spm=spm_path,
+        material_id=source_material_id,
+        provider_blend=manifest.get("blend_file"),
+        provider_scope_id=manifest.get("export_scope_id"),
+    )
+    return {
+        "intent_sha256": validated["intent_sha256"],
+        "planned_slot_identities": [list(identity) for identity in planned],
+        "target_material_id": source_material_id,
+        "provider_blend": str(manifest.get("blend_file") or ""),
+        "provider_scope_id": str(manifest.get("export_scope_id") or ""),
+    }
+
+
 def connect_atlas_generators_in_spm(
     spm_path,
     source_material_names,
@@ -3319,6 +3607,8 @@ def connect_atlas_generators_in_spm(
     generator_variant_policy=None,
     source_binding_repairs=None,
     ownership_manifest=None,
+    generator_delivery_scope_intent=None,
+    delivery_scope_preflight=None,
 ):
     """Connect source Leaf Mesh/Frond slots to generated atlas assets.
 
@@ -3355,6 +3645,39 @@ def connect_atlas_generators_in_spm(
             source_binding_repairs,
         )
     )
+    delivery_scope_validation = None
+    if generator_delivery_scope_intent is not None:
+        output_ordinals = _generator_delivery_output_ordinals(material_groups)
+        planned_slot_identities = plan_atlas_generator_slot_identities(
+            root,
+            source_material_names,
+            source_material_ids=source_material_ids,
+            previous_bindings=previous_bindings,
+            source_mesh_ids_by_name=source_mesh_ids_by_name,
+            generator_variant_policy=variant_policy,
+            expected_output_ordinals=output_ordinals,
+        )
+        if len(source_records) != 1:
+            raise GeneratorDeliveryScopeError(
+                "explicit Generator delivery scope requires one exact material"
+            )
+        source_material_id = next(iter(source_records))
+        delivery_scope_validation = validate_planned_delivery_scope(
+            generator_delivery_scope_intent,
+            planned_slot_identities,
+            target_spm=spm_path,
+            material_id=source_material_id,
+        )
+        if delivery_scope_preflight is not None:
+            if (
+                delivery_scope_preflight.get("intent_sha256")
+                != delivery_scope_validation["intent_sha256"]
+                or delivery_scope_preflight.get("planned_slot_identities")
+                != [list(identity) for identity in planned_slot_identities]
+            ):
+                raise GeneratorDeliveryScopeError(
+                    "Generator delivery scope changed after its pre-write plan"
+                )
     output_bindings = atlas_output_bindings(assets, material_groups)
     deleted_retirement = retire_deleted_generator_bindings(
         root,
@@ -3827,6 +4150,14 @@ def connect_atlas_generators_in_spm(
                 binding.update(expanded_parent_provenance[parent_key])
         bindings.append(binding)
 
+    if delivery_scope_validation is not None:
+        if canonical_authored_slots(bindings) != delivery_scope_validation[
+            "authored_slots"
+        ]:
+            raise GeneratorDeliveryScopeError(
+                "resolved Generator bindings differ from sealed authored slots"
+            )
+
     if deleted_retirement["retired_bindings"] or staged or applied_source_binding_repairs or any(
         item["added_property_names"] or item["reordered"]
         for item in variant_schema_repairs
@@ -3910,7 +4241,7 @@ def connect_atlas_generators_in_spm(
                         "unexpected created slot child-property schema."
                     )
 
-    return {
+    result = {
         "requested": True,
         "complete": True,
         "generator_variant_policy": variant_policy,
@@ -3924,6 +4255,13 @@ def connect_atlas_generators_in_spm(
         "retired_deleted_bindings": deleted_retirement["retired_bindings"],
         "bindings": bindings,
     }
+    if generator_delivery_scope_intent is not None:
+        result["delivery_scope"] = build_resolved_delivery_scope(
+            generator_delivery_scope_intent,
+            bindings,
+            spm_text_sha256(spm_path),
+        )
+    return result
 
 
 def _generator_property_node(generator, property_name):
@@ -7896,6 +8234,9 @@ def speedtree_source_material_mapping(props):
             source_binding_repairs = value.get(
                 "source_binding_repairs"
             ) or []
+            generator_delivery_scope_intent = value.get(
+                "generator_delivery_scope_intent"
+            )
         else:
             names = value
             ids = None
@@ -7904,6 +8245,7 @@ def speedtree_source_material_mapping(props):
                 GENERATOR_VARIANT_POLICY_PRESERVE_EXISTING
             )
             source_binding_repairs = []
+            generator_delivery_scope_intent = None
         if isinstance(names, str):
             names = [names]
         if not isinstance(names, list):
@@ -7912,6 +8254,13 @@ def speedtree_source_material_mapping(props):
             raise RuntimeError(
                 f"Source binding repairs for '{target}' must be a list."
             )
+        if (
+            generator_delivery_scope_intent is not None
+            and not isinstance(generator_delivery_scope_intent, dict)
+        ):
+            raise RuntimeError(
+                f"Generator delivery scope intent for '{target}' must be an object."
+            )
         mapping[normalized_target_key(target)] = {
             "source_material_names": [str(name) for name in names if str(name).strip()],
             "source_material_ids": ids,
@@ -7919,6 +8268,9 @@ def speedtree_source_material_mapping(props):
             "generator_variant_policy": generator_variant_policy,
             "source_binding_repairs": copy.deepcopy(
                 source_binding_repairs
+            ),
+            "generator_delivery_scope_intent": copy.deepcopy(
+                generator_delivery_scope_intent
             ),
         }
     return mapping
@@ -8171,6 +8523,17 @@ def extend_source_material_adoptions_for_targets(
                 ) or []
             ),
         }
+        if (
+            (existing_request or {}).get(
+                "generator_delivery_scope_intent"
+            )
+            is not None
+        ):
+            raw_mapping[str(target)][
+                "generator_delivery_scope_intent"
+            ] = copy.deepcopy(
+                existing_request["generator_delivery_scope_intent"]
+            )
         row = {
             "target_spm": str(target),
             "material_name": material_name,
@@ -8209,6 +8572,7 @@ def _export_or_update_speedtree_spm_path_impl(
     adopt_source_material=False,
     generator_variant_policy=None,
     source_binding_repairs=None,
+    generator_delivery_scope_intent=None,
     allow_create=False,
     preserve_explicit_material_name=False,
     production_target_spm=None,
@@ -8262,6 +8626,49 @@ def _export_or_update_speedtree_spm_path_impl(
         fallback_manifest,
         target_spm,
     )
+    material_groups = manifest.get("material_groups") or (
+        []
+        if manifest.get("collection_tombstone")
+        else [
+            {
+                "collection": manifest.get(
+                    "source_collection", props.collection_name
+                ),
+                "material": manifest.get(
+                    "source_collection", props.collection_name
+                ),
+                "meshes": manifest.get("meshes", []),
+            }
+        ]
+    )
+    previous_bindings = (
+        (previous_manifest.get("generator_connection") or {}).get("bindings")
+        or []
+    )
+    previous_adoption = previous_manifest.get("source_material_adoption") or {}
+    planning_source_mesh_ids_by_name = None
+    if (
+        len(source_material_names or []) == 1
+        and previous_adoption.get("material_name")
+        == str(source_material_names[0])
+    ):
+        planning_source_mesh_ids_by_name = {
+            str(source_material_names[0]): adoption_original_mesh_ids(
+                previous_adoption
+            )
+        }
+    delivery_scope_preflight = preflight_generator_delivery_scope(
+        target_spm,
+        generator_delivery_scope_intent,
+        manifest=manifest,
+        material_groups=material_groups,
+        source_material_names=source_material_names,
+        source_material_ids=source_material_ids,
+        previous_bindings=previous_bindings,
+        source_mesh_ids_by_name=planning_source_mesh_ids_by_name,
+        generator_variant_policy=generator_variant_policy,
+        source_binding_repairs=source_binding_repairs,
+    )
     superseded_manifests, superseded_scope_diagnostics = (
         superseded_scope_manifests_for_update(target_spm, manifest)
     )
@@ -8312,22 +8719,6 @@ def _export_or_update_speedtree_spm_path_impl(
                 "mode": "verified_contract_no_legacy_frond_state",
                 "restored_generator_properties": [],
             }
-    material_groups = manifest.get("material_groups") or (
-        []
-        if manifest.get("collection_tombstone")
-        else [
-            {
-                "collection": manifest.get(
-                    "source_collection", props.collection_name
-                ),
-                "material": manifest.get(
-                    "source_collection", props.collection_name
-                ),
-                "meshes": manifest.get("meshes", []),
-            }
-        ]
-    )
-
     adoption = None
     adoption_migration = None
     if adopt_source_material and not manifest.get("collection_tombstone"):
@@ -8571,10 +8962,7 @@ def _export_or_update_speedtree_spm_path_impl(
             source_material_names,
             material_groups,
             source_material_ids,
-            previous_bindings=(
-                (previous_manifest.get("generator_connection") or {}).get("bindings")
-                or []
-            ),
+            previous_bindings=previous_bindings,
             source_mesh_ids_by_name=(
                 {adoption["material_name"]: adoption_original_mesh_ids(adoption)}
                 if adoption is not None
@@ -8583,6 +8971,10 @@ def _export_or_update_speedtree_spm_path_impl(
             generator_variant_policy=generator_variant_policy,
             source_binding_repairs=source_binding_repairs,
             ownership_manifest=previous_manifest,
+            generator_delivery_scope_intent=(
+                generator_delivery_scope_intent
+            ),
+            delivery_scope_preflight=delivery_scope_preflight,
         )
     else:
         generator_connection = {
@@ -8639,6 +9031,22 @@ def _export_or_update_speedtree_spm_path_impl(
         {group["material"] for group in group_results},
         previous_manifest,
     )
+    if generator_delivery_scope_intent is not None:
+        postwrite_sha256 = spm_text_sha256(target_spm)
+        generator_connection["delivery_scope"] = (
+            build_resolved_delivery_scope(
+                generator_delivery_scope_intent,
+                generator_connection.get("bindings") or [],
+                postwrite_sha256,
+            )
+        )
+        validate_resolved_delivery_scope(
+            generator_connection,
+            target_spm=target_spm,
+            material_id=delivery_scope_preflight["target_material_id"],
+            provider_blend=delivery_scope_preflight["provider_blend"],
+            target_spm_postwrite_sha256=postwrite_sha256,
+        )
     action = ",".join(sorted({group["action"] for group in group_results}))
     if cleanup["removed_materials"] or cleanup["removed_mesh_ids"]:
         action = f"{action},cleaned"
@@ -8697,6 +9105,7 @@ def export_or_update_speedtree_spm_path(
     adopt_source_material=False,
     generator_variant_policy=None,
     source_binding_repairs=None,
+    generator_delivery_scope_intent=None,
     allow_create=False,
     preserve_explicit_material_name=False,
 ):
@@ -8714,6 +9123,9 @@ def export_or_update_speedtree_spm_path(
             adopt_source_material=adopt_source_material,
             generator_variant_policy=generator_variant_policy,
             source_binding_repairs=source_binding_repairs,
+            generator_delivery_scope_intent=(
+                generator_delivery_scope_intent
+            ),
             allow_create=allow_create,
             preserve_explicit_material_name=preserve_explicit_material_name,
         )
@@ -9053,6 +9465,9 @@ def export_or_update_speedtree_spm_targets(
             ),
             source_binding_repairs=source_request.get(
                 "source_binding_repairs"
+            ),
+            generator_delivery_scope_intent=source_request.get(
+                "generator_delivery_scope_intent"
             ),
             allow_create=allow_create,
             preserve_explicit_material_name=preserve_explicit_material_name,

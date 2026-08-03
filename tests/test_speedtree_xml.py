@@ -1,3 +1,4 @@
+import copy
 import gzip
 import importlib.util
 import json
@@ -77,6 +78,9 @@ def load_speedtree_module():
 
 
 speedtree = load_speedtree_module()
+delivery_scope = sys.modules[
+    "atlas_leaf_mesh_builder.generator_delivery_scope"
+]
 
 
 def canonical_test_textures(path):
@@ -389,6 +393,10 @@ class MeshAssetScaleTests(unittest.TestCase):
 
     def test_source_mapping_preserves_exact_generator_variant_policy(self):
         target = r"D:\Trees\SK_tree.spm"
+        delivery_intent = {
+            "kind": "speedtree_generator_delivery_scope_intent",
+            "intent_sha256": "a" * 64,
+        }
         props = types.SimpleNamespace(
             speedtree_source_materials_json=json.dumps(
                 {
@@ -406,6 +414,7 @@ class MeshAssetScaleTests(unittest.TestCase):
                                 "to_mesh_id": -10,
                             }
                         ],
+                        "generator_delivery_scope_intent": delivery_intent,
                     }
                 }
             )
@@ -421,6 +430,14 @@ class MeshAssetScaleTests(unittest.TestCase):
         self.assertEqual(
             request["source_binding_repairs"][0]["generator_guid"],
             "stable-guid",
+        )
+        self.assertEqual(
+            request["generator_delivery_scope_intent"],
+            delivery_intent,
+        )
+        self.assertIsNot(
+            request["generator_delivery_scope_intent"],
+            delivery_intent,
         )
 
 
@@ -746,11 +763,181 @@ class GeneratorConnectionTests(unittest.TestCase):
     def tearDown(self):
         self.temp_dir.cleanup()
 
+    def explicit_delivery_scope_intent(self, required_count=1):
+        root = speedtree.read_spm_xml(self.spm_path)
+        target_by_source_mesh = {
+            6: (7, 63),
+            7: (7, 64),
+            9: (8, 71),
+            10: (9, 78),
+        }
+        authored = []
+        for pair in speedtree.spm_generator_property_pairs(
+            root, {"Leaf Mesh", "Frond"}
+        ):
+            source_mesh_id = int(pair["mesh_property"].findtext("Value"))
+            target = target_by_source_mesh[source_mesh_id]
+            authored.append({
+                "slot_identity": list(
+                    delivery_scope.canonical_slot_identity(pair)
+                ),
+                "target_material_id": target[0],
+                "target_mesh_id": target[1],
+            })
+        authored = delivery_scope.canonical_authored_slots(authored)
+        required = [
+            row["slot_identity"] for row in authored[:required_count]
+        ]
+        continuity = [
+            {
+                "slot_identity": row["slot_identity"],
+                "reason": "sanitized recipe-owned continuity",
+                "policy": delivery_scope.CONTINUITY_ONLY_POLICY,
+                "provenance": {
+                    "fixture": "atlas-issue-8-direct-producer",
+                    "revision": 1,
+                },
+            }
+            for row in authored[required_count:]
+        ]
+        provider = str(Path(self.temp_dir.name) / "provider.blend")
+        intent = {
+            "kind": delivery_scope.INTENT_KIND,
+            "schema_version": 1,
+            "authority": {
+                "kind": "sanitized_test_recipe",
+                "id": "atlas-issue-8",
+                "provenance": {"fixture": "direct-producer"},
+            },
+            "target": {
+                "spm": str(self.spm_path),
+                "provider_blend": provider,
+                "provider_scope_id": "scope-issue-8",
+                "material_id": 4,
+            },
+            "authored_slots": authored,
+            "required_live_slot_identities": required,
+            "continuity_only_slots": continuity,
+            "runtime_inactive_policy": (
+                delivery_scope.RUNTIME_INACTIVE_POLICY
+            ),
+        }
+        intent["intent_sha256"] = delivery_scope.canonical_sha256(intent)
+        return intent
+
     def test_parsley_cutout_ordinals_connect_generator_slots(self):
         result = speedtree.connect_atlas_generators_in_spm(
             self.spm_path, ["M_leaf_parsley_02"], self.groups, [4]
         )
         self.assertTrue(result["complete"])
+        self.assertNotIn("delivery_scope", result)
+
+    def test_explicit_scope_is_planned_before_write_and_resolved_exactly(self):
+        intent = self.explicit_delivery_scope_intent(required_count=1)
+
+        result = speedtree.connect_atlas_generators_in_spm(
+            self.spm_path,
+            ["M_leaf_parsley_02"],
+            self.groups,
+            [4],
+            generator_delivery_scope_intent=intent,
+        )
+
+        self.assertEqual(
+            result["delivery_scope"]["intent"],
+            intent,
+        )
+        self.assertEqual(
+            result["delivery_scope"]["resolved"][
+                "target_spm_postwrite_sha256"
+            ],
+            speedtree.spm_text_sha256(self.spm_path),
+        )
+        validated = delivery_scope.validate_resolved_delivery_scope(
+            result,
+            target_spm=self.spm_path,
+            material_id=4,
+            provider_blend=intent["target"]["provider_blend"],
+            target_spm_postwrite_sha256=speedtree.spm_text_sha256(
+                self.spm_path
+            ),
+        )
+        self.assertEqual(validated["intent_sha256"], intent["intent_sha256"])
+        self.assertEqual(len(validated["required_live_slot_identities"]), 1)
+        self.assertEqual(len(validated["continuity_only_slot_identities"]), 3)
+
+    def test_non_exact_or_mismatched_explicit_scope_fails_before_write(self):
+        exact = self.explicit_delivery_scope_intent(required_count=1)
+        cases = []
+
+        partial = copy.deepcopy(exact)
+        partial.pop("intent_sha256")
+        partial["authored_slots"].pop()
+        partial["continuity_only_slots"].pop()
+        partial["intent_sha256"] = delivery_scope.canonical_sha256(partial)
+        cases.append(partial)
+
+        mismatched = copy.deepcopy(exact)
+        mismatched.pop("intent_sha256")
+        mismatched["authored_slots"][0]["target_mesh_id"] = 999
+        mismatched["intent_sha256"] = delivery_scope.canonical_sha256(
+            mismatched
+        )
+        cases.append(mismatched)
+
+        foreign = copy.deepcopy(exact)
+        foreign.pop("intent_sha256")
+        foreign["target"]["spm"] = str(
+            Path(self.temp_dir.name) / "foreign.spm"
+        )
+        foreign["intent_sha256"] = delivery_scope.canonical_sha256(foreign)
+        cases.append(foreign)
+
+        for intent in cases:
+            with self.subTest(intent=intent["intent_sha256"]):
+                before = self.spm_path.read_bytes()
+                with self.assertRaises(delivery_scope.GeneratorDeliveryScopeError):
+                    speedtree.connect_atlas_generators_in_spm(
+                        self.spm_path,
+                        ["M_leaf_parsley_02"],
+                        self.groups,
+                        [4],
+                        generator_delivery_scope_intent=intent,
+                    )
+                self.assertEqual(self.spm_path.read_bytes(), before)
+
+    def test_preflight_seals_provider_scope_and_detects_plan_drift(self):
+        intent = self.explicit_delivery_scope_intent(required_count=0)
+        manifest = {
+            "blend_file": intent["target"]["provider_blend"],
+            "export_scope_id": intent["target"]["provider_scope_id"],
+        }
+        preflight = speedtree.preflight_generator_delivery_scope(
+            self.spm_path,
+            intent,
+            manifest=manifest,
+            material_groups=self.groups,
+            source_material_names=["M_leaf_parsley_02"],
+            source_material_ids=[4],
+        )
+        self.assertEqual(preflight["intent_sha256"], intent["intent_sha256"])
+
+        stale_preflight = copy.deepcopy(preflight)
+        stale_preflight["planned_slot_identities"].pop()
+        before = self.spm_path.read_bytes()
+        with self.assertRaisesRegex(
+            delivery_scope.GeneratorDeliveryScopeError,
+            "changed after its pre-write plan",
+        ):
+            speedtree.connect_atlas_generators_in_spm(
+                self.spm_path,
+                ["M_leaf_parsley_02"],
+                self.groups,
+                [4],
+                generator_delivery_scope_intent=intent,
+                delivery_scope_preflight=stale_preflight,
+            )
+        self.assertEqual(self.spm_path.read_bytes(), before)
 
     def test_minus9_source_binding_requires_hashed_exact_backup_evidence(self):
         live_root = ET.Element("SpeedTreeModel")
@@ -2621,6 +2808,78 @@ class SafetyTests(unittest.TestCase):
         }
         return target, sample, manifest, material_name
 
+    def test_target_orchestration_passes_delivery_intent_to_producer(self):
+        with tempfile.TemporaryDirectory() as folder:
+            folder = Path(folder)
+            target = folder / "SK_tree_01.spm"
+            target.write_bytes(b"fixture")
+            manifest_path = folder / "target-manifest.json"
+            intent = {
+                "kind": "speedtree_generator_delivery_scope_intent",
+                "intent_sha256": "a" * 64,
+            }
+            props = types.SimpleNamespace(
+                speedtree_atlas_asset_name="M_branch_elm_01",
+                speedtree_create_missing_spm=False,
+                speedtree_source_materials_json=json.dumps({
+                    str(target): {
+                        "source_material_names": ["M_branch_elm_01"],
+                        "source_material_ids": [8],
+                        "adopt_source_material": True,
+                        "generator_variant_policy": (
+                            "ensure_all_material_cutouts"
+                        ),
+                        "generator_delivery_scope_intent": intent,
+                    }
+                }),
+            )
+            captured = {}
+            original_targets = speedtree.speedtree_spm_targets
+            original_export = speedtree._export_or_update_speedtree_spm_path_impl
+            original_execute = speedtree.execute_atomic_target_update
+
+            def fake_export(_props, target_spm, **kwargs):
+                captured.update(kwargs)
+                manifest_path.write_text(
+                    json.dumps({"generator_connection": {}}),
+                    encoding="utf-8",
+                )
+                return (
+                    Path(target_spm),
+                    manifest_path,
+                    [],
+                    "updated",
+                    8,
+                    [10],
+                    [],
+                    {
+                        "removed_materials": [],
+                        "removed_mesh_ids": [],
+                        "removed_mesh_files": [],
+                    },
+                )
+
+            def fake_execute(targets, build_target, _validate, **_kwargs):
+                return [build_target(Path(item), Path(item)) for item in targets]
+
+            speedtree.speedtree_spm_targets = lambda _props: [target]
+            speedtree._export_or_update_speedtree_spm_path_impl = fake_export
+            speedtree.execute_atomic_target_update = fake_execute
+            try:
+                results = speedtree.export_or_update_speedtree_spm_targets(
+                    props
+                )
+            finally:
+                speedtree.speedtree_spm_targets = original_targets
+                speedtree._export_or_update_speedtree_spm_path_impl = original_export
+                speedtree.execute_atomic_target_update = original_execute
+
+            self.assertEqual(
+                captured["generator_delivery_scope_intent"],
+                intent,
+            )
+            self.assertEqual(len(results), 1)
+
     def test_cluster_relation_expansion_adopts_each_targets_local_material_id(self):
         with tempfile.TemporaryDirectory() as folder:
             folder = Path(folder)
@@ -2700,6 +2959,10 @@ class SafetyTests(unittest.TestCase):
                         "generator_variant_policy": (
                             "ensure_all_material_cutouts"
                         ),
+                        "generator_delivery_scope_intent": {
+                            "kind": "speedtree_generator_delivery_scope_intent",
+                            "intent_sha256": "a" * 64,
+                        },
                     },
                 }),
             )
@@ -2718,6 +2981,12 @@ class SafetyTests(unittest.TestCase):
                     "source_material_ids"
                 ],
                 [19],
+            )
+            self.assertEqual(
+                mapping[speedtree.normalized_target_key(target)][
+                    "generator_delivery_scope_intent"
+                ]["intent_sha256"],
+                "a" * 64,
             )
 
     def test_cluster_relation_expansion_does_not_claim_another_atlas_scope(self):
