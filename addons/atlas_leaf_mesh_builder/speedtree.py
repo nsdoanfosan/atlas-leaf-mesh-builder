@@ -10061,8 +10061,26 @@ def spm_managed_reference_audit(spm_path):
     }
 
 
+def _production_mesh_reference_keys(production_root):
+    """Keep cleanup non-destructive when a read-only sibling is unreadable."""
+    mesh_root = Path(production_root) / "meshes"
+    if not mesh_root.is_dir():
+        return set()
+    return {
+        os.path.normcase(str(path.absolute())).casefold()
+        for path in mesh_root.rglob("*")
+        if path.is_file()
+    }
+
+
 def _validate_staged_speedtree_targets(staged_targets, states):
-    """Validate the complete staged SPM/file graph before fleet commit."""
+    """Validate selected targets and inventory sibling file ownership.
+
+    Sibling SPMs are staged so their valid external-file references can keep a
+    shared managed mesh from being deleted.  Merely sharing a folder is not,
+    however, export authority: structural or missing-file defects in an
+    unselected copy must not fail the exact target transaction.
+    """
     selected = {
         normalized_target_key(path): path
         for path in staged_targets
@@ -10073,12 +10091,31 @@ def _validate_staged_speedtree_targets(staged_targets, states):
         production_root = Path(state["production_root"])
         production_references = set()
         for spm_path in sorted(stage_root.glob("*.spm")):
-            root = read_spm_xml(spm_path)
+            is_selected = normalized_target_key(spm_path) in selected
+            try:
+                root = read_spm_xml(spm_path)
+            except (OSError, EOFError, gzip.BadGzipFile, ET.ParseError):
+                if is_selected:
+                    raise
+                # An unreadable sibling cannot prove individual ownership.
+                # Preserve the root's managed meshes instead of converting
+                # that diagnostic uncertainty into either a Push gate or a
+                # destructive cleanup decision.
+                production_references.update(
+                    _production_mesh_reference_keys(production_root)
+                )
+                continue
             assets = root.find("Assets")
             if assets is None:
-                raise RuntimeError(
-                    f"SpeedTree SPM validation failed: Assets missing in {spm_path.name}."
+                if is_selected:
+                    raise RuntimeError(
+                        "SpeedTree SPM validation failed: Assets missing in "
+                        f"{spm_path.name}."
+                    )
+                production_references.update(
+                    _production_mesh_reference_keys(production_root)
                 )
+                continue
             mesh_ids = {
                 positive_int(mesh.attrib.get("ID"))
                 for mesh in assets.findall("Mesh")
@@ -10090,7 +10127,7 @@ def _validate_staged_speedtree_targets(staged_targets, states):
                     for mesh_id in spm_material_mesh_ids(material)
                     if mesh_id not in mesh_ids
                 ]
-                if missing_cutouts:
+                if missing_cutouts and is_selected:
                     raise RuntimeError(
                         "SpeedTree SPM validation failed: material "
                         f"{material.attrib.get('Name')!r} in {spm_path.name} "
@@ -10102,10 +10139,16 @@ def _validate_staged_speedtree_targets(staged_targets, states):
                     continue
                 filenames = _external_mesh_filenames(mesh)
                 if not filenames:
-                    raise RuntimeError(
-                        "SpeedTree SPM validation failed: external Mesh "
-                        f"ID {mesh.attrib.get('ID')} in {spm_path.name} has no Filename."
+                    if is_selected:
+                        raise RuntimeError(
+                            "SpeedTree SPM validation failed: external Mesh "
+                            f"ID {mesh.attrib.get('ID')} in {spm_path.name} "
+                            "has no Filename."
+                        )
+                    production_references.update(
+                        _production_mesh_reference_keys(production_root)
                     )
+                    continue
                 for filename in filenames:
                     candidate = Path(filename)
                     if candidate.is_absolute():
@@ -10127,10 +10170,13 @@ def _validate_staged_speedtree_targets(staged_targets, states):
                             else (production_root / candidate).absolute()
                         )
                     if not resolved.is_file():
-                        raise RuntimeError(
-                            "SpeedTree SPM validation failed: external Mesh "
-                            f"Filename is absent for {spm_path.name}: {filename}"
-                        )
+                        if is_selected:
+                            raise RuntimeError(
+                                "SpeedTree SPM validation failed: external Mesh "
+                                f"Filename is absent for {spm_path.name}: "
+                                f"{filename}"
+                            )
+                        continue
                     try:
                         relative = resolved.relative_to(stage_root)
                     except ValueError:
@@ -10141,7 +10187,7 @@ def _validate_staged_speedtree_targets(staged_targets, states):
                         os.path.normcase(str(production_path.absolute())).casefold()
                     )
 
-            if normalized_target_key(spm_path) not in selected:
+            if not is_selected:
                 continue
             manifest = read_json_file(target_manifest_path(spm_path), {})
             connection = manifest.get("generator_connection") or {}

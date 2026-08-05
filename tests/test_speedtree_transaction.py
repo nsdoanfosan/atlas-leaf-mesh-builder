@@ -372,6 +372,46 @@ class StagedSpeedTreeValidationTests(unittest.TestCase):
                 {transaction._path_key(production / "meshes" / "shared.fbx")},
             )
 
+    def test_unselected_copy_missing_mesh_does_not_block_exact_target(self):
+        """A root glob is reference inventory, not transaction authority."""
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            stage = root / "stage"
+            production = root / "production"
+            (stage / "meshes").mkdir(parents=True)
+            production.mkdir()
+            selected_mesh = stage / "meshes" / "selected.fbx"
+            selected_mesh.write_bytes(b"selected-mesh")
+            selected = stage / "SK_tree_birch_paper_01.spm"
+            unrelated_copy = stage / "tree_birch_paper_02 - 복사본.spm"
+            self._spm_with_external_mesh(
+                selected,
+                "meshes/selected.fbx",
+            )
+            self._write_empty_generator_contract(selected)
+            self._spm_with_external_mesh(
+                unrelated_copy,
+                "../../../../Users/PARK/OneDrive/missing/LOD0.fbx",
+            )
+            state = {
+                "stage_root": stage,
+                "production_root": production,
+            }
+
+            graph = speedtree._validate_staged_speedtree_targets(
+                [selected],
+                [state],
+            )
+
+            self.assertEqual(
+                graph[transaction._path_key(production)],
+                {
+                    transaction._path_key(
+                        production / "meshes" / "selected.fbx"
+                    )
+                },
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
