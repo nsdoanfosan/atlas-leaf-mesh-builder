@@ -279,6 +279,72 @@ class StagedSpeedTreeValidationTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "Filename is absent"):
                 speedtree._validate_staged_speedtree_targets([target], [state])
 
+    def test_production_only_external_mesh_resolves_from_the_owner_folder(self):
+        """A reference the stage never receives still lives in production.
+
+        ``_copy_stage_inputs`` copies the folder's SPMs, managed relpaths and
+        read-through files -- never arbitrary subdirectories. An authored
+        reference such as ``mesh/<tree>/<lod>.fbx`` therefore only ever exists
+        under the production root, and resolving it against the stage reported
+        an on-disk file as absent.
+        """
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            stage = root / "stage"
+            production = root / "production"
+            stage.mkdir()
+            external = production / "mesh" / "Tree_abc_8K_3d_ms"
+            external.mkdir(parents=True)
+            owned = external / "abc_LOD0.fbx"
+            owned.write_bytes(b"external-mesh")
+            target = stage / "tree.spm"
+            self._spm_with_external_mesh(
+                target, "mesh/Tree_abc_8K_3d_ms/abc_LOD0.fbx"
+            )
+            self._write_empty_generator_contract(target)
+            state = {
+                "stage_root": stage,
+                "production_root": production,
+            }
+
+            graph = speedtree._validate_staged_speedtree_targets(
+                [target], [state]
+            )
+
+            self.assertEqual(
+                graph[transaction._path_key(production)],
+                {transaction._path_key(owned)},
+            )
+
+    def test_staged_copy_still_wins_over_the_production_original(self):
+        """A file this transaction staged remains the validated source."""
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            stage = root / "stage"
+            production = root / "production"
+            (stage / "meshes").mkdir(parents=True)
+            (production / "meshes").mkdir(parents=True)
+            (stage / "meshes" / "shared.fbx").write_bytes(b"staged")
+            (production / "meshes" / "shared.fbx").write_bytes(b"production")
+            target = stage / "tree.spm"
+            self._spm_with_external_mesh(target, "meshes/shared.fbx")
+            self._write_empty_generator_contract(target)
+            state = {
+                "stage_root": stage,
+                "production_root": production,
+            }
+
+            graph = speedtree._validate_staged_speedtree_targets(
+                [target], [state]
+            )
+
+            # Staged hit maps back through stage_root, so the recorded
+            # production path is the mirrored one rather than a stage path.
+            self.assertEqual(
+                graph[transaction._path_key(production)],
+                {transaction._path_key(production / "meshes" / "shared.fbx")},
+            )
+
     def test_validation_builds_shared_reference_graph_for_all_sibling_spms(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)

@@ -10108,11 +10108,24 @@ def _validate_staged_speedtree_targets(staged_targets, states):
                     )
                 for filename in filenames:
                     candidate = Path(filename)
-                    resolved = (
-                        candidate
-                        if candidate.is_absolute()
-                        else spm_path.parent / candidate
-                    ).absolute()
+                    if candidate.is_absolute():
+                        resolved = candidate.absolute()
+                    else:
+                        # A relative external Mesh reference is owned by the
+                        # production SPM, not by this transaction.  The stage
+                        # only receives the folder's SPMs, managed relpaths and
+                        # read-through files -- never arbitrary subdirectories
+                        # -- so a reference such as `mesh/<tree>/<lod>.fbx`
+                        # exists solely under the production root.  Prefer a
+                        # staged copy when this transaction actually produced
+                        # one, then fall back to production instead of
+                        # declaring an on-disk file absent.
+                        staged = (spm_path.parent / candidate).absolute()
+                        resolved = (
+                            staged
+                            if staged.is_file()
+                            else (production_root / candidate).absolute()
+                        )
                     if not resolved.is_file():
                         raise RuntimeError(
                             "SpeedTree SPM validation failed: external Mesh "
