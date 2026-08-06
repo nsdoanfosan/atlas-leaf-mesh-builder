@@ -8,6 +8,7 @@ validated, then commits the complete fleet with a verified rollback inventory.
 import hashlib
 import json
 import os
+import re
 import shutil
 import tempfile
 from pathlib import Path
@@ -42,6 +43,27 @@ STAGED_HISTORY_PATH_FIELDS = {
     "xml",
 }
 PENDING_TRANSACTION_ROOTS = []
+
+# Explorer copies and pipeline recovery snapshots are backup inventory, not
+# live sibling assets.  They must never enter the staged fleet merely because
+# they sit beside a production SPM: validation of such a historical copy can
+# otherwise abort an unrelated exact-target update.
+MANUAL_COPY_SPM_RE = re.compile(
+    r"\s+-\s+(?:\uBCF5\uC0AC\uBCF8|copy)(?:\s*\(\d+\))?\.spm$",
+    re.IGNORECASE,
+)
+BACKUP_SPM_RE = re.compile(
+    r"(?:"
+    r"\.(?:codex_backup|skbatch_backup|pcgtex_backup|skbatch-rescue)(?:[._-].*)?"
+    r"|\.texture_slot_backup_\d{8}_\d{6}(?:_\d{6})?"
+    r"|\.apply_rollback_backup"
+    r"|\.preimage"
+    r"|\.pre_xml_root_fix_\d{8}(?:_\d{6}(?:_\d{6})?)?"
+    r")\.spm$"
+    r"|^__spm_sync_(?:preflight|verify)_.+\.spm$"
+    r"|^\.__spm_pass_repair_.+\.spm$",
+    re.IGNORECASE,
+)
 
 
 def _sha256_bytes(payload):
@@ -99,6 +121,15 @@ def _copy_file(source, destination):
     shutil.copy2(source, destination)
 
 
+def _is_live_sibling_spm(path):
+    """Return false for explicit backup inventory beside production SPMs."""
+    name = Path(path).name
+    return not (
+        MANUAL_COPY_SPM_RE.search(name)
+        or BACKUP_SPM_RE.search(name)
+    )
+
+
 def _atomic_replace_bytes(destination, payload):
     """Replace one file without extending an already-long asset filename."""
     destination = Path(destination)
@@ -153,10 +184,11 @@ def cleanup_pending_transaction_roots():
 
 def _copy_stage_inputs(root, stage_root, target_names, managed_relpaths):
     copied = set()
-    # Every sibling SPM participates in the shared external-file graph even if
-    # it was not selected for mutation.
+    # Every live sibling SPM participates in the shared external-file graph
+    # even if it was not selected for mutation.  Manual copies and registered
+    # recovery snapshots are backup inventory and cannot own current outputs.
     for source in Path(root).glob("*.spm"):
-        if source.is_file():
+        if source.is_file() and _is_live_sibling_spm(source):
             relative = source.relative_to(root)
             _copy_file(source, Path(stage_root) / relative)
             copied.add(relative)

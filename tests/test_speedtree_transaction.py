@@ -54,6 +54,34 @@ def write_managed_fixture(root, targets=("tree_01.spm",)):
 
 
 class AtomicTargetTransactionTests(unittest.TestCase):
+    def test_stage_inventory_excludes_manual_copies_and_backup_snapshots(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder) / "production"
+            stage = Path(folder) / "stage"
+            root.mkdir()
+            stage.mkdir()
+            selected = root / "SK_tree_01.spm"
+            sibling = root / "SK_tree_02.spm"
+            manual_ko = root / "SK_tree_02 - \uBCF5\uC0AC\uBCF8.spm"
+            manual_en = root / "SK_tree_02 - Copy (2).spm"
+            backup = root / "SK_tree_02.skbatch_backup_20260806_110204.spm"
+            for path in (selected, sibling, manual_ko, manual_en, backup):
+                path.write_bytes(path.name.encode("utf-8"))
+
+            managed = transaction._managed_relpaths(root, [selected.name])
+            transaction._copy_stage_inputs(
+                root,
+                stage,
+                [selected.name],
+                managed,
+            )
+
+            self.assertTrue((stage / selected.name).is_file())
+            self.assertTrue((stage / sibling.name).is_file())
+            self.assertFalse((stage / manual_ko.name).exists())
+            self.assertFalse((stage / manual_en.name).exists())
+            self.assertFalse((stage / backup.name).exists())
+
     def test_atomic_temp_name_does_not_extend_long_asset_filename(self):
         with tempfile.TemporaryDirectory() as folder:
             parent = Path(folder) / ("nested_" + "x" * 80)
