@@ -1,0 +1,168 @@
+{
+  "fixture_kind": "atlas_issue8_generator_delivery_scope_contract",
+  "fixture_version": 1,
+  "intent_projection": {
+    "kind": "speedtree_generator_delivery_scope_intent",
+    "schema_version": 1,
+    "authority": {
+      "kind": "sanitized_test_recipe",
+      "id": "atlas-issue-8",
+      "provenance": {
+        "fixture": "hidden-zero-node-duplicate-mesh"
+      }
+    },
+    "target": {
+      "spm": "C:\\sanitized\\SK_tree_issue8.spm",
+      "provider_blend": "C:\\sanitized\\provider.blend",
+      "provider_scope_id": "issue8-provider-scope",
+      "material_id": 4
+    },
+    "authored_slots": [
+      {
+        "slot_identity": [
+          "guid",
+          "AQIDBAUGBwgJCgsMDQ4PEA==",
+          "Leaves:Type:0"
+        ],
+        "target_material_id": 4,
+        "target_mesh_id": 93
+      },
+      {
+        "slot_identity": [
+          "guid",
+          "AQIDBAUGBwgJCgsMDQ4PEA==",
+          "Leaves:Type:1"
+        ],
+        "target_material_id": 4,
+        "target_mesh_id": 93
+      },
+      {
+        "slot_identity": [
+          "guid",
+          "AQIDBAUGBwgJCgsMDQ4PEA==",
+          "Leaves:Type:2"
+        ],
+        "target_material_id": 4,
+        "target_mesh_id": 95
+      },
+      {
+        "slot_identity": [
+          "guid",
+          "AQIDBAUGBwgJCgsMDQ4PEA==",
+          "Leaves:Type:3"
+        ],
+        "target_material_id": 4,
+        "target_mesh_id": 96
+      }
+    ],
+    "required_live_slot_identities": [
+      [
+        "guid",
+        "AQIDBAUGBwgJCgsMDQ4PEA==",
+        "Leaves:Type:0"
+      ]
+    ],
+    "continuity_only_slots": [
+      {
+        "slot_identity": [
+          "guid",
+          "AQIDBAUGBwgJCgsMDQ4PEA==",
+          "Leaves:Type:1"
+        ],
+        "reason": "hidden authored relationship retained by recipe",
+        "policy": "relationship_continuity_only",
+        "provenance": {
+          "fixture": "hidden-slot",
+          "authority_revision": 1
+        }
+      },
+      {
+        "slot_identity": [
+          "guid",
+          "AQIDBAUGBwgJCgsMDQ4PEA==",
+          "Leaves:Type:2"
+        ],
+        "reason": "zero-node authored relationship retained by recipe",
+        "policy": "relationship_continuity_only",
+        "provenance": {
+          "fixture": "zero-node-slot",
+          "authority_revision": 1
+        }
+      },
+      {
+        "slot_identity": [
+          "guid",
+          "AQIDBAUGBwgJCgsMDQ4PEA==",
+          "Leaves:Type:3"
+        ],
+        "reason": "authored continuity retained independently of live survivors",
+        "policy": "relationship_continuity_only",
+        "provenance": {
+          "fixture": "continuity-slot",
+          "authority_revision": 1
+        }
+      }
+    ],
+    "runtime_inactive_policy": "sealed_required_live"
+  },
+  "bindings": [
+    {
+      "generator_guid": "AQIDBAUGBwgJCgsMDQ4PEA==",
+      "generator_type": "Leaf Mesh",
+      "generator_name": "Leaf fixture",
+      "slot_prefix": "Leaves:Type:0",
+      "target_material_id": 4,
+      "target_mesh_id": 93
+    },
+    {
+      "generator_guid": "AQIDBAUGBwgJCgsMDQ4PEA==",
+      "generator_type": "Leaf Mesh",
+      "generator_name": "Leaf fixture",
+      "slot_prefix": "Leaves:Type:1",
+      "target_material_id": 4,
+      "target_mesh_id": 93
+    },
+    {
+      "generator_guid": "AQIDBAUGBwgJCgsMDQ4PEA==",
+      "generator_type": "Leaf Mesh",
+      "generator_name": "Leaf fixture",
+      "slot_prefix": "Leaves:Type:2",
+      "target_material_id": 4,
+      "target_mesh_id": 95
+    },
+    {
+      "generator_guid": "AQIDBAUGBwgJCgsMDQ4PEA==",
+      "generator_type": "Leaf Mesh",
+      "generator_name": "Leaf fixture",
+      "slot_prefix": "Leaves:Type:3",
+      "target_material_id": 4,
+      "target_mesh_id": 96
+    }
+  ],
+  "runtime_observations_not_authority": [
+    {
+      "slot_prefix": "Leaves:Type:0",
+      "graph_visible": true,
+      "generated_node_count": 12,
+      "export_participates": true
+    },
+    {
+      "slot_prefix": "Leaves:Type:1",
+      "graph_visible": false,
+      "generated_node_count": 842,
+      "export_participates": false
+    },
+    {
+      "slot_prefix": "Leaves:Type:2",
+      "graph_visible": true,
+      "generated_node_count": 0,
+      "export_participates": false
+    },
+    {
+      "slot_prefix": "Leaves:Type:3",
+      "graph_visible": true,
+      "generated_node_count": 0,
+      "export_participates": false
+    }
+  ]
+}
