@@ -210,6 +210,71 @@ class AtomicTargetTransactionTests(unittest.TestCase):
 
             replace.assert_not_called()
 
+    def test_semantically_identical_spm_rewrite_is_rebased_before_commit(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            target = root / "tree_01.spm"
+            target.write_bytes(b"<SpeedTreeRaw><Value>1</Value></SpeedTreeRaw>")
+            observed_states = []
+
+            def build(staged, production):
+                staged.write_bytes(
+                    b"<SpeedTreeRaw><Value>2</Value></SpeedTreeRaw>"
+                )
+                production.write_bytes(
+                    b"<SpeedTreeRaw>\n  <Value>1</Value>\n</SpeedTreeRaw>\n"
+                )
+                return staged
+
+            def validate(_staged, states):
+                observed_states.extend(states)
+                return {}
+
+            transaction.execute_atomic_target_update(
+                [target], build, validate
+            )
+
+            self.assertEqual(
+                target.read_bytes(),
+                b"<SpeedTreeRaw><Value>2</Value></SpeedTreeRaw>",
+            )
+            self.assertEqual(
+                observed_states[0]["semantic_rebases"][0]["path"],
+                str(target),
+            )
+
+    def test_semantic_spm_change_reports_conflict_and_preserves_external_edit(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            target = root / "tree_01.spm"
+            target.write_bytes(b"<SpeedTreeRaw><Value>1</Value></SpeedTreeRaw>")
+            external = b"<SpeedTreeRaw><Value>9</Value></SpeedTreeRaw>"
+
+            def build(staged, production):
+                staged.write_bytes(
+                    b"<SpeedTreeRaw><Value>2</Value></SpeedTreeRaw>"
+                )
+                production.write_bytes(external)
+                return staged
+
+            with self.assertRaises(
+                transaction.AtlasTransactionConflictError
+            ) as caught:
+                transaction.execute_atomic_target_update(
+                    [target], build, lambda staged, states: {}
+                )
+
+            self.assertEqual(target.read_bytes(), external)
+            self.assertEqual(
+                caught.exception.failure_contract["reason"],
+                "production_changed_while_staging",
+            )
+            self.assertTrue(
+                caught.exception.failure_contract[
+                    "preserve_external_changes"
+                ]
+            )
+
     def test_shared_file_delete_is_rejected_when_graph_still_references_it(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
@@ -368,6 +433,38 @@ class StagedSpeedTreeValidationTests(unittest.TestCase):
 
             # Staged hit maps back through stage_root, so the recorded
             # production path is the mirrored one rather than a stage path.
+            self.assertEqual(
+                graph[transaction._path_key(production)],
+                {transaction._path_key(production / "meshes" / "shared.fbx")},
+            )
+
+    def test_unselected_sibling_missing_external_mesh_does_not_block_update(self):
+        """A broken dummy reference in another SPM is outside this update."""
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            stage = root / "stage"
+            production = root / "production"
+            (stage / "meshes").mkdir(parents=True)
+            production.mkdir()
+            shared = stage / "meshes" / "shared.fbx"
+            shared.write_bytes(b"mesh")
+            selected = stage / "selected.spm"
+            sibling = stage / "unrelated.spm"
+            self._spm_with_external_mesh(selected, "meshes/shared.fbx")
+            self._spm_with_external_mesh(
+                sibling,
+                "../../../../Users/Park/OneDrive/root_set_broken_dummy.fbx",
+            )
+            self._write_empty_generator_contract(selected)
+            state = {
+                "stage_root": stage,
+                "production_root": production,
+            }
+
+            graph = speedtree._validate_staged_speedtree_targets(
+                [selected], [state]
+            )
+
             self.assertEqual(
                 graph[transaction._path_key(production)],
                 {transaction._path_key(production / "meshes" / "shared.fbx")},

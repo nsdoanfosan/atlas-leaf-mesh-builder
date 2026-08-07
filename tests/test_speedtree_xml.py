@@ -2998,6 +2998,58 @@ class SafetyTests(unittest.TestCase):
                 "ensure_all_material_cutouts",
             )
 
+    def test_cluster_relation_duplicate_names_follow_explicit_id_without_blocking(self):
+        with tempfile.TemporaryDirectory() as folder:
+            target = Path(folder) / "SK_tree_01.spm"
+            root = ET.Element("SpeedTreeModel")
+            assets = ET.SubElement(root, "Assets")
+            add_material(assets, 4, "M_leaf_tree_01", [2, 3])
+            add_material(assets, 14, "M_leaf_tree_01", [110, 111, 112])
+            for mesh_id in (2, 3, 110, 111, 112):
+                add_mesh(assets, mesh_id)
+            write_spm(target, root)
+            props = types.SimpleNamespace(
+                speedtree_atlas_asset_name="M_leaf_tree_01",
+                speedtree_source_materials_json=json.dumps({
+                    str(target): {
+                        "source_material_names": ["M_leaf_tree_01"],
+                        "source_material_ids": [4],
+                        "adopt_source_material": True,
+                        "generator_variant_policy": (
+                            "ensure_all_material_cutouts"
+                        ),
+                    },
+                }),
+            )
+
+            report = speedtree.extend_source_material_adoptions_for_targets(
+                props,
+                [target],
+            )
+            mapping = speedtree.speedtree_source_material_mapping(props)
+
+            self.assertEqual(report["preserved"], [str(target)])
+            self.assertEqual(
+                mapping[speedtree.normalized_target_key(target)][
+                    "source_material_ids"
+                ],
+                [4],
+            )
+            _names, records = speedtree.source_materials_by_name(
+                assets,
+                ["M_leaf_tree_01"],
+                [4],
+            )
+            self.assertEqual(list(records), [4])
+            adoption = speedtree.prepare_source_material_adoption(
+                target,
+                {"export_scope_id": "test-scope"},
+                "M_leaf_tree_01",
+                4,
+            )
+            self.assertEqual(adoption["material_id"], 4)
+            self.assertEqual(adoption["original_mesh_ids"], [2, 3])
+
     def test_cluster_relation_reconciles_stale_existing_local_material_id(self):
         with tempfile.TemporaryDirectory() as folder:
             folder = Path(folder)
@@ -4154,6 +4206,36 @@ class SafetyTests(unittest.TestCase):
                 generator_values(target),
                 {("Leaf 1", "Leaves:Type:0"): (8, 1)},
             )
+
+    def test_adoption_migration_accepts_managed_output_already_removed(self):
+        with tempfile.TemporaryDirectory() as folder:
+            target = Path(folder) / "SK_tree.spm"
+            root = ET.Element("SpeedTreeModel")
+            assets = ET.SubElement(root, "Assets")
+            add_material(assets, 8, "M_leaf", [1])
+            add_mesh(assets, 1)
+            write_spm(target, root)
+            previous = {
+                "export_scope_id": "scope-adopt",
+                "speedtree_material_groups": [{
+                    "collection": "Plans",
+                    "material": "M_leaf",
+                    "material_id": 19,
+                    "mesh_ids": [20],
+                }],
+                "generator_connection": {"bindings": []},
+            }
+
+            migration = speedtree.migrate_previous_scope_material_for_adoption(
+                target,
+                previous,
+                "M_leaf",
+                8,
+            )
+
+            self.assertTrue(migration["already_removed"])
+            self.assertEqual(migration["legacy_material_id"], 19)
+            self.assertEqual(migration["reusable_mesh_ids"], [])
 
     def test_untagged_unused_same_name_with_different_mesh_paths_is_reclaimed(self):
         with tempfile.TemporaryDirectory() as folder:

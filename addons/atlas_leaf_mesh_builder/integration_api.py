@@ -12,6 +12,39 @@ from .props import (
 )
 
 
+INTEGRATION_API_NAME = "atlas_leaf_mesh_builder.integration"
+INTEGRATION_API_VERSION = 1
+INTEGRATION_API_CAPABILITIES = frozenset({
+    "atomic_exact_target_slice_v1",
+    "generator_adoption_reconciliation_v1",
+    "structured_transaction_conflict_v1",
+})
+
+
+def get_integration_contract():
+    """Return the stable contract implemented by this installed add-on."""
+    return {
+        "name": INTEGRATION_API_NAME,
+        "version": INTEGRATION_API_VERSION,
+        "capabilities": sorted(INTEGRATION_API_CAPABILITIES),
+    }
+
+
+def require_integration_contract(*, minimum_version=1, capabilities=()):
+    """Fail before mutation when an external caller needs a newer contract."""
+    minimum_version = int(minimum_version)
+    required = {str(value) for value in capabilities}
+    missing = sorted(required - INTEGRATION_API_CAPABILITIES)
+    if INTEGRATION_API_VERSION < minimum_version or missing:
+        raise RuntimeError(
+            "Atlas integration API contract is incompatible: "
+            f"installed_version={INTEGRATION_API_VERSION}, "
+            f"minimum_version={minimum_version}, "
+            f"missing_capabilities={missing}"
+        )
+    return get_integration_contract()
+
+
 def _load_cluster_card_contract_reader():
     try:
         from cluster_card_pipeline import read_uv_template_contract
@@ -314,4 +347,115 @@ def configure_external_plan_target(
         ),
         "export_scope_id": export_scope_id,
         "build_operator": "atlas_leaf.build_speedtree_spm",
+    }
+
+
+def execute_external_target_transaction(
+    props,
+    target_spms,
+    *,
+    adoption_targets=(),
+    adoption_blend_path=None,
+    preserve_explicit_material_name=False,
+):
+    """Publish one exact external target slice through Atlas' stable API.
+
+    External tools must not import the exporter implementation or temporarily
+    rewrite the Blender target collection themselves.  This entry point owns
+    target narrowing, same-name adoption reconciliation and the atomic fleet
+    transaction, then restores the scene's persistent target view.
+    """
+    contract = require_integration_contract(
+        minimum_version=1,
+        capabilities=(
+            "atomic_exact_target_slice_v1",
+            "structured_transaction_conflict_v1",
+        ),
+    )
+    targets = [
+        Path(bpy.path.abspath(str(value))).expanduser().absolute()
+        for value in target_spms
+    ]
+    if not targets:
+        raise ValueError("Atlas external transaction requires at least one target SPM.")
+    keys = [str(path).casefold() for path in targets]
+    if len(keys) != len(set(keys)):
+        raise ValueError("Atlas external transaction contains duplicate target SPMs.")
+    for target in targets:
+        if target.suffix.casefold() != ".spm":
+            raise ValueError(f"Atlas external target must end with .spm: {target}")
+        if not target.is_file():
+            raise FileNotFoundError(f"Atlas external target does not exist: {target}")
+
+    from .speedtree import (
+        export_or_update_speedtree_spm_targets,
+        extend_source_material_adoptions_for_targets,
+        normalized_target_key,
+    )
+
+    requested_keys = {normalized_target_key(path) for path in targets}
+    adoption_paths = [
+        Path(bpy.path.abspath(str(value))).expanduser().absolute()
+        for value in adoption_targets
+    ]
+    if not {
+        normalized_target_key(path) for path in adoption_paths
+    }.issubset(requested_keys):
+        raise ValueError(
+            "Atlas adoption targets must be part of the exact transaction slice."
+        )
+    if adoption_paths:
+        mapping_update = extend_source_material_adoptions_for_targets(
+            props,
+            adoption_paths,
+            blend_path=adoption_blend_path,
+        )
+    else:
+        mapping_update = {
+            "material_name": str(
+                getattr(props, "speedtree_atlas_asset_name", "") or ""
+            ),
+            "added": [],
+            "reconciled": [],
+            "preserved": [],
+        }
+
+    previous_targets = [
+        str(item.path)
+        for item in props.speedtree_spm_items
+        if str(item.path or "").strip()
+    ]
+    props.speedtree_spm_items.clear()
+    for target in targets:
+        add_spm_target_item(props, str(target))
+    try:
+        results = export_or_update_speedtree_spm_targets(
+            props,
+            preserve_explicit_material_name=preserve_explicit_material_name,
+        )
+    finally:
+        props.speedtree_spm_items.clear()
+        for target in previous_targets:
+            add_spm_target_item(props, target)
+
+    completed = {
+        normalized_target_key(result.get("spm_path"))
+        for result in results
+    }
+    if completed != requested_keys:
+        missing = sorted(requested_keys - completed)
+        unexpected = sorted(completed - requested_keys)
+        raise RuntimeError(
+            "Atlas external transaction returned a different target slice: "
+            f"missing={missing}, unexpected={unexpected}"
+        )
+    return {
+        "integration_contract": contract,
+        "transaction": {
+            "status": "committed",
+            "target_count": len(targets),
+            "targets": [str(path) for path in targets],
+        },
+        "mapping_update": mapping_update,
+        "results": results,
     }

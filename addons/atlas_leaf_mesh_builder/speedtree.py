@@ -2639,15 +2639,23 @@ def source_materials_by_name(
     records = {}
     for name in names:
         matches = [node for node in assets.findall("Material_v8") if node.attrib.get("Name") == name]
-        if len(matches) != 1:
+        requested_id = requested_ids.get(name)
+        if requested_id is not None:
+            exact = [
+                node
+                for node in matches
+                if positive_int(node.attrib.get("ID")) == requested_id
+            ]
+            if exact:
+                matches = exact
+        if not matches:
             raise RuntimeError(
-                f"Source material '{name}' must resolve to exactly one Material_v8 asset; found {len(matches)}."
+                f"Source material '{name}' does not exist in the target SPM."
             )
         material = matches[0]
         material_id = positive_int(material.attrib.get("ID"))
         if material_id is None:
             raise RuntimeError(f"Source material '{name}' has an invalid ID.")
-        requested_id = requested_ids.get(name)
         if name in requested_ids and requested_id != material_id:
             raise RuntimeError(
                 f"Source material '{name}' ID is {material_id}, expected {requested_ids.get(name)}."
@@ -4604,10 +4612,18 @@ def prepare_source_material_adoption(
         for node in assets.findall("Material_v8")
         if node.attrib.get("Name") == material_name
     ]
-    if len(matches) != 1:
+    if requested_id is not None:
+        exact = [
+            node
+            for node in matches
+            if positive_int(node.attrib.get("ID")) == requested_id
+        ]
+        if exact:
+            matches = exact
+    if not matches:
         raise RuntimeError(
-            f"Source material adoption requires exactly one Material_v8 named '{material_name}'; "
-            f"found {len(matches)}."
+            f"Source material adoption could not find Material_v8 "
+            f"'{material_name}'."
         )
     material = matches[0]
     existing_id = positive_int(material.attrib.get("ID"))
@@ -4856,10 +4872,21 @@ def migrate_previous_scope_material_for_adoption(
         ),
         None,
     )
-    if source_material is None or legacy_material is None:
+    if source_material is None:
         raise RuntimeError(
-            "Cannot migrate the previous Atlas material: source or managed material is missing."
+            "Cannot migrate the previous Atlas material: source material is missing."
         )
+    if legacy_material is None:
+        # Superseded-scope cleanup runs before adoption migration and can
+        # already remove this managed output.  Treat that idempotent state as
+        # completed instead of requiring the same material a second time.
+        return {
+            "legacy_material_name": legacy_name,
+            "legacy_material_id": legacy_id,
+            "reusable_mesh_ids": [],
+            "restored_generator_slots": [],
+            "already_removed": True,
+        }
     marker = parse_atlas_leaf_spm_user_data(legacy_material.findtext("UserData"))
     if not marker or marker.get("scope") != spm_export_scope(previous_manifest):
         raise RuntimeError(
@@ -8930,10 +8957,27 @@ def extend_source_material_adoptions_for_targets(
             if assets is not None
             else []
         )
-        if len(matches) != 1:
+        requested_material_ids = list(
+            (existing_request or {}).get("source_material_ids") or []
+        )
+        requested_material_id = (
+            positive_int(requested_material_ids[0])
+            if len(requested_material_ids) == 1
+            else None
+        )
+        if requested_material_id is not None:
+            exact = [
+                node
+                for node in matches
+                if positive_int(node.attrib.get("ID"))
+                == requested_material_id
+            ]
+            if exact:
+                matches = exact
+        if not matches:
             raise RuntimeError(
-                f"Cluster relationship ON requires exactly one Material_v8 "
-                f"named '{material_name}' in {target.name}; found {len(matches)}."
+                f"Cluster relationship ON could not find Material_v8 "
+                f"'{material_name}' in {target.name}."
             )
         material = matches[0]
         material_id = positive_int(material.attrib.get("ID"))
@@ -10073,6 +10117,7 @@ def _validate_staged_speedtree_targets(staged_targets, states):
         production_root = Path(state["production_root"])
         production_references = set()
         for spm_path in sorted(stage_root.glob("*.spm")):
+            is_selected = normalized_target_key(spm_path) in selected
             root = read_spm_xml(spm_path)
             assets = root.find("Assets")
             if assets is None:
@@ -10127,6 +10172,14 @@ def _validate_staged_speedtree_targets(staged_targets, states):
                             else (production_root / candidate).absolute()
                         )
                     if not resolved.is_file():
+                        # Sibling SPMs are loaded only to protect shared files
+                        # from deletion.  A pre-existing broken reference in
+                        # an unselected sibling has nothing to protect and
+                        # must not abort an otherwise unrelated target update.
+                        # Selected targets remain strict so Atlas never
+                        # commits a newly generated broken reference.
+                        if not is_selected:
+                            continue
                         raise RuntimeError(
                             "SpeedTree SPM validation failed: external Mesh "
                             f"Filename is absent for {spm_path.name}: {filename}"
@@ -10141,7 +10194,7 @@ def _validate_staged_speedtree_targets(staged_targets, states):
                         os.path.normcase(str(production_path.absolute())).casefold()
                     )
 
-            if normalized_target_key(spm_path) not in selected:
+            if not is_selected:
                 continue
             manifest = read_json_file(target_manifest_path(spm_path), {})
             connection = manifest.get("generator_connection") or {}

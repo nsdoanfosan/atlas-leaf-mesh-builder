@@ -11,6 +11,7 @@ import os
 import re
 import shutil
 import tempfile
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 
@@ -44,6 +45,50 @@ STAGED_HISTORY_PATH_FIELDS = {
 }
 PENDING_TRANSACTION_ROOTS = []
 
+
+class AtlasTransactionConflictError(RuntimeError):
+    """A production input changed after the private stage was created."""
+
+    reason_token = "production_changed_while_staging"
+
+    def __init__(
+        self,
+        path,
+        *,
+        expected_sha256,
+        actual_sha256,
+        expected_xml_sha256=None,
+        actual_xml_sha256=None,
+    ):
+        self.path = Path(path).absolute()
+        self.expected_sha256 = expected_sha256
+        self.actual_sha256 = actual_sha256
+        self.expected_xml_sha256 = expected_xml_sha256
+        self.actual_xml_sha256 = actual_xml_sha256
+        self.failure_contract = {
+            "kind": "atlas_speedtree_transaction_failure",
+            "version": 1,
+            "failure_kind": "transaction_conflict",
+            "reason": self.reason_token,
+            "commit_started": False,
+            "preserve_external_changes": True,
+            "conflicts": [
+                {
+                    "path": str(self.path),
+                    "expected_sha256": expected_sha256,
+                    "actual_sha256": actual_sha256,
+                    "expected_xml_sha256": expected_xml_sha256,
+                    "actual_xml_sha256": actual_xml_sha256,
+                }
+            ],
+        }
+        super().__init__(
+            "Atlas transaction conflict: production file changed while "
+            f"staging: {self.path} "
+            f"(expected_sha256={expected_sha256}, "
+            f"actual_sha256={actual_sha256})"
+        )
+
 # Explorer copies and pipeline recovery snapshots are backup inventory, not
 # live sibling assets.  They must never enter the staged fleet merely because
 # they sit beside a production SPM: validation of such a historical copy can
@@ -68,6 +113,24 @@ BACKUP_SPM_RE = re.compile(
 
 def _sha256_bytes(payload):
     return hashlib.sha256(payload).hexdigest()
+
+
+def _xml_semantic_sha256(payload):
+    """Return a formatting-independent XML digest, or ``None`` if invalid."""
+    try:
+        root = ET.fromstring(payload)
+        for node in root.iter():
+            if node.text is not None and not node.text.strip():
+                node.text = None
+            if node.tail is not None and not node.tail.strip():
+                node.tail = None
+        canonical = ET.canonicalize(
+            xml_data=ET.tostring(root, encoding="unicode"),
+            with_comments=True,
+        )
+    except (ET.ParseError, TypeError, ValueError):
+        return None
+    return _sha256_bytes(canonical.encode("utf-8"))
 
 
 def _normalized_path(path):
@@ -334,11 +397,13 @@ def _map_result_paths(value, states):
     return value
 
 
-def _verify_backup(state):
+def _write_verified_backup(state):
+    """Persist the already-sealed snapshot, never a later production read."""
     backup_root = state["backup_root"]
     for relative, entry in state["snapshot"].items():
         backup = backup_root / relative
-        _copy_file(state["production_root"] / relative, backup)
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        backup.write_bytes(entry["bytes"])
         if _sha256_bytes(backup.read_bytes()) != entry["sha256"]:
             raise RuntimeError(
                 f"Atlas transaction backup hash mismatch: {state['production_root'] / relative}"
@@ -357,10 +422,46 @@ def _verify_production_unchanged(state):
         )
     for relative, entry in state["snapshot"].items():
         path = state["production_root"] / relative
-        if not path.is_file() or _sha256_bytes(path.read_bytes()) != entry["sha256"]:
-            raise RuntimeError(
-                f"Atlas transaction production file changed while staging: {path}"
+        if not path.is_file():
+            raise AtlasTransactionConflictError(
+                path,
+                expected_sha256=entry["sha256"],
+                actual_sha256=None,
             )
+        current = path.read_bytes()
+        current_sha256 = _sha256_bytes(current)
+        if current_sha256 == entry["sha256"]:
+            continue
+        expected_xml_sha256 = None
+        actual_xml_sha256 = None
+        if relative.suffix.casefold() == ".spm":
+            expected_xml_sha256 = _xml_semantic_sha256(entry["bytes"])
+            actual_xml_sha256 = _xml_semantic_sha256(current)
+            if (
+                expected_xml_sha256 is not None
+                and expected_xml_sha256 == actual_xml_sha256
+            ):
+                # SpeedTree/OneDrive can rewrite XML serialization while an
+                # Atlas stage is being built.  If the complete canonical XML
+                # is identical, preserve the newer bytes as the rollback
+                # baseline and safely commit the already-equivalent stage.
+                previous_sha256 = entry["sha256"]
+                entry["bytes"] = current
+                entry["sha256"] = current_sha256
+                state.setdefault("semantic_rebases", []).append({
+                    "path": str(path),
+                    "previous_sha256": previous_sha256,
+                    "current_sha256": current_sha256,
+                    "xml_sha256": actual_xml_sha256,
+                })
+                continue
+        raise AtlasTransactionConflictError(
+            path,
+            expected_sha256=entry["sha256"],
+            actual_sha256=current_sha256,
+            expected_xml_sha256=expected_xml_sha256,
+            actual_xml_sha256=actual_xml_sha256,
+        )
 
 
 def _restore_state(state, final_relpaths):
@@ -406,12 +507,13 @@ def _commit_sort_key(relative):
 def _commit_states(states, referenced_files):
     final_by_state = {}
     for state in states:
-        _verify_backup(state)
         _verify_production_unchanged(state)
         final_by_state[id(state)] = _managed_relpaths(
             state["stage_root"],
             state["target_names"],
         )
+    for state in states:
+        _write_verified_backup(state)
 
     try:
         for state in states:
