@@ -413,6 +413,98 @@ def current_bindings(manifest):
     return copy.deepcopy(rows)
 
 
+def _legacy_binding_with_live_guid(binding, live_bindings, label):
+    """Upgrade one pre-GUID receipt row from the exact live Generator slot."""
+    row = copy.deepcopy(binding)
+    if str(row.get("generator_guid") or "").strip():
+        return row
+    slot_prefix = _text(row.get("slot_prefix"), f"{label} slot_prefix")
+    candidates = [
+        live
+        for live in live_bindings
+        if str(live.get("slot_prefix") or "").strip() == slot_prefix
+    ]
+    for field in ("generator_index", "generator_name", "generator_type"):
+        expected = row.get(field)
+        if expected in (None, ""):
+            continue
+        matched = [
+            live
+            for live in candidates
+            if str(live.get(field)) == str(expected)
+        ]
+        if matched:
+            candidates = matched
+    if len(candidates) != 1:
+        try:
+            expected_pair = (
+                _integer(
+                    row.get("target_material_id"),
+                    f"{label} target_material_id",
+                    positive=True,
+                ),
+                canonical_target_mesh_id(
+                    row.get("target_mesh_id"),
+                    f"{label} target_mesh_id",
+                ),
+            )
+        except GeneratorSlotOwnershipError:
+            expected_pair = None
+        if expected_pair is not None:
+            candidates = [
+                live
+                for live in candidates
+                if (
+                    int(live.get("target_material_id")),
+                    int(live.get("target_mesh_id")),
+                ) == expected_pair
+            ]
+    if len(candidates) != 1:
+        raise GeneratorSlotOwnershipError(
+            f"{label} has no unique live Generator GUID migration: "
+            f"slot_prefix={slot_prefix}, candidates={len(candidates)}"
+        )
+    row["generator_guid"] = _text(
+        candidates[0].get("generator_guid"),
+        f"{label} live generator_guid",
+    )
+    row["legacy_generator_guid_migration"] = (
+        "exact_live_generator_slot"
+    )
+    return row
+
+
+def migrate_legacy_manifest_binding_guids(manifest, live_bindings):
+    """Return a legacy receipt with missing GUIDs bound to live exact slots.
+
+    Versioned ownership contracts never use this migration.  It is only for
+    historical ``generator_connection`` rows written before Generator GUIDs
+    became mandatory, and therefore cannot weaken current explicit ownership.
+    """
+    payload = copy.deepcopy(manifest)
+    if payload.get("generator_binding_ownership") is not None:
+        return payload
+    connection = copy.deepcopy(payload.get("generator_connection") or {})
+    for field in ("bindings", "authored_bindings"):
+        rows = connection.get(field)
+        if rows is None:
+            continue
+        if not isinstance(rows, list):
+            raise GeneratorSlotOwnershipError(
+                f"generator_connection.{field} must be a list"
+            )
+        connection[field] = [
+            _legacy_binding_with_live_guid(
+                row,
+                live_bindings,
+                f"generator_connection.{field} binding #{index}",
+            )
+            for index, row in enumerate(rows, 1)
+        ]
+    payload["generator_connection"] = connection
+    return payload
+
+
 def manifest_with_binding_contracts(
     manifest,
     current_rows,
@@ -498,7 +590,8 @@ def plan_live_binding_reconciliation(provider_records, live_bindings):
     """
     if not isinstance(provider_records, list):
         raise GeneratorSlotOwnershipError("provider_records must be a list")
-    live_rows = canonical_ownership_bindings(list(live_bindings or []))
+    live_binding_rows = copy.deepcopy(list(live_bindings or []))
+    live_rows = canonical_ownership_bindings(live_binding_rows)
     live_by_slot = {binding_key(row): row for row in live_rows}
 
     providers = {}
@@ -510,7 +603,10 @@ def plan_live_binding_reconciliation(provider_records, live_bindings):
                 f"provider record #{ordinal + 1} is invalid"
             )
         path = str(record.get("path") or "")
-        payload = record["payload"]
+        payload = migrate_legacy_manifest_binding_guids(
+            record["payload"],
+            live_binding_rows,
+        )
         identity = provider_identity(
             payload,
             relative_to=(Path(path).parent if path else None),
@@ -735,6 +831,7 @@ __all__ = [
     "creation_provenance_slot",
     "current_bindings",
     "manifest_with_binding_contracts",
+    "migrate_legacy_manifest_binding_guids",
     "ownership_binding_projection",
     "plan_live_binding_reconciliation",
     "provider_identity",

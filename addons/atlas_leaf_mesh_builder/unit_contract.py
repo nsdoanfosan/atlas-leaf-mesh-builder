@@ -179,3 +179,27 @@ def unit_probe_contract_from_json(text):
     except json.JSONDecodeError as exc:
         raise ValueError(f"SpeedTree unit probe contract is invalid JSON: {exc}") from exc
     return validate_unit_probe_contract(value)
+
+
+def resolve_unit_probe_contract_update(
+    existing_json,
+    requested_contract=None,
+    *,
+    clear=False,
+):
+    """Resolve an integration update without silently erasing scale proof.
+
+    External target refreshes commonly update only Generator ownership.  A
+    missing optional argument therefore means "preserve the verified current
+    contract"; callers that truly need an unproven target must opt into an
+    explicit clear.
+    """
+    if requested_contract is not None and clear:
+        raise ValueError(
+            "SpeedTree unit probe cannot be replaced and cleared together."
+        )
+    if requested_contract is not None:
+        return validate_unit_probe_contract(requested_contract)
+    if clear:
+        return None
+    return unit_probe_contract_from_json(existing_json)

@@ -18,6 +18,7 @@ INTEGRATION_API_CAPABILITIES = frozenset({
     "atomic_exact_target_slice_v1",
     "generator_adoption_reconciliation_v1",
     "structured_transaction_conflict_v1",
+    "unit_probe_preserve_by_default_v1",
 })
 
 
@@ -169,6 +170,7 @@ def configure_external_plan_target(
     unit_probe_contract=None,
     connect_generators=True,
     generator_delivery_scope_intent=None,
+    clear_unit_probe_contract=False,
 ):
     """Configure Atlas' existing public scene contract for an external plan collection.
 
@@ -217,11 +219,14 @@ def configure_external_plan_target(
     props.speedtree_atlas_asset_name = generated_material_name
     props.speedtree_anchor_export_mode = "OFF"
     props.speedtree_create_missing_spm = False
-    verified_unit_contract = None
-    if unit_probe_contract is not None:
-        from .unit_contract import validate_unit_probe_contract
+    from .unit_contract import resolve_unit_probe_contract_update
 
-        verified_unit_contract = validate_unit_probe_contract(unit_probe_contract)
+    verified_unit_contract = resolve_unit_probe_contract_update(
+        getattr(props, "speedtree_unit_probe_contract_json", ""),
+        unit_probe_contract,
+        clear=bool(clear_unit_probe_contract),
+    )
+    if verified_unit_contract is not None:
         mesh_geometry_scale = verified_unit_contract["mesh_geometry_scale"]
         mesh_asset_scale = verified_unit_contract["mesh_asset_scale"]
         props.speedtree_unit_probe_contract_json = json.dumps(
@@ -312,6 +317,14 @@ def configure_external_plan_target(
                     generator_delivery_scope_intent
                 )
             mapping[str(target)] = request
+        else:
+            # Configuration is authoritative for this exact target.  Merely
+            # skipping a new mapping leaves a previous connection request
+            # active and makes an asset-only external refresh unexpectedly
+            # mutate (or reject) Generator slots.
+            for mapped_target in list(mapping):
+                if blend_paths_equal(mapped_target, target):
+                    del mapping[mapped_target]
         props.speedtree_source_materials_json = json.dumps(mapping, ensure_ascii=False)
         save_spm_target_registry(props)
 
@@ -341,6 +354,15 @@ def configure_external_plan_target(
         ),
         "adopt_source_material": adopt_source_material,
         "connect_generators": connect_generators,
+        "unit_probe_update": (
+            "cleared"
+            if clear_unit_probe_contract
+            else "replaced"
+            if unit_probe_contract is not None
+            else "preserved"
+            if verified_unit_contract is not None
+            else "absent"
+        ),
         "generator_variant_policy": generator_variant_policy,
         "generator_delivery_scope_intent": (
             generator_delivery_scope_intent

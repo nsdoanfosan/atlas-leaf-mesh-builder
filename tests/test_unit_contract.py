@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import unittest
 from pathlib import Path
 
@@ -16,6 +17,9 @@ SPEC = importlib.util.spec_from_file_location(
 UNIT_CONTRACT = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(UNIT_CONTRACT)
 validate_unit_probe_contract = UNIT_CONTRACT.validate_unit_probe_contract
+resolve_unit_probe_contract_update = (
+    UNIT_CONTRACT.resolve_unit_probe_contract_update
+)
 
 
 def fixture(**selected_overrides):
@@ -81,6 +85,31 @@ class UnitContractTests(unittest.TestCase):
         value["generator_results"] = value["generator_results"][:1]
         with self.assertRaisesRegex(ValueError, "Leaf Mesh"):
             validate_unit_probe_contract(value)
+
+    def test_missing_update_preserves_existing_verified_contract(self):
+        existing = fixture()
+        resolved = resolve_unit_probe_contract_update(
+            json.dumps(existing),
+            None,
+        )
+        self.assertEqual(resolved["contract_sha256"], validate_unit_probe_contract(
+            existing
+        )["contract_sha256"])
+
+    def test_explicit_clear_is_required_to_remove_existing_contract(self):
+        self.assertIsNone(resolve_unit_probe_contract_update(
+            json.dumps(fixture()),
+            None,
+            clear=True,
+        ))
+
+    def test_replace_and_clear_together_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "replaced and cleared"):
+            resolve_unit_probe_contract_update(
+                json.dumps(fixture()),
+                fixture(),
+                clear=True,
+            )
 
 
 if __name__ == "__main__":
