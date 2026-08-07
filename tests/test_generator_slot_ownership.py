@@ -331,6 +331,51 @@ class LiveBindingReconciliationTests(unittest.TestCase):
             "payload": payload,
         }
 
+    def test_legacy_binding_without_guid_migrates_from_exact_live_slot(self):
+        live = binding(
+            "OpaqueLiveGuid==",
+            "Leaves:Type:0",
+            14,
+            16,
+            index=1,
+        )
+        legacy = copy.deepcopy(live)
+        legacy.pop("generator_guid")
+        record = self.record("legacy", "legacy-scope", [legacy])
+
+        plan = ownership.plan_live_binding_reconciliation(
+            [record],
+            [live],
+        )
+
+        self.assertEqual(plan["status"], "repairable")
+        update = next(iter(plan["provider_updates"].values()))
+        migrated = update["records"][0]["payload"][
+            "generator_connection"
+        ]["bindings"][0]
+        self.assertEqual(migrated["generator_guid"], "OpaqueLiveGuid==")
+        self.assertEqual(
+            migrated["legacy_generator_guid_migration"],
+            "exact_live_generator_slot",
+        )
+
+    def test_ambiguous_legacy_guid_migration_fails_closed(self):
+        legacy = binding("discard", "Leaves:Type:0", 14, 16)
+        legacy.pop("generator_guid")
+        for field in ("generator_index", "generator_name", "generator_type"):
+            legacy.pop(field)
+        live_a = binding("GuidA==", "Leaves:Type:0", 14, 16, index=1)
+        live_b = binding("GuidB==", "Leaves:Type:0", 14, 16, index=2)
+
+        with self.assertRaisesRegex(
+            ownership.GeneratorSlotOwnershipError,
+            "no unique live Generator GUID migration",
+        ):
+            ownership.plan_live_binding_reconciliation(
+                [self.record("legacy", "legacy-scope", [legacy])],
+                [live_a, live_b],
+            )
+
     def test_live_spm_splits_one_generator_across_two_providers(self):
         guid = "OpaqueGuid=="
         provider_a_rows = [
