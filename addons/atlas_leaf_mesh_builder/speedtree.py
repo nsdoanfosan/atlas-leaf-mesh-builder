@@ -3085,7 +3085,7 @@ def previous_generated_binding_retarget(
         (
             integer_value(mesh_property.findtext("Value"))
             if mesh_property is not None
-            else None
+            else MATERIAL_DEFAULT_MESH_ID
         ),
     )
     previous_target = (
@@ -3145,6 +3145,9 @@ def previous_generated_binding_retarget(
             sentinel_policy = (
                 "previous_generated_ordinal_without_output_to_first_generated"
             )
+    if previous_target[1] == MATERIAL_DEFAULT_MESH_ID:
+        target = copy.deepcopy(target)
+        target["target_mesh_id"] = MATERIAL_DEFAULT_MESH_ID
     return {
         "previous": previous,
         "source": source,
@@ -3438,7 +3441,7 @@ def plan_atlas_generator_slot_identities(
         mesh_id = (
             integer_value(mesh_property.findtext("Value"))
             if mesh_property is not None
-            else None
+            else MATERIAL_DEFAULT_MESH_ID
         )
         previous = previous_by_slot.get(
             (pair["generator_index"], pair["slot_prefix"])
@@ -3449,13 +3452,8 @@ def plan_atlas_generator_slot_identities(
             else None
         )
         if ordinal is None and material_id in source_records:
-            if mesh_property is None:
-                raise RuntimeError(
-                    f"Generator '{pair['generator_name']}' slot "
-                    f"'{pair['slot_prefix']}' has Material but no Mesh property."
-                )
             source = source_records[material_id]
-            if mesh_id == -10:
+            if mesh_id == MATERIAL_DEFAULT_MESH_ID:
                 ordinal = 1
             elif mesh_id in source["mesh_ids"]:
                 ordinal = source["mesh_ids"].index(mesh_id) + 1
@@ -3795,7 +3793,7 @@ def connect_atlas_generators_in_spm(
             mesh_id = (
                 integer_value(mesh_property.findtext("Value"))
                 if mesh_property is not None
-                else None
+                else MATERIAL_DEFAULT_MESH_ID
             )
             ordinal = None
             previous_retarget = previous_generated_binding_retarget(
@@ -3815,12 +3813,7 @@ def connect_atlas_generators_in_spm(
                     ordinal = target["leaf_ordinal"]
             if ordinal is None:
                 if material_id == source_material_id:
-                    if mesh_property is None:
-                        raise RuntimeError(
-                            f"Generator '{pair['generator_name']}' slot "
-                            f"'{pair['slot_prefix']}' has Material but no Mesh property."
-                        )
-                    if mesh_id == -10:
+                    if mesh_id == MATERIAL_DEFAULT_MESH_ID:
                         ordinal = 1
                     elif mesh_id in source["mesh_ids"]:
                         ordinal = source["mesh_ids"].index(mesh_id) + 1
@@ -3949,7 +3942,11 @@ def connect_atlas_generators_in_spm(
         material_property = pair["material_property"]
         mesh_property = pair["mesh_property"]
         material_id = positive_int(material_property.findtext("Value"))
-        mesh_id = integer_value(mesh_property.findtext("Value")) if mesh_property is not None else None
+        mesh_id = (
+            integer_value(mesh_property.findtext("Value"))
+            if mesh_property is not None
+            else MATERIAL_DEFAULT_MESH_ID
+        )
         previous = previous_by_slot.get(
             (pair["generator_index"], pair["slot_prefix"])
         )
@@ -3978,6 +3975,18 @@ def connect_atlas_generators_in_spm(
                 ))
             continue
         target = generated_pair_to_binding.get((material_id, mesh_id))
+        if target is None and mesh_id == MATERIAL_DEFAULT_MESH_ID:
+            material_matches = [
+                binding
+                for binding in output_bindings.values()
+                if binding["target_material_id"] == material_id
+            ]
+            if material_matches:
+                target = copy.deepcopy(sorted(
+                    material_matches,
+                    key=lambda binding: binding["leaf_ordinal"],
+                )[0])
+                target["target_mesh_id"] = MATERIAL_DEFAULT_MESH_ID
         if target is not None:
             already.append((pair, target))
             continue
@@ -4015,19 +4024,14 @@ def connect_atlas_generators_in_spm(
             )
             continue
         if material_id in source_records:
-            if mesh_property is None:
-                raise RuntimeError(
-                    f"Generator '{pair['generator_name']}' slot '{pair['slot_prefix']}' has Material but no Mesh property."
-                )
             source = source_records[material_id]
             sentinel_policy = None
-            if mesh_id == -10:
-                # SpeedTree uses -10 as a non-specific mesh selection. A split
-                # generated atlas can span several material groups, so there is
-                # no single material whose cutout list can safely retain that
-                # sentinel. Bind it deterministically to the first exported leaf.
+            if mesh_id == MATERIAL_DEFAULT_MESH_ID:
+                # This slot intentionally takes its cutout mesh from the
+                # assigned material. Preserve that SpeedTree behavior and
+                # update only the Material reference.
                 ordinal = 1
-                sentinel_policy = "mesh_-10_to_first_generated_leaf"
+                sentinel_policy = "material_default_mesh_preserved"
             elif mesh_id not in source["mesh_ids"]:
                 raise RuntimeError(
                     f"Generator '{pair['generator_name']}' mesh ID {mesh_id} is not in source material "
@@ -4050,6 +4054,9 @@ def connect_atlas_generators_in_spm(
                         f"Generator '{pair['generator_name']}' needs "
                         f"leaf_{ordinal:02d}, but that atlas mesh was not exported."
                     )
+            if mesh_id == MATERIAL_DEFAULT_MESH_ID:
+                target = copy.deepcopy(target)
+                target["target_mesh_id"] = MATERIAL_DEFAULT_MESH_ID
             staged.append((
                 pair,
                 source,
@@ -4084,7 +4091,8 @@ def connect_atlas_generators_in_spm(
         previous,
     ) in staged:
         child_text(pair["material_property"], "Value", target["target_material_id"])
-        child_text(pair["mesh_property"], "Value", target["target_mesh_id"])
+        if pair["mesh_property"] is not None:
+            child_text(pair["mesh_property"], "Value", target["target_mesh_id"])
         binding = {
             "state": "changed",
             "generator_index": pair["generator_index"],
@@ -4137,7 +4145,7 @@ def connect_atlas_generators_in_spm(
         previous_matches_target = (
             positive_int(previous.get("target_material_id"))
             == target["target_material_id"]
-            and positive_int(previous.get("target_mesh_id"))
+            and integer_value(previous.get("target_mesh_id"))
             == target["target_mesh_id"]
         )
         binding = {
@@ -4211,10 +4219,17 @@ def connect_atlas_generators_in_spm(
     }
     for binding in bindings:
         pair = validated_pairs.get(generator_binding_slot_key(binding))
-        if pair is None or pair["mesh_property"] is None:
-            raise RuntimeError("Generator connection validation failed: slot pair disappeared after write.")
+        if pair is None:
+            raise RuntimeError(
+                "Generator connection validation failed: slot disappeared "
+                "after write."
+            )
         material_id = positive_int(pair["material_property"].findtext("Value"))
-        mesh_id = positive_int(pair["mesh_property"].findtext("Value"))
+        mesh_id = (
+            integer_value(pair["mesh_property"].findtext("Value"))
+            if pair["mesh_property"] is not None
+            else MATERIAL_DEFAULT_MESH_ID
+        )
         if (material_id, mesh_id) != (binding["target_material_id"], binding["target_mesh_id"]):
             raise RuntimeError(
                 f"Generator connection validation failed for '{binding['generator_name']}' "
@@ -5120,7 +5135,7 @@ def live_generator_ownership_bindings(spm_path):
         mesh_id = (
             integer_value(mesh_property.findtext("Value"))
             if mesh_property is not None
-            else None
+            else MATERIAL_DEFAULT_MESH_ID
         )
         if material_id is None or (
             mesh_id != MATERIAL_DEFAULT_MESH_ID

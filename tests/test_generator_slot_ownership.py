@@ -519,7 +519,7 @@ class LiveBindingReconciliationTests(unittest.TestCase):
             "scope-a",
         )
 
-    def test_same_live_pair_claimed_by_two_providers_remains_blocked(self):
+    def test_same_live_pair_claimed_by_two_providers_is_rebased_unowned(self):
         guid = "OpaqueGuid=="
         plan = ownership.plan_live_binding_reconciliation(
             [
@@ -537,11 +537,26 @@ class LiveBindingReconciliationTests(unittest.TestCase):
             [binding(guid, "Leaves:Type:7", 8, 90)],
         )
 
-        self.assertEqual(plan["status"], "blocked")
-        self.assertEqual(
-            plan["blocking"][0]["reason"],
-            "live_pair_has_multiple_provider_claims",
+        self.assertEqual(plan["status"], "repairable")
+        self.assertEqual(plan["blocking"], [])
+        self.assertIsNone(next(iter(plan["owners"].values())))
+
+    def test_live_pair_without_exact_provider_claim_is_rebased_unowned(self):
+        guid = "OpaqueGuid=="
+        plan = ownership.plan_live_binding_reconciliation(
+            [
+                self.record(
+                    "stale",
+                    "scope-stale",
+                    [binding(guid, "Material:Frond:0", 8, 90)],
+                ),
+            ],
+            [binding(guid, "Material:Frond:0", 10, -10)],
         )
+
+        self.assertEqual(plan["status"], "repairable")
+        self.assertEqual(plan["blocking"], [])
+        self.assertIsNone(next(iter(plan["owners"].values())))
 
 
 if __name__ == "__main__":
