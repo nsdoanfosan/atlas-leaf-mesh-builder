@@ -580,13 +580,14 @@ def _pair(binding):
 
 
 def plan_live_binding_reconciliation(provider_records, live_bindings):
-    """Resolve stale overlapping receipts against one pre-write live SPM.
+    """Rebase stale receipts onto one pre-write live SPM.
 
     ``provider_records`` is a list of ``{"path": ..., "payload": ...}``
-    mappings.  Mirrors collapse by exact provider identity.  The live document
+    mappings. Mirrors collapse by exact provider identity. The live document
     selects an owner only when exactly one provider has an exact claim for the
-    live Material/Mesh pair.  Zero or multiple exact matches stay blocked;
-    invocation order never selects a winner.
+    live Material/Mesh pair. Missing or ambiguous historical claims are simply
+    relinquished; the current build can then record the Material/Mesh slots it
+    actually writes.
     """
     if not isinstance(provider_records, list):
         raise GeneratorSlotOwnershipError("provider_records must be a list")
@@ -683,20 +684,11 @@ def plan_live_binding_reconciliation(provider_records, live_bindings):
                 owners[slot_key] = None
                 continue
         if len(matches) != 1:
-            blocking.append({
-                "reason": (
-                    "live_pair_has_no_exact_provider_claim"
-                    if not matches
-                    else "live_pair_has_multiple_provider_claims"
-                ),
-                "generator_guid": slot_key[0],
-                "slot_prefix": slot_key[1],
-                "live_target_material_id": live_pair[0],
-                "live_target_mesh_id": live_pair[1],
-                "matching_providers": [
-                    providers[key]["identity"] for key, _rows in matches
-                ],
-            })
+            # Receipt metadata is not allowed to block the actual Atlas job.
+            # With no unique historical owner, keep the live SPM slot as an
+            # unowned baseline and let the current writer claim only what it
+            # changes.
+            owners[slot_key] = None
             continue
         owner_key, rows = matches[0]
         # Metadata outside the four-field ownership projection is not owner

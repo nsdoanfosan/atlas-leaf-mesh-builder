@@ -1062,7 +1062,7 @@ class GeneratorConnectionTests(unittest.TestCase):
             generator_values(self.spm_path)[
                 ("Frond 4", "Material:Frond:0")
             ],
-            (7, 63),
+            (7, -10),
         )
         self.assertEqual(
             result["applied_source_binding_repairs"][0]["from_mesh_id"],
@@ -1397,7 +1397,7 @@ class GeneratorConnectionTests(unittest.TestCase):
             )
         self.assertEqual(self.spm_path.read_bytes(), before)
 
-    def test_ladyfern_mesh_minus_ten_uses_first_generated_leaf(self):
+    def test_ladyfern_mesh_minus_ten_updates_material_only(self):
         root = speedtree.read_spm_xml(self.spm_path)
         assets = root.find("Assets")
         add_material(assets, 10, "cluster_ladyfern_02", [1, 2, 3, 13])
@@ -1410,8 +1410,47 @@ class GeneratorConnectionTests(unittest.TestCase):
         )
         binding = next(item for item in result["bindings"] if item["generator_name"] == "Frond 2")
         self.assertEqual(binding["target_material_id"], 7)
-        self.assertEqual(binding["target_mesh_id"], 63)
-        self.assertEqual(binding["sentinel_policy"], "mesh_-10_to_first_generated_leaf")
+        self.assertEqual(binding["target_mesh_id"], -10)
+        self.assertEqual(binding["sentinel_policy"], "material_default_mesh_preserved")
+        self.assertEqual(
+            generator_values(self.spm_path)[("Frond 2", "Material:Frond:0")],
+            (7, -10),
+        )
+
+    def test_frond_without_mesh_property_updates_material_only(self):
+        target = Path(self.temp_dir.name) / "material_only_frond.spm"
+        root = ET.Element("SpeedTreeModel")
+        assets = ET.SubElement(root, "Assets")
+        add_material(assets, 4, "M_branch", [5])
+        add_material(assets, 7, "M_branch_atlas", [63])
+        add_mesh(assets, 5)
+        add_mesh(assets, 63)
+        generator = add_generator(root, "Frond", "Frond material", [(4, -10)])
+        properties = generator.find("Properties")
+        mesh_property = next(
+            prop
+            for prop in list(properties)
+            if prop.findtext("Name") == "Material:Frond:0:Mesh"
+        )
+        properties.remove(mesh_property)
+        write_spm(target, root)
+        groups = [{
+            "material": "M_branch_atlas",
+            "material_id": 7,
+            "mesh_ids": [63],
+            "meshes": [{"source_object": "leaf_01", "source_ordinal": 1}],
+        }]
+
+        result = speedtree.connect_atlas_generators_in_spm(
+            target, ["M_branch"], groups
+        )
+
+        pair = speedtree.spm_generator_property_pairs(
+            speedtree.read_spm_xml(target), {"Frond"}
+        )[0]
+        self.assertEqual(pair["material_property"].findtext("Value"), "7")
+        self.assertIsNone(pair["mesh_property"])
+        self.assertEqual(result["bindings"][0]["target_mesh_id"], -10)
 
     def test_duplicate_source_name_and_mismatched_id_list_fail(self):
         with self.assertRaisesRegex(RuntimeError, "duplicated"):
@@ -6029,7 +6068,7 @@ class DeletedMeshLifecycleTests(unittest.TestCase):
             speedtree._write_json_if_changed(previous_path, resurrected)
             with self.assertRaisesRegex(
                 RuntimeError,
-                "ownership receipts remain ambiguous",
+                "receipts still overlap or differ",
             ):
                 speedtree.validate_target_generator_ownership_receipts(target)
 
