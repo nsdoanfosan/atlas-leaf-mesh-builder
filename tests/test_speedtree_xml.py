@@ -83,6 +83,41 @@ delivery_scope = sys.modules[
 ]
 
 
+class _FakePlan(dict):
+    name = "Plan_Leaf_01"
+
+
+class NormalizedPlanBoneContractTests(unittest.TestCase):
+    def test_preserves_exact_source_bone(self):
+        plan = _FakePlan({
+            "speedtree_cluster_source_partition_mode": (
+                "PER_CONNECTED_DEFORM_CLUSTER"
+            ),
+            "speedtree_cluster_source_bone": "Bone_7_Start",
+            "speedtree_cluster_endpoint_bone": "Bone_7_End",
+        })
+
+        self.assertEqual(
+            speedtree.normalized_plan_bone_contract(plan),
+            {
+                "source_partition_mode": "PER_CONNECTED_DEFORM_CLUSTER",
+                "source_bone": "Bone_7_Start",
+                "endpoint_bone": "Bone_7_End",
+            },
+        )
+
+    def test_rejects_normalized_plan_without_exact_source_bone(self):
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "has no exact source_bone identity",
+        ):
+            speedtree.normalized_plan_bone_contract(_FakePlan({
+                "speedtree_cluster_source_partition_mode": (
+                    "PER_CONNECTED_DEFORM_CLUSTER"
+                ),
+            }))
+
+
 def canonical_test_textures(path):
     path = str(path)
     return {

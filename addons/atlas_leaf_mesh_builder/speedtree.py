@@ -1437,6 +1437,29 @@ def positive_int(value):
     return number if number is not None and number > 0 else None
 
 
+def normalized_plan_bone_contract(source):
+    """Preserve normalizer-authored FBX bone identity in Atlas receipts."""
+    source_partition_mode = str(
+        source.get("speedtree_cluster_source_partition_mode") or ""
+    ).strip() or None
+    source_bone = str(
+        source.get("speedtree_cluster_source_bone") or ""
+    ).strip()
+    endpoint_bone = str(
+        source.get("speedtree_cluster_endpoint_bone") or ""
+    ).strip()
+    if source_partition_mode and not source_bone:
+        raise RuntimeError(
+            "Normalized SpeedTree plan has no exact source_bone identity: "
+            + str(getattr(source, "name", "<unnamed>"))
+        )
+    return {
+        "source_partition_mode": source_partition_mode,
+        "source_bone": source_bone or None,
+        "endpoint_bone": endpoint_bone or None,
+    }
+
+
 def normalized_generator_type(value):
     return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
 
@@ -8497,6 +8520,14 @@ def export_speedtree_assets(
                             asset_name = str(
                                 composite_part.get("skeletal_asset_name") or ""
                             ).strip()
+                            source_bone = str(
+                                composite_part.get("source_bone") or ""
+                            ).strip()
+                            if not source_bone:
+                                raise RuntimeError(
+                                    "Physical composite prototype has no exact "
+                                    f"source_bone identity: {asset_name or '<unnamed>'}"
+                                )
                             bounds = prototype_bounds.get(
                                 asset_name.casefold()
                             )
@@ -8589,6 +8620,7 @@ def export_speedtree_assets(
                         anchor_records,
                     )
                     asset_path = xml_path
+                bone_contract = normalized_plan_bone_contract(source)
                 item = {
                     "name": export_stem,
                     "fbx": str(fbx_path),
@@ -8606,9 +8638,7 @@ def export_speedtree_assets(
                     "source_prototype_index": positive_int(
                         source.get("speedtree_cluster_prototype_index")
                     ),
-                    "source_partition_mode": str(
-                        source.get("speedtree_cluster_source_partition_mode") or ""
-                    ).strip() or None,
+                    **bone_contract,
                     "composite_parts": copy.deepcopy(composite_parts),
                     "source_ordinal": (
                         positive_int(source.get("speedtree_cluster_variant_index"))
