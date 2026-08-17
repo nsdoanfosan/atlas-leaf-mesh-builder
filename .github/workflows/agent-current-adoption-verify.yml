@@ -1,0 +1,27 @@
+name: Agent current adoption verification
+
+on:
+  push:
+    branches:
+      - agent/current-transaction-adoption-authority
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Compile changed Python files
+        run: >-
+          python -m py_compile
+          addons/atlas_leaf_mesh_builder/current_transaction_adoption.py
+          addons/atlas_leaf_mesh_builder/integration_api.py
+          tests/test_current_transaction_adoption.py
+      - name: Run current transaction regression tests
+        run: python tests/test_current_transaction_adoption.py
+      - name: Run generator ownership tests
+        run: python tests/test_generator_slot_ownership.py
+      - name: Run transaction tests
+        run: python tests/test_speedtree_transaction.py
