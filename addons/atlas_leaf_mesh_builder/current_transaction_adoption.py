@@ -1,11 +1,11 @@
-"""Current-transaction authority for external Cluster material adoption.
+"""Authority policy for explicit external Cluster adoption transactions.
 
-Historical Atlas receipts prove lineage and rollback provenance.  They do not
-freeze the live Material_v8 cutout mesh list forever: a later rebuild from the
-same logical provider may legitimately replace those mesh IDs before Cluster
-relationship ON is extended to another target.  This adapter is intentionally
-used only by the external atomic transaction API.  Direct/legacy Atlas callers
-keep the stricter legacy reconciliation path in ``speedtree.py``.
+The Batch tool already chooses the exact target slice and passes
+``adoption_targets`` into the Atlas atomic transaction API.  That explicit
+request is the authority for the current run.  Historical Atlas scopes,
+receipts, mesh IDs and collection identities are lineage/rollback data; they
+must not veto an explicit current adoption before the atomic transaction has a
+chance to reconcile and publish the new state.
 """
 
 from __future__ import annotations
@@ -32,82 +32,30 @@ def _raw_mapping(props):
     return payload
 
 
-def _current_provider_manifest(props, blend_path):
-    return {
-        "blend_file": str(Path(blend_path).expanduser().absolute()),
-        "source_collection": str(
-            getattr(props, "collection_name", "") or ""
-        ).strip(),
-    }
-
-
-def _same_source_adoption_predecessors(
-    speedtree,
-    props,
-    target,
-    material,
-    material_name,
-    material_id,
-    marker,
-    blend_path,
-):
-    """Return exact same-provider receipts without comparing stale mesh IDs."""
-    if not blend_path or not isinstance(marker, dict):
+def _matching_materials(assets, material_name):
+    if assets is None:
         return []
-    if marker.get("kind") != "material" or not marker.get("scope"):
-        return []
-
-    current_provider = _current_provider_manifest(props, blend_path)
-    matches = []
-    for previous in speedtree.target_scope_manifests_for_blend(
-        target,
-        blend_path,
-    ):
-        previous_scope = speedtree.spm_export_scope(previous)
-        adoption = previous.get("source_material_adoption") or {}
-        adoption_scope = str(adoption.get("scope") or "")
-        valid_adoption = bool(
-            adoption.get("version")
-            == speedtree.SOURCE_MATERIAL_ADOPTION_VERSION
-            and adoption.get("material_name") == material_name
-            and speedtree.positive_int(adoption.get("material_id"))
-            == material_id
-            and adoption.get("original_material_snapshot")
-            and adoption.get("original_mesh_snapshots")
-            and (
-                not adoption_scope
-                or adoption_scope == previous_scope
-            )
-        )
-        if not valid_adoption:
-            continue
-        if (
-            marker.get("scope") != previous_scope
-            or not speedtree.manifests_share_source_identity(
-                current_provider,
-                previous,
-                material_name,
-            )
-        ):
-            continue
-        matches.append(previous)
-    return matches
+    return [
+        node
+        for node in assets.findall("Material_v8")
+        if node.attrib.get("Name") == material_name
+    ]
 
 
-def _snapshot_key(speedtree, manifest, material_name, material_id):
-    adoption = manifest.get("source_material_adoption") or {}
-    if not (
-        adoption.get("version") == speedtree.SOURCE_MATERIAL_ADOPTION_VERSION
-        and adoption.get("material_name") == material_name
-        and speedtree.positive_int(adoption.get("material_id")) == material_id
-        and adoption.get("original_material_snapshot")
-        and adoption.get("original_mesh_snapshots")
-    ):
-        return None
-    return (
-        adoption["original_material_snapshot"],
-        json.dumps(adoption["original_mesh_snapshots"], sort_keys=True),
-    )
+def _select_current_material(speedtree, matches, requested_material_ids):
+    requested_id = None
+    values = list(requested_material_ids or [])
+    if len(values) == 1:
+        requested_id = speedtree.positive_int(values[0])
+    if requested_id is not None:
+        exact = [
+            node
+            for node in matches
+            if speedtree.positive_int(node.attrib.get("ID")) == requested_id
+        ]
+        if exact:
+            return exact[0]
+    return matches[0] if matches else None
 
 
 def extend_current_transaction_source_material_adoptions(
@@ -116,20 +64,18 @@ def extend_current_transaction_source_material_adoptions(
     *,
     blend_path=None,
 ):
-    """Extend Cluster ON mappings while letting proven current data win.
+    """Apply current explicit adoption intent to every requested target.
 
-    A tagged material is accepted as a same-provider successor when the exact
-    target has a non-retired receipt for the same logical provider
-    (blend/source collection/material), the live material marker names that
-    receipt's scope, and the receipt still contains a complete original
-    adoption snapshot.  The historical receipt's *final* mesh IDs are not
-    compared to the current Material_v8 mesh list; those IDs are mutable output
-    state, while the original snapshots remain rollback evidence.
+    ``target_spms`` is already the exact adoption slice selected by the Batch
+    transaction.  Therefore this function does not ask historical receipts or
+    Atlas scope markers for permission again.  It only resolves the live target
+    material and writes the current request using that target-local Material ID.
 
-    Anything that cannot satisfy this narrow successor proof is delegated to
-    the existing legacy helper, preserving its foreign-provider and ambiguous
-    ownership protections unchanged.
+    The downstream atomic transaction remains responsible for mutation,
+    validation, rollback and publication.
     """
+    del blend_path  # Kept for API compatibility; history is not an authority.
+
     from . import speedtree
 
     raw_mapping = _raw_mapping(props)
@@ -153,34 +99,21 @@ def extend_current_transaction_source_material_adoptions(
             f"Cluster relationship ON has no source-material adoption template "
             f"for '{material_name}'."
         )
-    policies = {
-        speedtree.normalize_generator_variant_policy(
-            row.get("generator_variant_policy")
-        )
-        for row in templates
-    }
-    if len(policies) != 1:
-        raise RuntimeError(
-            f"Cluster relationship ON has conflicting Generator variant "
-            f"policies for '{material_name}'."
-        )
-    generator_variant_policy = next(iter(policies))
+
+    template = templates[0]
+    generator_variant_policy = speedtree.normalize_generator_variant_policy(
+        template.get("generator_variant_policy")
+    )
 
     added = []
     reconciled = []
     preserved = []
-    legacy_targets = []
 
     for target_value in target_spms:
         target = Path(target_value).expanduser().absolute()
         target_key = speedtree.normalized_target_key(target)
         existing_request = mapping.get(target_key)
-        if existing_request and not (
-            existing_request.get("source_material_names") == [material_name]
-            and existing_request.get("adopt_source_material") is True
-        ):
-            preserved.append(str(target))
-            continue
+
         if not target.is_file():
             raise RuntimeError(
                 f"Cluster relationship target does not exist: {target}"
@@ -188,38 +121,28 @@ def extend_current_transaction_source_material_adoptions(
 
         root = speedtree.read_spm_xml(target)
         assets = root.find("Assets")
-        matches = (
-            [
-                node
-                for node in assets.findall("Material_v8")
-                if node.attrib.get("Name") == material_name
-            ]
-            if assets is not None
-            else []
-        )
-        requested_material_ids = list(
-            (existing_request or {}).get("source_material_ids") or []
-        )
-        requested_material_id = (
-            speedtree.positive_int(requested_material_ids[0])
-            if len(requested_material_ids) == 1
-            else None
-        )
-        if requested_material_id is not None:
-            exact = [
-                node
-                for node in matches
-                if speedtree.positive_int(node.attrib.get("ID"))
-                == requested_material_id
-            ]
-            if exact:
-                matches = exact
+        matches = _matching_materials(assets, material_name)
         if not matches:
             raise RuntimeError(
                 f"Cluster relationship ON could not find Material_v8 "
                 f"'{material_name}' in {target.name}."
             )
-        material = matches[0]
+
+        same_current_request = bool(
+            existing_request
+            and existing_request.get("source_material_names") == [material_name]
+            and existing_request.get("adopt_source_material") is True
+        )
+        requested_ids = (
+            existing_request.get("source_material_ids")
+            if same_current_request
+            else None
+        )
+        material = _select_current_material(
+            speedtree,
+            matches,
+            requested_ids,
+        )
         material_id = speedtree.positive_int(material.attrib.get("ID"))
         if material_id is None:
             raise RuntimeError(
@@ -233,80 +156,41 @@ def extend_current_transaction_source_material_adoptions(
                 f"cutout meshes in {target.name}."
             )
 
-        marker = speedtree.parse_atlas_leaf_spm_user_data(
-            material.findtext("UserData")
-        )
-        predecessors = _same_source_adoption_predecessors(
-            speedtree,
-            props,
-            target,
-            material,
-            material_name,
-            material_id,
-            marker,
-            blend_path,
-        )
-        if not predecessors:
-            legacy_targets.append(target)
-            continue
-
-        snapshots = {
-            snapshot
-            for previous in predecessors
-            for snapshot in [
-                _snapshot_key(
-                    speedtree,
-                    previous,
-                    material_name,
-                    material_id,
-                )
-            ]
-            if snapshot is not None
-        }
-        if len(snapshots) != 1:
-            raise RuntimeError(
-                f"Cannot extend Cluster relationship to {target.name}: "
-                "same-provider adoption receipts disagree."
-            )
-
+        source_row = existing_request if same_current_request else template
         request = {
             "source_material_names": [material_name],
             "source_material_ids": [material_id],
             "adopt_source_material": True,
             "generator_variant_policy": generator_variant_policy,
             "source_binding_repairs": copy.deepcopy(
-                (existing_request or {}).get("source_binding_repairs") or []
+                (source_row or {}).get("source_binding_repairs") or []
             ),
         }
-        if (
-            (existing_request or {}).get("generator_delivery_scope_intent")
-            is not None
-        ):
+        delivery_intent = (source_row or {}).get(
+            "generator_delivery_scope_intent"
+        )
+        if delivery_intent is not None:
             request["generator_delivery_scope_intent"] = copy.deepcopy(
-                existing_request["generator_delivery_scope_intent"]
+                delivery_intent
             )
-        raw_mapping[str(target)] = request
 
+        raw_mapping[str(target)] = request
         row = {
             "target_spm": str(target),
             "material_name": material_name,
             "material_id": material_id,
             "source_mesh_ids": mesh_ids,
-            "reused_existing_scope": True,
-            "ownership_authority": "current_transaction_same_source",
-            "predecessor_scopes": sorted(
-                {
-                    speedtree.spm_export_scope(previous)
-                    for previous in predecessors
-                }
-            ),
+            "reused_existing_scope": False,
+            "ownership_authority": "explicit_current_transaction",
         }
         if existing_request is None:
             added.append(row)
-        elif existing_request.get("source_material_ids") != [material_id]:
-            reconciled.append(row)
-        else:
+        elif same_current_request and existing_request.get(
+            "source_material_ids"
+        ) == [material_id]:
             preserved.append(str(target))
+        else:
+            reconciled.append(row)
 
     props.speedtree_source_materials_json = json.dumps(
         raw_mapping,
@@ -314,20 +198,10 @@ def extend_current_transaction_source_material_adoptions(
         sort_keys=True,
     )
 
-    if legacy_targets:
-        legacy = speedtree.extend_source_material_adoptions_for_targets(
-            props,
-            legacy_targets,
-            blend_path=blend_path,
-        )
-        added.extend(legacy.get("added") or [])
-        reconciled.extend(legacy.get("reconciled") or [])
-        preserved.extend(legacy.get("preserved") or [])
-
     return {
         "material_name": material_name,
         "generator_variant_policy": generator_variant_policy,
-        "authority_policy": "current_transaction_same_source_v1",
+        "authority_policy": "explicit_current_transaction_v2",
         "added": added,
         "reconciled": reconciled,
         "preserved": preserved,
