@@ -47,6 +47,12 @@ def material_root(material_name, material_id, mesh_ids):
     for mesh_id in mesh_ids[1:]:
         ET.SubElement(supplemental, "CutoutMesh", {"ID": str(mesh_id)})
     ET.SubElement(material, "UserData").text = "historical-managed-marker"
+    for mesh_id in mesh_ids:
+        ET.SubElement(
+            assets,
+            "Mesh",
+            {"ID": str(mesh_id), "Name": f"Mesh_{mesh_id}"},
+        )
     return root
 
 
@@ -96,6 +102,7 @@ class CurrentTransactionAdoptionTests(unittest.TestCase):
 
     def fake_speedtree(self, *, material_present=True):
         module = types.ModuleType(f"{PACKAGE_NAME}.speedtree")
+        module.SOURCE_MATERIAL_ADOPTION_VERSION = 1
         module.normalized_target_key = lambda value: str(
             Path(value).expanduser().absolute()
         ).casefold()
@@ -113,6 +120,21 @@ class CurrentTransactionAdoptionTests(unittest.TestCase):
             else ET.Element("SpeedTreeModel")
         )
         module.spm_material_mesh_ids = spm_material_mesh_ids
+        module.spm_export_scope = lambda manifest: str(
+            manifest.get("export_scope_id") or "current-scope"
+        )
+        module.encode_spm_node_snapshot = lambda node: (
+            f"snapshot:{node.tag}:{node.attrib.get('ID', '')}"
+        )
+
+        def historical_gate(*args, **kwargs):
+            raise RuntimeError(
+                "Cannot newly adopt 'M_branch_lauraceae_01': it is already "
+                "managed by Atlas scope 'old-scope' and no matching original "
+                "snapshot was found."
+            )
+
+        module.prepare_source_material_adoption = historical_gate
 
         def source_mapping(props):
             raw = json.loads(props.speedtree_source_materials_json)
@@ -176,7 +198,7 @@ class CurrentTransactionAdoptionTests(unittest.TestCase):
 
         self.assertEqual(
             result["authority_policy"],
-            "explicit_current_transaction_v2",
+            "explicit_current_transaction_v3_live_baseline",
         )
         self.assertEqual(len(result["added"]), 1)
         self.assertEqual(
@@ -189,6 +211,54 @@ class CurrentTransactionAdoptionTests(unittest.TestCase):
             mapping[str(target.absolute())]["source_material_ids"],
             [self.material_id],
         )
+
+    def test_historical_snapshot_gate_falls_back_to_live_current_baseline(self):
+        temporary, target = self.workspace()
+        self.addCleanup(temporary.cleanup)
+        fake = self.fake_speedtree()
+        prepare = policy.enable_current_transaction_adoption_authority(fake)
+
+        adoption = prepare(
+            target,
+            {"export_scope_id": "new-current-scope"},
+            self.material_name,
+            self.material_id,
+            {"export_scope_id": "stale-old-scope"},
+        )
+
+        self.assertEqual(
+            adoption["baseline_kind"],
+            "explicit_current_transaction_live_baseline",
+        )
+        self.assertEqual(adoption["scope"], "new-current-scope")
+        self.assertEqual(adoption["material_id"], self.material_id)
+        self.assertEqual(adoption["original_mesh_ids"], [200, 201])
+        self.assertEqual(
+            [row["mesh_id"] for row in adoption["original_mesh_snapshots"]],
+            [200, 201],
+        )
+        self.assertFalse(adoption["reused_original_snapshot"])
+
+    def test_structural_adoption_errors_are_not_suppressed(self):
+        temporary, target = self.workspace()
+        self.addCleanup(temporary.cleanup)
+        fake = self.fake_speedtree()
+
+        def structural_failure(*args, **kwargs):
+            raise RuntimeError(
+                "Source material adoption is missing Mesh assets [999]."
+            )
+
+        fake.prepare_source_material_adoption = structural_failure
+        prepare = policy.enable_current_transaction_adoption_authority(fake)
+        with self.assertRaisesRegex(RuntimeError, "missing Mesh assets"):
+            prepare(
+                target,
+                {"export_scope_id": "new-current-scope"},
+                self.material_name,
+                self.material_id,
+                None,
+            )
 
     def test_explicit_current_transaction_overrides_old_conflicting_mapping(self):
         temporary, target = self.workspace()
