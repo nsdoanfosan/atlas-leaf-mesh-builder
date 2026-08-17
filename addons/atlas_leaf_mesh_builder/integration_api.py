@@ -409,9 +409,11 @@ def execute_external_target_transaction(
         if not target.is_file():
             raise FileNotFoundError(f"Atlas external target does not exist: {target}")
 
+    from .current_transaction_adoption import (
+        extend_current_transaction_source_material_adoptions,
+    )
     from .speedtree import (
         export_or_update_speedtree_spm_targets,
-        extend_source_material_adoptions_for_targets,
         normalized_target_key,
     )
 
@@ -427,7 +429,7 @@ def execute_external_target_transaction(
             "Atlas adoption targets must be part of the exact transaction slice."
         )
     if adoption_paths:
-        mapping_update = extend_source_material_adoptions_for_targets(
+        mapping_update = extend_current_transaction_source_material_adoptions(
             props,
             adoption_paths,
             blend_path=adoption_blend_path,
