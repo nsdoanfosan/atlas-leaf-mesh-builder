@@ -372,6 +372,127 @@ class StagedSpeedTreeValidationTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "Filename is absent"):
                 speedtree._validate_staged_speedtree_targets([target], [state])
 
+    def test_selected_update_allows_unchanged_preexisting_missing_mesh(self):
+        """Another provider's sealed missing FBX cannot block this update."""
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            stage = root / "stage"
+            production = root / "production"
+            stage.mkdir()
+            production.mkdir()
+            production_target = production / "tree.spm"
+            self._spm_with_external_mesh(
+                production_target,
+                "meshes/other_provider_missing.fbx",
+            )
+            target = stage / "tree.spm"
+            target.write_bytes(production_target.read_bytes())
+            staged_root = speedtree.read_spm_xml(target)
+            assets = staged_root.find("Assets")
+            embedded = speedtree.ET.SubElement(
+                assets, "Mesh", {"ID": "3"}
+            )
+            speedtree.ET.SubElement(embedded, "Embedded").text = "true"
+            material = speedtree.ET.SubElement(
+                assets,
+                "Material_v8",
+                {"ID": "4", "Name": "M_current_provider"},
+            )
+            speedtree.ET.SubElement(material, "CutoutMeshID").text = "3"
+            speedtree.write_spm_xml(target, staged_root)
+            self._write_empty_generator_contract(target)
+            state = {
+                "stage_root": stage,
+                "production_root": production,
+                "snapshot": {
+                    Path("tree.spm"): {
+                        "bytes": production_target.read_bytes(),
+                    }
+                },
+            }
+
+            graph = speedtree._validate_staged_speedtree_targets(
+                [target], [state]
+            )
+
+            self.assertEqual(
+                graph[transaction._path_key(production)],
+                set(),
+            )
+
+    def test_selected_update_rejects_changed_preexisting_missing_mesh(self):
+        """A selected transaction cannot rewrite legacy debt to a new miss."""
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            stage = root / "stage"
+            production = root / "production"
+            stage.mkdir()
+            production.mkdir()
+            production_target = production / "tree.spm"
+            self._spm_with_external_mesh(
+                production_target,
+                "meshes/old_missing.fbx",
+            )
+            target = stage / "tree.spm"
+            target.write_bytes(production_target.read_bytes())
+            staged_root = speedtree.read_spm_xml(target)
+            staged_root.find("./Assets/Mesh/Filename").text = (
+                "meshes/new_missing.fbx"
+            )
+            speedtree.write_spm_xml(target, staged_root)
+            state = {
+                "stage_root": stage,
+                "production_root": production,
+                "snapshot": {
+                    Path("tree.spm"): {
+                        "bytes": production_target.read_bytes(),
+                    }
+                },
+            }
+
+            with self.assertRaisesRegex(RuntimeError, "Filename is absent"):
+                speedtree._validate_staged_speedtree_targets(
+                    [target], [state]
+                )
+
+    def test_selected_update_rejects_new_user_of_preexisting_missing_mesh(self):
+        """Unchanged Filename alone cannot hide newly activated bad data."""
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            stage = root / "stage"
+            production = root / "production"
+            stage.mkdir()
+            production.mkdir()
+            production_target = production / "tree.spm"
+            self._spm_with_external_mesh(
+                production_target,
+                "meshes/old_missing.fbx",
+            )
+            target = stage / "tree.spm"
+            target.write_bytes(production_target.read_bytes())
+            staged_root = speedtree.read_spm_xml(target)
+            extra = speedtree.ET.SubElement(
+                staged_root.find("Assets"),
+                "Material_v8",
+                {"ID": "3", "Name": "M_new_user"},
+            )
+            speedtree.ET.SubElement(extra, "CutoutMeshID").text = "1"
+            speedtree.write_spm_xml(target, staged_root)
+            state = {
+                "stage_root": stage,
+                "production_root": production,
+                "snapshot": {
+                    Path("tree.spm"): {
+                        "bytes": production_target.read_bytes(),
+                    }
+                },
+            }
+
+            with self.assertRaisesRegex(RuntimeError, "Filename is absent"):
+                speedtree._validate_staged_speedtree_targets(
+                    [target], [state]
+                )
+
     def test_production_only_external_mesh_resolves_from_the_owner_folder(self):
         """A reference the stage never receives still lives in production.
 

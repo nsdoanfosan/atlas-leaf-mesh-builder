@@ -1599,6 +1599,177 @@ class GeneratorConnectionTests(unittest.TestCase):
         ]
         self.assertEqual(len(fallback_bindings), 2)
 
+    def test_previous_fallback_bindings_retarget_to_fresh_first_output(self):
+        target = Path(self.temp_dir.name) / "partial_output_refresh.spm"
+        root = ET.Element("SpeedTreeModel")
+        assets = ET.SubElement(root, "Assets")
+        add_material(assets, 4, "M_branch", [1, 2, 3])
+        add_material(assets, 8, "M_branch_generated", [10, 20])
+        for mesh_id in (1, 2, 3, 10, 20):
+            add_mesh(assets, mesh_id)
+        add_variant_generator(
+            root,
+            "Frond",
+            "Frond 36",
+            [(8, 10), (8, 10), (8, 10)],
+        )
+        write_spm(target, root)
+        previous = speedtree.connect_atlas_generators_in_spm(
+            target,
+            ["M_branch"],
+            [{
+                "material": "M_branch_generated",
+                "material_id": 8,
+                "mesh_ids": [10],
+                "meshes": [{
+                    "source_object": "branch_elm_01_01",
+                    "source_ordinal": 1,
+                }],
+            }],
+            [4],
+            previous_bindings=[
+                {
+                    "generator_index": 0,
+                    "generator_name": "Frond 36",
+                    "generator_guid": speedtree.generator_guid(
+                        next(root.iter("Generator"))
+                    ),
+                    "generator_type": "Frond",
+                    "slot_prefix": f"Material:Frond:{index}",
+                    "source_material_id": 4,
+                    "source_material_name": "M_branch",
+                    "source_mesh_id": source_mesh_id,
+                    "sentinel_policy": (
+                        None
+                        if index == 0
+                        else "source_ordinal_without_output_to_first_generated"
+                    ),
+                    "target_material_id": 8,
+                    "target_mesh_id": 10,
+                    "leaf_ordinal": 1,
+                    "created_slot": False,
+                }
+                for index, source_mesh_id in enumerate((1, 2, 3))
+            ],
+            source_mesh_ids_by_name={"M_branch": [1, 2, 3]},
+            generator_variant_policy="ensure_all_material_cutouts",
+        )
+        refreshed_groups = [{
+            "material": "M_branch_generated",
+            "material_id": 8,
+            "mesh_ids": [20],
+            "meshes": [{
+                "source_object": "branch_elm_01_01",
+                "source_ordinal": 1,
+            }],
+        }]
+
+        refreshed = speedtree.connect_atlas_generators_in_spm(
+            target,
+            ["M_branch"],
+            refreshed_groups,
+            [4],
+            previous_bindings=previous["bindings"],
+            source_mesh_ids_by_name={"M_branch": [1, 2, 3]},
+            generator_variant_policy="ensure_all_material_cutouts",
+        )
+
+        self.assertEqual(
+            generator_values(target),
+            {
+                ("Frond 36", "Material:Frond:0"): (8, 20),
+                ("Frond 36", "Material:Frond:1"): (8, 20),
+                ("Frond 36", "Material:Frond:2"): (8, 20),
+            },
+        )
+        self.assertEqual(
+            [
+                binding["source_mesh_id"]
+                for binding in refreshed["bindings"]
+            ],
+            [1, 2, 3],
+        )
+        self.assertEqual(
+            [
+                binding.get("sentinel_policy")
+                for binding in refreshed["bindings"]
+            ],
+            [
+                None,
+                "source_ordinal_without_output_to_first_generated",
+                "source_ordinal_without_output_to_first_generated",
+            ],
+        )
+
+    def test_previous_fallback_binding_upgrades_when_output_now_exists(self):
+        target = Path(self.temp_dir.name) / "expanded_output_refresh.spm"
+        root = ET.Element("SpeedTreeModel")
+        assets = ET.SubElement(root, "Assets")
+        add_material(assets, 4, "M_branch", [1, 2])
+        add_material(assets, 8, "M_branch_generated", [10, 20, 21])
+        for mesh_id in (1, 2, 10, 20, 21):
+            add_mesh(assets, mesh_id)
+        generator = add_variant_generator(
+            root,
+            "Frond",
+            "Frond 36",
+            [(8, 10)],
+        )
+        write_spm(target, root)
+        previous = [{
+            "generator_index": 0,
+            "generator_name": "Frond 36",
+            "generator_guid": speedtree.generator_guid(generator),
+            "generator_type": "Frond",
+            "slot_prefix": "Material:Frond:0",
+            "source_material_id": 4,
+            "source_material_name": "M_branch",
+            "source_mesh_id": 2,
+            "sentinel_policy": (
+                "source_ordinal_without_output_to_first_generated"
+            ),
+            "target_material_id": 8,
+            "target_mesh_id": 10,
+            "leaf_ordinal": 1,
+            "created_slot": False,
+        }]
+
+        refreshed = speedtree.connect_atlas_generators_in_spm(
+            target,
+            ["M_branch"],
+            [{
+                "material": "M_branch_generated",
+                "material_id": 8,
+                "mesh_ids": [20, 21],
+                "meshes": [
+                    {
+                        "source_object": f"branch_elm_01_{ordinal:02d}",
+                        "source_ordinal": ordinal,
+                    }
+                    for ordinal in (1, 2)
+                ],
+            }],
+            [4],
+            previous_bindings=previous,
+            source_mesh_ids_by_name={"M_branch": [1, 2]},
+            generator_variant_policy="ensure_all_material_cutouts",
+        )
+
+        self.assertEqual(
+            generator_values(target),
+            {
+                ("Frond 36", "Material:Frond:0"): (8, 21),
+                ("Frond 36", "Material:Frond:1"): (8, 20),
+            },
+        )
+        upgraded = next(
+            binding
+            for binding in refreshed["bindings"]
+            if binding["slot_prefix"] == "Material:Frond:0"
+        )
+        self.assertEqual(upgraded["leaf_ordinal"], 2)
+        self.assertIsNone(upgraded["sentinel_policy"])
+
     def test_leaf_mesh_extra_source_ordinals_rebind_to_generated_output(self):
         target = Path(self.temp_dir.name) / "leaf_partial_outputs.spm"
         root = ET.Element("SpeedTreeModel")

@@ -3144,16 +3144,34 @@ def previous_generated_binding_retarget(
             f"{source_mesh_id} is not in source material "
             f"'{source['name']}' cutout mesh list {source['mesh_ids']}."
         )
+    sentinel_policy = previous.get("sentinel_policy")
     ordinal = positive_int(previous.get("leaf_ordinal")) or source_ordinal
     if source_mesh_id != -10 and ordinal != source_ordinal:
-        raise RuntimeError(
-            "Previous Atlas Generator binding source ordinal disagrees with "
-            f"source material '{source['name']}': {ordinal} vs "
-            f"{source_ordinal}."
-        )
+        if (
+            sentinel_policy
+            != "source_ordinal_without_output_to_first_generated"
+        ):
+            raise RuntimeError(
+                "Previous Atlas Generator binding source ordinal disagrees with "
+                f"source material '{source['name']}': {ordinal} vs "
+                f"{source_ordinal}."
+            )
+        first_output_ordinal = min(output_bindings)
+        if ordinal != first_output_ordinal:
+            raise RuntimeError(
+                "Previous Atlas Generator fallback binding does not point to "
+                f"the first generated output: {ordinal} vs "
+                f"{first_output_ordinal}."
+            )
+        if source_ordinal in output_bindings:
+            # The previous run deliberately folded a source cutout without a
+            # matching output onto the first generated variant.  If that
+            # output exists now, prefer the current exact source identity and
+            # retire the fallback marker instead of preserving stale routing.
+            ordinal = source_ordinal
+            sentinel_policy = None
 
     target = output_bindings.get(ordinal)
-    sentinel_policy = previous.get("sentinel_policy")
     if target is None:
         if (
             generator_variant_policy
@@ -9968,6 +9986,100 @@ def _external_mesh_filenames(mesh):
     return [filename for filename in filenames if filename]
 
 
+def _external_mesh_reference_fingerprint(root, mesh_id):
+    """Seal one external Mesh and every live reference to its ID."""
+    assets = root.find("Assets")
+    if assets is None:
+        return None
+    meshes = [
+        mesh
+        for mesh in assets.findall("Mesh")
+        if positive_int(mesh.attrib.get("ID")) == mesh_id
+    ]
+    if len(meshes) != 1:
+        return None
+    material_users = sorted(
+        spm_node_semantic_sha256(material)
+        for material in assets.findall("Material_v8")
+        if mesh_id in spm_material_mesh_ids(material)
+    )
+    generator_users = sorted(
+        (
+            pair["generator_guid"],
+            pair["slot_prefix"],
+            positive_int(pair["material_property"].findtext("Value")),
+            integer_value(pair["mesh_property"].findtext("Value")),
+        )
+        for pair in spm_generator_property_pairs(
+            root, {"Leaf Mesh", "Frond"}
+        )
+        if (
+            pair.get("mesh_property") is not None
+            and integer_value(pair["mesh_property"].findtext("Value"))
+            == mesh_id
+        )
+    )
+    return (
+        spm_node_semantic_sha256(meshes[0]),
+        tuple(material_users),
+        tuple(generator_users),
+    )
+
+
+def _unchanged_preexisting_missing_managed_mesh(
+    spm_path,
+    state,
+    staged_root,
+    mesh,
+    filename,
+):
+    """Prove a missing managed FBX is unrelated pre-transaction debt.
+
+    A selected SPM can carry several independent Atlas providers. Updating one
+    provider must not be blocked by another provider's already-missing output,
+    but only when the complete Mesh/Material/Generator reference fingerprint
+    is byte-sealed by the transaction preimage and remains semantically exact.
+    """
+    candidate = Path(filename)
+    if candidate.is_absolute():
+        return False
+    stage_root = Path(state.get("stage_root") or ".").absolute()
+    production_root = Path(
+        state.get("production_root") or "."
+    ).absolute()
+    production_candidate = (production_root / candidate).absolute()
+    try:
+        managed_relative = production_candidate.relative_to(production_root)
+        spm_relative = Path(spm_path).absolute().relative_to(stage_root)
+    except ValueError:
+        return False
+    if (
+        not managed_relative.parts
+        or managed_relative.parts[0].casefold() != "meshes"
+    ):
+        return False
+    snapshot = state.get("snapshot") or {}
+    if managed_relative in snapshot or str(managed_relative) in snapshot:
+        # The file existed when the transaction was sealed and therefore
+        # disappeared during this run; that is never legacy debt.
+        return False
+    preimage = snapshot.get(spm_relative) or snapshot.get(str(spm_relative))
+    if not isinstance(preimage, dict) or not isinstance(
+        preimage.get("bytes"), (bytes, bytearray)
+    ):
+        return False
+    try:
+        previous_root = ET.fromstring(gzip.decompress(preimage["bytes"]))
+    except (ET.ParseError, OSError, TypeError, ValueError):
+        return False
+    mesh_id = positive_int(mesh.attrib.get("ID"))
+    if mesh_id is None:
+        return False
+    return _external_mesh_reference_fingerprint(
+        previous_root, mesh_id
+    ) == _external_mesh_reference_fingerprint(staged_root, mesh_id)
+
+
 def _spm_receipt_mesh_claims(spm_path):
     """Return exact ID+asset claims from current and legacy receipts.
 
@@ -10224,6 +10336,14 @@ def _validate_staged_speedtree_targets(staged_targets, states):
                         # Selected targets remain strict so Atlas never
                         # commits a newly generated broken reference.
                         if not is_selected:
+                            continue
+                        if _unchanged_preexisting_missing_managed_mesh(
+                            spm_path,
+                            state,
+                            root,
+                            mesh,
+                            filename,
+                        ):
                             continue
                         raise RuntimeError(
                             "SpeedTree SPM validation failed: external Mesh "
