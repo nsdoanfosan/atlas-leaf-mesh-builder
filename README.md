@@ -86,6 +86,39 @@ Not implemented yet:
 
 ## Validation
 
+### Producer CI
+
+GitHub pull requests and pushes to `main` or `codex/**` run the complete producer
+suite on Windows with CPython 3.10.11. From a clean checkout, the exact local
+equivalent in Windows PowerShell is:
+
+```powershell
+.\scripts\run_ci.ps1 -InstallDependencies
+```
+
+The command installs the fully pinned CI dependency lock, runs every test with
+`pytest`, verifies focused contracts whenever the corresponding feature is
+present, compiles every Python file, runs `git diff --check`, and fails if any
+tracked, untracked, or ignored repository artifact remains. Python bytecode and
+pytest cache are disabled or redirected outside the repository. The workflow
+caches only pip dependencies; generated receipts, fixtures, and outputs are
+never cached and cannot grant authority.
+
+Expected complete-suite counts before the CI-only files are merged into each
+branch are:
+
+| Revision | Expected tests | Focus |
+| --- | ---: | --- |
+| `main` / this CI change | 122 | Baseline producer suite |
+| PR #5 | 131 | Multi-target atomicity, rollback, idempotence |
+| PR #6 | 139 | Deleted-mesh and collection tombstones |
+| PR #7 | 165 | Atomic updates plus 13 fleet refresh and rollback tests |
+| PR #9 | 131 + 3 subtests | Sealed Generator delivery-scope receipts |
+
+These tests use temporary directories and Python stubs only. They do not open
+production `D:` assets, Blender, or SpeedTree Modeler, and the CI command must
+never be replaced with a production fleet refresh.
+
 Validated with Blender 5.1.2:
 
 - add-on enables successfully,
