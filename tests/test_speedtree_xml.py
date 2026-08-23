@@ -83,6 +83,32 @@ delivery_scope = sys.modules[
 ]
 
 
+class ExportedFbxMeshPayloadTests(unittest.TestCase):
+    def test_rejects_empty_fbx_container(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "empty.fbx"
+            path.write_bytes(b"Kaydara FBX Binary  \x00\x1a\x00")
+            with self.assertRaisesRegex(RuntimeError, "contains no mesh geometry"):
+                speedtree.validate_exported_fbx_mesh_payload(path, "leaf_01")
+
+    def test_accepts_fbx_with_mesh_arrays(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "mesh.fbx"
+            path.write_bytes(
+                b"Kaydara FBX Binary  \x00\x1a\x00"
+                b"Geometry\x00Vertices\x00PolygonVertexIndex\x00"
+            )
+            result = speedtree.validate_exported_fbx_mesh_payload(
+                path,
+                "leaf_01",
+            )
+            self.assertEqual(result["size"], path.stat().st_size)
+            self.assertEqual(
+                result["markers"],
+                ["Geometry", "Vertices", "PolygonVertexIndex"],
+            )
+
+
 class _FakePlan(dict):
     name = "Plan_Leaf_01"
 

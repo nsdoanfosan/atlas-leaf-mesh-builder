@@ -7583,6 +7583,35 @@ def cleanup_stale_mesh_exports(export_dir, exported_meshes):
     return []
 
 
+def validate_exported_fbx_mesh_payload(path, source_name):
+    """Reject an FBX container that was written without actual mesh arrays.
+
+    Blender can report a successful selected-object export even when the
+    selected object is not visible to the operator's current view layer.  The
+    resulting binary FBX is a small, structurally valid container with no
+    Geometry/Vertices/PolygonVertexIndex records.  Such a file must never be
+    published into an SPM manifest as a usable external mesh.
+    """
+    path = Path(path)
+    if not path.is_file():
+        raise RuntimeError(
+            f"Atlas FBX export did not create a file for {source_name}: {path}"
+        )
+    payload = path.read_bytes()
+    required = (b"Geometry", b"Vertices", b"PolygonVertexIndex")
+    missing = [marker.decode("ascii") for marker in required if marker not in payload]
+    if missing:
+        raise RuntimeError(
+            "Atlas FBX export contains no mesh geometry for "
+            f"{source_name}: missing {', '.join(missing)} in {path}"
+        )
+    return {
+        "path": str(path),
+        "size": len(payload),
+        "markers": [marker.decode("ascii") for marker in required],
+    }
+
+
 def material_suffix_from_collection_name(collection_name):
     text = collection_name.strip().lower()
     text = re.sub(r"[^a-z0-9]+", "_", text)
@@ -8562,6 +8591,12 @@ def export_speedtree_assets(
                     anchor_records = collect_source_anchors(source, props, mesh_geometry_scale)
                 evaluated = source.evaluated_get(depsgraph)
                 mesh = bpy.data.meshes.new_from_object(evaluated, depsgraph=depsgraph)
+                if not mesh.vertices or not mesh.polygons:
+                    bpy.data.meshes.remove(mesh)
+                    raise RuntimeError(
+                        "Atlas source evaluated to empty mesh geometry: "
+                        f"{source.name}"
+                    )
                 mesh.materials.clear()
                 mesh.materials.append(material)
                 for poly in mesh.polygons:
@@ -8586,7 +8621,13 @@ def export_speedtree_assets(
                         obj.select_set(False)
                     temp_obj.select_set(True)
                     bpy.context.view_layer.objects.active = temp_obj
-                    bpy.ops.export_scene.fbx(
+                    bpy.context.view_layer.update()
+                    if temp_obj not in bpy.context.selected_objects:
+                        raise RuntimeError(
+                            "Atlas temporary mesh is not selected in the active "
+                            f"view layer: {source.name}"
+                        )
+                    export_result = bpy.ops.export_scene.fbx(
                         filepath=str(assembly_plan_fbx),
                         use_selection=True,
                         object_types={"MESH"},
@@ -8595,6 +8636,15 @@ def export_speedtree_assets(
                         add_leaf_bones=False,
                         path_mode="RELATIVE",
                         embed_textures=False,
+                    )
+                    if "FINISHED" not in export_result:
+                        raise RuntimeError(
+                            "Blender did not finish Atlas assembly-plan FBX export: "
+                            f"{source.name}"
+                        )
+                    validate_exported_fbx_mesh_payload(
+                        assembly_plan_fbx,
+                        source.name,
                     )
                     for vertex in mesh.vertices:
                         vertex.co *= mesh_geometry_scale
@@ -8616,8 +8666,14 @@ def export_speedtree_assets(
                 for temp_anchor in temp_anchor_objects:
                     temp_anchor.select_set(True)
                 bpy.context.view_layer.objects.active = temp_obj
+                bpy.context.view_layer.update()
+                if temp_obj not in bpy.context.selected_objects:
+                    raise RuntimeError(
+                        "Atlas temporary mesh is not selected in the active "
+                        f"view layer: {source.name}"
+                    )
 
-                bpy.ops.export_scene.fbx(
+                export_result = bpy.ops.export_scene.fbx(
                     filepath=str(fbx_path),
                     use_selection=True,
                     object_types={"MESH", "EMPTY"} if anchor_export_mode == "FBX_EMPTY" else {"MESH"},
@@ -8627,6 +8683,12 @@ def export_speedtree_assets(
                     path_mode="RELATIVE",
                     embed_textures=False,
                 )
+                if "FINISHED" not in export_result:
+                    raise RuntimeError(
+                        "Blender did not finish Atlas production FBX export: "
+                        f"{source.name}"
+                    )
+                validate_exported_fbx_mesh_payload(fbx_path, source.name)
                 xml_path = None
                 asset_path = fbx_path
                 if anchor_export_mode == "XML" and anchor_records:
