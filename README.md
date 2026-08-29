@@ -23,10 +23,10 @@ The add-on package lives at:
 addons/atlas_leaf_mesh_builder
 ```
 
-On this machine it is installed into Blender 5.1 by junction:
+On this machine it is installed into Blender 5.2 by junction:
 
 ```text
-C:/Users/PARK/AppData/Roaming/Blender Foundation/Blender/5.1/scripts/addons/atlas_leaf_mesh_builder
+C:/Users/PARK/AppData/Roaming/Blender Foundation/Blender/5.2/scripts/addons/atlas_leaf_mesh_builder
 ```
 
 Blender UI:
@@ -96,6 +96,9 @@ Validated with Blender 5.1.2:
 - generated shell meshes use simple side quads, material-boundary sharp edges, shell-side angle sharp edges, and weighted normals,
 - Chestnut atlas `leaf_04_front_04_single_plate` projected from `leaf_13_front_13_single_plate` creates 270 vertices and 437 faces while preserving both source meshes; the duplicated surfaces contain 169 matching faces each plus 99 side faces,
 - SpeedTree build/update operator creates or updates one target `.spm`, exports the collection's live FBX variants, references the original texture files without creating copies, and records material/mesh IDs plus Generator ownership/provenance contracts in the manifest.
+
+Blender 5.2.0 LTS factory registration was also validated with
+`addon_utils.enable(..., default_set=False)`; user preferences were not saved.
 
 ## SpeedTree Generator receipt contracts
 

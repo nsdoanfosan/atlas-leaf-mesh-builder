@@ -47,7 +47,7 @@ python tools/atlas_fleet_refresh.py plan `
 python tools/atlas_fleet_refresh.py apply `
   --plan 'C:\Users\PARK\Documents\CodexBackups\atlas-refresh\staging-plan.json' `
   --backup-root 'C:\Users\PARK\Documents\CodexBackups\atlas-refresh\backup-20260801' `
-  --blender 'C:\Program Files\Blender Foundation\Blender 5.1\blender.exe' `
+  --blender 'C:\Program Files\Blender Foundation\Blender 5.2\blender.exe' `
   --addon-root 'C:\Users\PARK\Documents\CodexWorktrees\atlas-leaf-issue-4-fleet-refresh'
 ```
 
