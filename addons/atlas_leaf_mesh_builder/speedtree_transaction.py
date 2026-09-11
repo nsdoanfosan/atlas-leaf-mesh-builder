@@ -563,6 +563,67 @@ def _commit_states(states, referenced_files):
         raise
 
 
+def _retain_referenced_mesh_files(states, referenced_files):
+    """Keep snapshot files still needed by the validated final SPM graph.
+
+    Export cleanup runs before SPM routing is finalized. A removed Blender
+    object can still have an authored/hidden Generator reference, or another
+    SPM can share its file. Restore that file in the stage rather than letting
+    the commit guard abort an otherwise valid update. The guard remains strict.
+    """
+    for state in states:
+        references = referenced_files.get(_path_key(state["production_root"]), set())
+        retained = {}
+        for relative, entry in state["snapshot"].items():
+            if not relative.parts or relative.parts[0].casefold() != "meshes":
+                continue
+            staged = state["stage_root"] / relative
+            production = state["production_root"] / relative
+            if staged.exists() or _path_key(production) not in references:
+                continue
+            staged.parent.mkdir(parents=True, exist_ok=True)
+            staged.write_bytes(entry["bytes"])
+            if _sha256_bytes(staged.read_bytes()) != entry["sha256"]:
+                raise RuntimeError(f"Retained mesh snapshot hash mismatch: {production}")
+            retained[_path_key(production)] = str(production)
+        if not retained:
+            continue
+
+        # Both SPM asset cleanup and export cleanup can propose file deletions.
+        # Reconcile their receipts against the same final graph as the files.
+        for relative in _managed_relpaths(state["stage_root"], state["target_names"]):
+            if relative.suffix.casefold() != ".json" or relative.parts[0] == "meshes":
+                continue
+            staged = state["stage_root"] / relative
+            payload = staged.read_bytes()
+            before = state["snapshot"].get(relative)
+            if before is not None and _sha256_bytes(payload) == before["sha256"]:
+                continue
+            manifest = json.loads(payload)
+            if not isinstance(manifest, dict):
+                continue
+            preserved = set()
+
+            def reconcile(value):
+                if isinstance(value, dict):
+                    for key, item in value.items():
+                        if key in {"removed_stale_mesh_exports", "removed_mesh_files"} and isinstance(item, list):
+                            kept = [path for path in item if _path_key(path) in retained]
+                            preserved.update(kept)
+                            value[key] = [path for path in item if _path_key(path) not in retained]
+                        else:
+                            reconcile(item)
+                elif isinstance(value, list):
+                    for item in value:
+                        reconcile(item)
+
+            reconcile(manifest)
+            if not preserved:
+                continue
+            manifest["retained_referenced_mesh_exports"] = sorted(preserved)
+            staged.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
 def execute_atomic_target_update(
     targets,
     build_target,
@@ -640,6 +701,7 @@ def execute_atomic_target_update(
         for state in states:
             _rewrite_staged_manifests(state)
         referenced_files = validate_staged(staged_targets, states)
+        _retain_referenced_mesh_files(states, referenced_files or {})
         _commit_states(states, referenced_files or {})
         mapped_results = _map_result_paths(staged_results, states)
     if transaction_root is not None and transaction_root.exists():

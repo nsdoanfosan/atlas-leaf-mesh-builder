@@ -2197,6 +2197,12 @@ class ATLASLEAF_OT_build_speedtree_spm(Operator):
         removed_meshes = sum(len(result.get("cleanup", {}).get("removed_mesh_ids", [])) for result in results)
         summary = ", ".join(f"{result['action']} {Path(result['spm_path']).name}" for result in results)
         cleanup_summary = f"; cleaned {removed_materials} materials/{removed_meshes} meshes" if removed_materials or removed_meshes else ""
+        retained = {
+            path for result in results
+            for path in result.get("retained_referenced_mesh_exports", [])
+        }
+        if retained:
+            cleanup_summary += f"; retained {len(retained)} files still referenced by SPM nodes"
         self.report({"INFO"}, f"Updated {len(results)} SpeedTree SPMs ({total_meshes} mesh refs{cleanup_summary}): {summary}")
         return {"FINISHED"}
 

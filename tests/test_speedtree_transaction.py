@@ -275,7 +275,7 @@ class AtomicTargetTransactionTests(unittest.TestCase):
                 ]
             )
 
-    def test_shared_file_delete_is_rejected_when_graph_still_references_it(self):
+    def test_shared_file_delete_is_retained_without_blocking_target_update(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             write_managed_fixture(root)
@@ -283,18 +283,84 @@ class AtomicTargetTransactionTests(unittest.TestCase):
             before = inventory(root)
 
             def build(staged, production):
+                staged.write_bytes(b"updated target")
                 (staged.parent / "meshes" / "shared.fbx").unlink()
+                (staged.parent / "speedtree_import_manifest.json").write_text(
+                    json.dumps({"removed_stale_mesh_exports": [str(staged.parent / "meshes" / "shared.fbx")]}),
+                    encoding="utf-8",
+                )
                 return staged
 
             root_key = transaction._path_key(root)
             shared_key = transaction._path_key(root / "meshes" / "shared.fbx")
-            with self.assertRaisesRegex(RuntimeError, "still referenced"):
-                transaction.execute_atomic_target_update(
-                    [target],
-                    build,
-                    lambda staged, states: {root_key: {shared_key}},
-                )
+            transaction.execute_atomic_target_update(
+                [target], build,
+                lambda staged, states: {root_key: {shared_key}},
+            )
 
+            self.assertEqual(target.read_bytes(), b"updated target")
+            self.assertEqual((root / "meshes" / "shared.fbx").read_bytes(), b"shared-v1")
+            receipt = json.loads((root / "speedtree_import_manifest.json").read_text())
+            self.assertEqual(receipt["removed_stale_mesh_exports"], [])
+            self.assertEqual(receipt["retained_referenced_mesh_exports"], [str(root / "meshes" / "shared.fbx")])
+
+    def test_retaining_referenced_mesh_does_not_keep_unreferenced_exports(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            write_managed_fixture(root)
+            target = root / "tree_01.spm"
+            unused = root / "meshes" / "unused.fbx"
+            unused.write_bytes(b"unused")
+            def build(staged, production):
+                staged.write_bytes(b"updated")
+                (staged.parent / "meshes" / "shared.fbx").unlink()
+                (staged.parent / "meshes" / "unused.fbx").unlink()
+                return staged
+            graph = {transaction._path_key(root): {transaction._path_key(root / "meshes" / "shared.fbx")}}
+            transaction.execute_atomic_target_update([target], build, lambda *_: graph)
+            self.assertEqual((root / "meshes" / "shared.fbx").read_bytes(), b"shared-v1")
+            self.assertFalse(unused.exists())
+
+    def test_spm_cleanup_receipt_reports_only_committed_deletions(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            write_managed_fixture(root)
+            unused = root / "meshes" / "unused.fbx"
+            unused.write_bytes(b"unused")
+
+            def build(staged, production):
+                paths = [staged.parent / "meshes" / name for name in ("shared.fbx", "unused.fbx")]
+                for path in paths:
+                    path.unlink()
+                (staged.parent / "speedtree_import_manifest.json").write_text(json.dumps({
+                    "removed_stale_mesh_exports": [],
+                    "removed_stale_spm_assets": {"removed_mesh_ids": [25], "removed_mesh_files": list(map(str, paths))},
+                    "superseded_scope_cleanup": {"removed_mesh_files": [str(paths[0])]},
+                }), encoding="utf-8")
+                return staged
+
+            shared = str(root / "meshes" / "shared.fbx")
+            graph = {transaction._path_key(root): {transaction._path_key(shared)}}
+            transaction.execute_atomic_target_update([root / "tree_01.spm"], build, lambda *_: graph)
+            receipt = json.loads((root / "speedtree_import_manifest.json").read_text())
+            self.assertEqual(receipt["removed_stale_spm_assets"]["removed_mesh_files"], [str(unused)])
+            self.assertEqual(receipt["removed_stale_spm_assets"]["removed_mesh_ids"], [25])
+            self.assertEqual(receipt["superseded_scope_cleanup"]["removed_mesh_files"], [])
+            self.assertEqual(receipt["retained_referenced_mesh_exports"], [shared])
+
+    def test_commit_guard_still_rejects_unreconciled_reference_deletion(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            write_managed_fixture(root)
+            before = inventory(root)
+            def build(staged, production):
+                staged.write_bytes(b"updated")
+                (staged.parent / "meshes" / "shared.fbx").unlink()
+                return staged
+            graph = {transaction._path_key(root): {transaction._path_key(root / "meshes" / "shared.fbx")}}
+            with mock.patch.object(transaction, "_retain_referenced_mesh_files"):
+                with self.assertRaisesRegex(RuntimeError, "still referenced"):
+                    transaction.execute_atomic_target_update([root / "tree_01.spm"], build, lambda *_: graph)
             self.assertEqual(inventory(root), before)
 
     def test_mid_commit_failure_restores_all_targets_and_shared_outputs(self):

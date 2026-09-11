@@ -10557,7 +10557,10 @@ def export_or_update_speedtree_spm_targets(
                 "material_id": material_id,
                 "mesh_ids": mesh_ids,
                 "material_groups": material_groups,
-                "cleanup": cleanup,
+                "cleanup": manifest.get("removed_stale_spm_assets", cleanup),
+                "retained_referenced_mesh_exports": manifest.get(
+                    "retained_referenced_mesh_exports", []
+                ),
                 "generator_connection": manifest.get("generator_connection", {}),
             }
         )
