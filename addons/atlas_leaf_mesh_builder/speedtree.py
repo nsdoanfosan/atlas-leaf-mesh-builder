@@ -54,6 +54,7 @@ from .texture_paths import (
     canonical_texture_base_for_material,
     expected_canonical_role_paths,
     resolve_production_texture_contract,
+    validate_source_texture_fallback,
 )
 
 
@@ -4771,11 +4772,35 @@ def finalize_source_material_adoption(
             f"conflicts {reused_source_ids}."
         )
 
+    root = read_spm_xml(spm_path)
+    assets = root.find("Assets")
+    material = next(
+        (
+            node
+            for node in assets.findall("Material_v8")
+            if positive_int(node.attrib.get("ID")) == positive_int(adoption.get("material_id"))
+            and node.attrib.get("Name") == adoption.get("material_name")
+        ),
+        None,
+    )
+    if material is None or spm_material_mesh_ids(material) != generated_mesh_ids:
+        raise RuntimeError("Adopted source material does not own the expected generated plan meshes.")
+
     generated_set = set(generated_mesh_ids)
     generated_by_ordinal = {}
     for binding in (generator_connection or {}).get("bindings") or []:
         ordinal = positive_int(binding.get("leaf_ordinal"))
         target_mesh_id = positive_int(binding.get("target_mesh_id"))
+        if (
+            integer_value(binding.get("target_mesh_id")) == MATERIAL_DEFAULT_MESH_ID
+            and positive_int(binding.get("target_material_id"))
+            == positive_int(adoption.get("material_id"))
+            and ordinal == 1
+        ):
+            # -10 uses the assigned Material's primary CutoutMeshID. Keep the
+            # authored sentinel in the Generator and count its effective mesh
+            # only after validating this exact Material's generated registry.
+            target_mesh_id = generated_mesh_ids[0]
         if ordinal is None or target_mesh_id not in generated_set:
             continue
         previous = generated_by_ordinal.get(ordinal)
@@ -4800,19 +4825,6 @@ def finalize_source_material_adoption(
     replaced_original_mesh_ids = list(original_mesh_ids)
     preserved_original_mesh_ids = []
 
-    root = read_spm_xml(spm_path)
-    assets = root.find("Assets")
-    material = next(
-        (
-            node
-            for node in assets.findall("Material_v8")
-            if positive_int(node.attrib.get("ID")) == positive_int(adoption.get("material_id"))
-            and node.attrib.get("Name") == adoption.get("material_name")
-        ),
-        None,
-    )
-    if material is None or spm_material_mesh_ids(material) != generated_mesh_ids:
-        raise RuntimeError("Adopted source material does not own the expected generated plan meshes.")
     update_spm_material_mesh_ids(material, final_material_mesh_ids)
     write_spm_xml(spm_path, root)
 
@@ -8072,6 +8084,48 @@ def blender_cluster_bake_origin_receipt(
     }
 
 
+def resolve_group_production_texture_contract(
+    target_spm, group, material_id, source_paths, normalization_receipt,
+    *, blend_file=None, manifest_path=None,
+):
+    """Keep a physical capture paired with the geometry/UVs it produced.
+
+    An older PCG mapping for the same material ID does not prove that its
+    images represent this capture. Ordinary Atlas exports still use PCG first.
+    """
+    material_name = group["material"]
+    if (normalization_receipt or {}).get("workflow_mode") == "PHYSICAL_DIRECT_CAPTURE":
+        paths = validate_source_texture_fallback(source_paths, material_name)
+        origin = blender_cluster_bake_origin_receipt(
+            paths, group, normalization_receipt, blend_file=blend_file,
+        )
+        if origin is None:
+            raise RuntimeError(
+                f"Physical Cluster capture origin is not proven: {material_name}"
+            )
+        captures = {
+            _texture_path_key(row["path"]): row
+            for row in origin["capture_maps"]
+        }
+        for path in paths.values():
+            expected = captures[_texture_path_key(path)].get("sha256")
+            actual = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+            if not expected or actual != expected:
+                raise RuntimeError(
+                    f"Physical Cluster capture texture is stale: {path}"
+                )
+        return {
+            "texture_contract_status": BLENDER_CLUSTER_BAKE_TEXTURE_STATUS,
+            "material": material_name,
+            "source_paths": paths,
+            "origin_receipt": origin,
+        }
+    return resolve_production_texture_contract(
+        target_spm, material_name, material_id,
+        source_paths=source_paths, manifest_path=manifest_path,
+    )
+
+
 def target_material_id_hint(
     target_spm,
     material_name,
@@ -8380,11 +8434,13 @@ def export_speedtree_assets(
             source_material_names,
             source_material_ids,
         )
-        contract = resolve_production_texture_contract(
+        contract = resolve_group_production_texture_contract(
             texture_contract_target_spm,
-            material_name,
+            group,
             material_id,
-            source_paths=source_texture_exports,
+            source_texture_exports,
+            normalization_receipt,
+            blend_file=bpy.data.filepath,
             manifest_path=canonical_texture_manifest_path,
         )
         texture_status = contract["texture_contract_status"]
@@ -8400,7 +8456,7 @@ def export_speedtree_assets(
             production_texture_maps[material_name] = contract["files"]
         else:
             fallback_paths = contract["source_paths"]
-            origin_receipt = blender_cluster_bake_origin_receipt(
+            origin_receipt = contract.get("origin_receipt") or blender_cluster_bake_origin_receipt(
                 fallback_paths,
                 group,
                 normalization_receipt,
