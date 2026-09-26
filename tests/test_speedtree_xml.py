@@ -67,6 +67,9 @@ def load_speedtree_module():
     texture_paths.resolve_production_texture_contract = (
         lambda *args, **kwargs: {}
     )
+    texture_paths.validate_source_texture_fallback = (
+        lambda paths, material: paths
+    )
     sys.modules[texture_paths.__name__] = texture_paths
 
     name = f"{package_name}.speedtree"
