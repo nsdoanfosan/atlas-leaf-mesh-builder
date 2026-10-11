@@ -3047,6 +3047,20 @@ def retire_deleted_generator_bindings(
             )
             if current_pair in active_pairs:
                 continue
+            # A fresh explicit adoption can use the currently connected
+            # managed cutout as its source baseline even when an older
+            # receipt has no Generator bindings. It is still a real source
+            # pair; coverage below must retarget it to the refreshed output.
+            # Only retire unrecorded legacy pairs outside that exact baseline.
+            current_source = source_records.get(current_pair[0])
+            if current_source is not None and any(
+                positive_int(output.get("target_material_id")) == current_pair[0]
+                for output in (output_bindings or {}).values()
+            ) and (
+                current_pair[1] == MATERIAL_DEFAULT_MESH_ID
+                or current_pair[1] in current_source.get("mesh_ids", [])
+            ):
+                continue
             if (
                 current_pair[0] not in owned_material_ids
                 or current_pair[1] not in owned_mesh_ids
@@ -3891,7 +3905,10 @@ def connect_atlas_generators_in_spm(
                 raise RuntimeError(
                     "Generator variant coverage found no supported Frond or "
                     "Leaf Mesh multi-property parent referencing the source "
-                    "material or generated atlas."
+                    f"material or generated atlas. target={spm_path}; "
+                    f"source_material_id={source_material_id}; "
+                    f"source_name={source['name']}; "
+                    f"retired_slots={sorted(retired_slot_keys)!r}"
                 )
             candidates = []
             for group in generator_groups.values():
@@ -7845,6 +7862,92 @@ def _checked_normalized_bounds(value, label):
     return result
 
 
+def _validated_normalized_bend_receipt_fields(report, raw_prototypes, prototypes):
+    """Keep explicit bend intent separate from the existing capture roles."""
+    if "part_bend_role" not in report:
+        if any(row.get("part_bend_payload") is not None for row in raw_prototypes):
+            raise RuntimeError("Normalized bend payload has no explicit source role.")
+        return {}
+    role = report["part_bend_role"]
+    role_codes = {"leaf": 1, "leaf_side": 2, "cluster": 1}
+    if (type(report.get("schema_version")) is not int or report["schema_version"] != 2
+            or role is not None and (not isinstance(role, str) or role not in role_codes)):
+        raise RuntimeError("Normalized bend source schema or role is invalid.")
+    if (report.get("geometry_committed") is not True
+            or report.get("source_preserved") is not True
+            or type(report.get("prototype_count")) is not int
+            or report["prototype_count"] != len(prototypes)
+            or not isinstance(report.get("source_3d_contract"), dict)
+            or not report["source_3d_contract"]
+            or re.fullmatch(r"[0-9a-f]{64}", str(report.get("physical_capture_contract_sha256") or "")) is None):
+        raise RuntimeError("Normalized bend source receipt is not committed and complete.")
+    expected = {
+        "schema_version": 2,
+        "role": role,
+        "role_code": role_codes.get(role),
+        "uv_name": "nanite_part_bend",
+        "uv_index": 3,
+        "blender_encoding": "U=8+clamp(Y/maxY,0,1)*sqrt(max(1,bboxY/max(bboxX,bboxZ)));V=1-role_code",
+        "unreal_encoding": "U=8+mask*aspect_correction;V=role_code",
+        "aspect_policy": "normalized_bbox_y_over_max_xz/sqrt_gain/v2",
+        "reference_weight_exponent": 2.0,
+        "growth_axis_blender": "+Y",
+        "growth_axis_unreal": "-Y",
+        "anchor_local": [0.0, 0.0, 0.0],
+    }
+    for raw, prototype in zip(raw_prototypes, prototypes):
+        if "part_bend_payload" not in raw:
+            raise RuntimeError("Normalized bend prototype is missing its payload marker.")
+        payload = raw["part_bend_payload"]
+        if role is None:
+            if payload is not None:
+                raise RuntimeError("Disabled normalized bend source contains an active payload.")
+        else:
+            if (not isinstance(payload, dict)
+                    or any(payload.get(key) != value for key, value in expected.items())
+                    or any(type(payload.get(key)) is not int for key in ("schema_version", "role_code", "uv_index"))
+                    or not isinstance(payload.get("normalized_bounds"), dict)
+                    or any(payload["normalized_bounds"].get(key) != prototype["normalized_bounds"].get(key)
+                           for key in ("minimum", "maximum", "size"))):
+                raise RuntimeError("Normalized bend payload schema, role or bounds disagree with its prototype.")
+            hashes = payload.get("protected_uv_sha256")
+            if (not isinstance(hashes, dict) or set(hashes) != {"0", "1", "2"}
+                    or any(not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None
+                           for value in hashes.values())
+                    or any(type(payload.get(key)) is not int or payload[key] <= 0
+                           for key in ("vertex_count", "loop_count"))):
+                raise RuntimeError("Normalized bend payload has no protected UV or geometry receipt.")
+            bounds = payload["normalized_bounds"]
+            try:
+                lo, hi, size = (bounds[key] for key in ("minimum", "maximum", "size"))
+                if (any(len(row) != 3 for row in (lo, hi, size))
+                        or any(isinstance(value, bool) or not isinstance(value, (int, float))
+                               or not math.isfinite(value) for row in (lo, hi, size) for value in row)
+                        or any(value < 0 or not math.isclose(value, b - a, rel_tol=1e-6, abs_tol=1e-9)
+                               for a, b, value in zip(lo, hi, size))
+                        or hi[1] <= 0 or max(size[0], size[2]) <= 0):
+                    raise ValueError("invalid normalized bounds")
+                ratio = size[1] / max(size[0], size[2])
+                measured = {"aspect_ratio": ratio, "aspect_gain": max(1.0, ratio),
+                            "aspect_correction": math.sqrt(max(1.0, ratio))}
+                if (measured["aspect_correction"] > 3.402823466e38 ** 0.25
+                        or any(isinstance(payload.get(key), bool)
+                               or not isinstance(payload.get(key), (int, float))
+                               or not math.isfinite(payload[key])
+                               or not math.isclose(payload[key], value, rel_tol=1e-6, abs_tol=1e-9)
+                               for key, value in measured.items())):
+                    raise ValueError("invalid measured correction")
+            except (KeyError, TypeError, ValueError, OverflowError, ZeroDivisionError) as exc:
+                raise RuntimeError("Normalized bend payload aspect evidence is invalid.") from exc
+        prototype["part_bend_payload"] = copy.deepcopy(payload)
+    return {
+        "schema_version": 2,
+        "part_bend_role": role,
+        "prototype_count": len(prototypes),
+        "source_3d_contract": copy.deepcopy(report["source_3d_contract"]),
+    }
+
+
 def physical_normalization_receipt_from_scene(scene):
     """Return the compact direct-capture receipt persisted by the normalizer."""
     raw = scene.get("speedtree_cluster_normalizer_last_report")
@@ -7871,9 +7974,12 @@ def physical_normalization_receipt_from_scene(scene):
             "Physical direct-capture report has no matching capture contract."
         )
 
+    raw_prototypes = report.get("prototypes") or []
+    if not isinstance(raw_prototypes, list) or any(not isinstance(row, dict) for row in raw_prototypes):
+        raise RuntimeError("Physical normalization prototypes are not an object list.")
     prototypes = []
     seen_assets = set()
-    for raw_prototype in report.get("prototypes") or []:
+    for raw_prototype in raw_prototypes:
         asset_name = str(
             raw_prototype.get("skeletal_asset")
             or raw_prototype.get("prototype_asset")
@@ -7900,6 +8006,7 @@ def physical_normalization_receipt_from_scene(scene):
         raise RuntimeError(
             "Physical normalization report has no indexed prototypes."
         )
+    bend_fields = _validated_normalized_bend_receipt_fields(report, raw_prototypes, prototypes)
 
     variants = []
     for raw_variant in report.get("variants") or []:
@@ -7961,6 +8068,7 @@ def physical_normalization_receipt_from_scene(scene):
         "physical_capture_contract_sha256": capture_hash,
         "prototypes": prototypes,
         "variants": variants,
+        **bend_fields,
     }
 
 
@@ -10410,7 +10518,10 @@ def _validate_staged_speedtree_targets(staged_targets, states):
                     for mesh_id in spm_material_mesh_ids(material)
                     if mesh_id not in mesh_ids
                 ]
-                if missing_cutouts:
+                # Unselected siblings are read only to protect shared files.
+                # Their existing broken cutout IDs must not gate this target;
+                # selected SPMs retain the complete structural validation.
+                if missing_cutouts and is_selected:
                     raise RuntimeError(
                         "SpeedTree SPM validation failed: material "
                         f"{material.attrib.get('Name')!r} in {spm_path.name} "

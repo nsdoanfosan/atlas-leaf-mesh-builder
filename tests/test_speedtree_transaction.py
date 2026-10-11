@@ -684,6 +684,30 @@ class StagedSpeedTreeValidationTests(unittest.TestCase):
                 {transaction._path_key(production / "meshes" / "shared.fbx")},
             )
 
+    def test_broken_sibling_cutout_is_outside_selection_but_selected_is_strict(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            stage, production = root / "stage", root / "production"
+            (stage / "meshes").mkdir(parents=True)
+            production.mkdir()
+            (stage / "meshes" / "shared.fbx").write_bytes(b"mesh")
+            selected, sibling = stage / "selected.spm", stage / "sibling.spm"
+            self._spm_with_external_mesh(selected, "meshes/shared.fbx")
+            self._spm_with_external_mesh(sibling, "meshes/shared.fbx")
+            tree = speedtree.read_spm_xml(sibling)
+            tree.find("Assets/Material_v8/CutoutMeshID").text = "13"
+            speedtree.write_spm_xml(sibling, tree)
+            before = sibling.read_bytes()
+            self._write_empty_generator_contract(selected)
+            state = {"stage_root": stage, "production_root": production}
+            graph = speedtree._validate_staged_speedtree_targets([selected], [state])
+            self.assertEqual(sibling.read_bytes(), before)
+            self.assertEqual(graph[transaction._path_key(production)], {
+                transaction._path_key(production / "meshes" / "shared.fbx")
+            })
+            with self.assertRaisesRegex(RuntimeError, "missing cutout Mesh IDs"):
+                speedtree._validate_staged_speedtree_targets([sibling], [state])
+
 
 if __name__ == "__main__":
     unittest.main()
