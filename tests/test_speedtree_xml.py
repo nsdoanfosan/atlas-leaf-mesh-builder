@@ -6111,6 +6111,32 @@ class DeletedMeshLifecycleTests(unittest.TestCase):
                 "detached_unassigned_missing_original_binding",
             )
 
+    def test_current_adoption_source_pair_survives_new_output_mesh_ids(self):
+        for has_output in (True, False):
+            with self.subTest(has_output=has_output), tempfile.TemporaryDirectory() as folder:
+                folder = Path(folder)
+                target = folder / "SK_tree.spm"
+                manifest = self._managed_manifest(target, folder / "atlas.blend")
+                manifest["speedtree_material_groups"][0]["mesh_ids"] = [10]
+                root = ET.Element("SpeedTreeModel")
+                assets = ET.SubElement(root, "Assets")
+                material = add_material(assets, 8, "M_leaf_test", [12])
+                mesh = add_mesh(assets, 10)
+                add_mesh(assets, 12)
+                speedtree.tag_spm_asset(material, manifest, "material")
+                speedtree.tag_spm_asset(mesh, manifest, "mesh")
+                add_variant_generator(root, "Leaf Mesh", "Leaf", [(8, 10)])
+                result = speedtree.retire_deleted_generator_bindings(
+                    root, [],
+                    {1: {"target_material_id": 8, "target_mesh_id": 12}} if has_output else {},
+                    {8: {"name": "M_leaf_test", "material": material, "mesh_ids": [10]}},
+                    ownership_manifest=manifest, spm_path=target,
+                )
+                pair = speedtree.spm_generator_property_pairs(root)[0]
+                self.assertEqual(pair["material_property"].findtext("Value"), "8" if has_output else "-1")
+                self.assertEqual(pair["mesh_property"].findtext("Value"), "10" if has_output else "-10")
+                self.assertEqual(len(result["retired_bindings"]), 0 if has_output else 1)
+
     def test_partial_legacy_deletion_detaches_tagged_mesh_removed_from_cutout_list(self):
         with tempfile.TemporaryDirectory() as folder:
             folder = Path(folder)
