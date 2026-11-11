@@ -842,13 +842,27 @@ def file_sha256(path):
     return digest.hexdigest()
 
 
-def texture_path_signature(texture_exports):
+def _texture_needs_cloud_recall(path):
+    """Recognize Windows cloud placeholders without fetching their contents."""
+    attributes = getattr(Path(path).stat(), "st_file_attributes", 0)
+    return bool(attributes & (0x1000 | 0x400000))
+
+
+def _unavailable_optional_ao(role, path):
+    return str(role).rsplit(":", 1)[-1].casefold() == "ao" and _texture_needs_cloud_recall(path)
+
+
+def texture_path_signature(texture_exports, *, allow_unavailable_optional_ao=False):
     payload = {}
     for key, value in sorted((texture_exports or {}).items()):
         normalized_path = str(value).replace("\\", "/").lower()
         row = {"path": normalized_path}
         candidate = Path(value)
         if candidate.is_file():
+            if allow_unavailable_optional_ao and _unavailable_optional_ao(key, candidate):
+                row["content"] = "cloud_placeholder_unverified"
+                payload[str(key)] = row
+                continue
             digest = hashlib.sha256()
             with candidate.open("rb") as stream:
                 for chunk in iter(lambda: stream.read(1024 * 1024), b""):
@@ -923,6 +937,12 @@ def source_refresh_receipt_is_current(receipt, blend_path):
         return False
     texture_inputs = receipt.get("texture_inputs")
     if not isinstance(texture_inputs, dict) or not texture_inputs:
+        return False
+    if any(
+        Path(path).is_file() and _unavailable_optional_ao(role, path)
+        for role, path in texture_inputs.items()
+    ):
+        # A path-only placeholder is not evidence that the pixels are unchanged.
         return False
     return texture_path_signature(texture_inputs) == str(
         receipt.get("texture_signature") or ""
@@ -1050,7 +1070,8 @@ def texture_pixel_dimensions(texture_path):
     """Read exact pixel dimensions without depending on a loaded Blender image."""
     path = Path(texture_path)
     suffix = path.suffix.casefold()
-    header = path.read_bytes()[:32]
+    with path.open("rb") as stream:
+        header = stream.read(32)
     if suffix == ".tga":
         if len(header) < 18:
             raise RuntimeError(f"TGA texture header is incomplete: {path}")
@@ -1090,6 +1111,10 @@ def common_texture_dimensions(texture_exports, fallback=None):
             continue
         path = Path(texture_path)
         if not path.is_file():
+            continue
+        if _unavailable_optional_ao(role, path):
+            # AO is optional for geometry transfer. Retain its path in the SPM;
+            # use the other local maps to verify dimensions without hydration.
             continue
         dimensions[role] = texture_pixel_dimensions(path)
     unique = sorted(set(dimensions.values()))
@@ -8619,7 +8644,9 @@ def export_speedtree_assets(
     canonical_manifest_available = (
         texture_contract_status == CANONICAL_TEXTURE_STATUS
     )
-    texture_signature = texture_path_signature(production_signature_paths)
+    texture_signature = texture_path_signature(
+        production_signature_paths, allow_unavailable_optional_ao=True
+    )
     export_scope_id = resolve_export_scope_id(
         collection,
         export_dir,
